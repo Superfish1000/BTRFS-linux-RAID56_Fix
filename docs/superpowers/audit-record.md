@@ -21,6 +21,26 @@ length, and is correct. No further instances.
 scanned for allocations, mutexes, bio submission, and waits. None contains a
 sleeping or blocking call.
 
+**Returning while still holding a lock.** The evidence channel's `commit()`
+did exactly this -- an early return on a re-read pointer, skipping the unlock,
+which deadlocked a concurrent disarm that was already blocked on that lock.
+After fixing it, every function in `raid56-wib.c`, `raid56.c`, `bio.c` and
+`scrub.c` was walked with a lock-depth simulation looking for the same shape.
+Three `goto`s reach a label while holding (`btrfs_wib_load()` to `out:`,
+`lock_stripe_add()` to `lockit:`, `unlock_stripe()` to `done:`) and all three
+labels release what is held. **No bare return while holding a lock remains.**
+
+**Pointers swapped at runtime.** The deadlock and the use-after-free beside it
+both came from one property: a pointer in `fs_info` that is published and
+unpublished while the filesystem is mounted, read without the lock that
+protects it. `fs_info->wib` looks like the same shape and is not:
+`btrfs_wib_disable()` only sets a flag, and the object lives from
+`btrfs_wib_alloc()` at mount to `btrfs_wib_free()` at unmount, so it is stable
+for the mount's lifetime. `fs_info->raid56_evidence` was the only genuinely
+runtime-swapped pointer in this code, which is why it was the only one with
+these bugs, and its lock now lives in `fs_info` where it outlives what it
+protects.
+
 **Allocation and free pairing.** Every allocation in the log reaches its free on
 all paths, including both early returns in `wib_submit_all_devices()`.
 `get_file()`/`fput()` pair across the retry loop and the exit path.
