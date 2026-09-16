@@ -727,11 +727,12 @@ BTRFS_IOC_RAID56_EVIDENCE streams the data columns of an ambiguous full stripe
 out during a scrub. The capture is wired into scrub_raid56_parity_stripe()'s
 AMBIGUOUS branch only.
 
-**The gap, and it is the important one.** Mount-time recovery reaches its own
-verdict through btrfs_scrub_raid56_full_stripe() (scrub.c ~3670) and captures
-nothing. That is the 3 a.m. case the user asked about: the machine crashes with
-nobody there, comes back up, recovery runs, and ordinary filesystem activity
-starts eroding the evidence before anyone can plug a drive in.
+**CORRECTION, and the original claim here was wrong.** Mount-time recovery does
+NOT bypass the capture. btrfs_scrub_raid56_full_stripe() calls
+scrub_raid56_parity_stripe() (scrub.c:3806), the same function the user scrub
+calls (scrub.c:3048), so the capture in its AMBIGUOUS branch fires on both
+paths. The 3 a.m. case was covered from the first commit; the changelog that
+said otherwise was mistaken.
 
 It is also the one place the block group is NOT held read-only.
 btrfs_inc_block_group_ro() appears only at scrub.c:3248, on the user-scrub
@@ -740,11 +741,16 @@ the coherence argument that makes the user-scrub capture sound -- nothing can be
 writing while we copy -- does not hold there, and wiring the capture in
 unchanged would hand out a snapshot that may not correspond to any instant.
 
-Deciding what to do about that is a design question, not a mechanical one:
-either take the RO in the recovery path (and inherit its -ENOSPC behaviour on a
-degraded mount), or capture without it and label the result as possibly torn,
-or leave recovery uncaptured and require a scrub before the evidence is
-collectable.
+**RESOLVED** by labelling rather than by holding. The capture sets
+BTRFS_RAID56_EVIDENCE_F_COHERENT only when bg->ro is held, so a helper can tell
+a coherent snapshot from a possibly-torn one, and evidence.c prints
+"coherent NO -- captured by mount recovery without a block group hold".
+
+Taking the RO in the recovery path was rejected: btrfs_inc_block_group_ro()
+returns -ENOSPC when it cannot reserve elsewhere, and a mount recovering a
+degraded array is precisely where that fails. Refusing to recover in order to
+protect evidence would trade the filesystem for the evidence. Preserve, label,
+never block.
 
 **Smaller things also open:**
 - No test exercises the ring's drop paths (dropped_full, dropped_wide). The
