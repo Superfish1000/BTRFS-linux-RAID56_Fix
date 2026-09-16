@@ -817,6 +817,31 @@ with no checksum consulted. That is the thread to pull: whether the affected
 range still has an extent covering it in the degraded mount, not whether the
 RAID5/6 code reconstructed it correctly.
 
+### Where the zeros are NOT, by measurement
+
+Every path that can make a btrfs data read return bytes it did not read was
+counted, on runs that reproduce the symptom. All of them are zero:
+
+    delivered_zero           0   raid56 hands back no zero sector
+    delivered_unchecked      0   nothing with a checksum went uncompared
+    delivered_nocsum         0   nothing without a checksum was delivered
+    delivered_audit_skipped  0   and the audit actually ran
+    read_hole_true           0   no block served as a real hole
+    read_hole_prealloc       0   no block served as a prealloc hole
+    read_past_eof            0   no block zeroed as beyond last_byte
+    read_already_uptodate    0   no block skipped as already uptodate
+
+(The four read_* counters were temporary: they are per-block atomics in the
+generic buffered-read loop, which is not a cost to leave in for every btrfs
+user once they have answered. They answered zero and were removed. The four
+delivered_* counters are in the RAID5/6 path only and stay.)
+
+So the zeros enter AFTER btrfs_do_readpage() builds and submits the bio, and
+AFTER raid56 hands back non-zero content -- which leaves the bio completion and
+read-repair machinery in fs/btrfs/bio.c (btrfs_end_repair_bio(),
+next_repair_mirror(), the bio_reset/retry into the original pages). That is
+where the next person should instrument, and it is a small amount of code.
+
 ### The zeros do not come from raid56
 
 `delivered_zero` counts data sectors a degraded read hands back that are

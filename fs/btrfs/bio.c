@@ -257,9 +257,12 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 	 *
 	 * For RAID56 it is not.  A mirror > 1 is not a copy of the block:
 	 * raid56_parity_recover() reconstructs it as P ^ (every other data
-	 * stripe of the vertical stripe), and none of those inputs is verified
-	 * - parity carries no checksum at all, and recover_rbio() never calls
-	 * fill_data_csums(), so rbio->csum_bitmap stays NULL and
+	 * stripe of the vertical stripe).  recover_rbio() now calls
+	 * fill_data_csums(), so a reconstruction of a block that HAS a
+	 * checksum is checked against it -- but this branch is the case where
+	 * there is none, and then nothing is verified: parity carries no
+	 * checksum at all, so for a csum-less block rbio->csum_bitmap has no
+	 * bit and
 	 * verify_one_sector() is a no-op for BTRFS_RBIO_READ_REBUILD.  If the
 	 * parity is stale, or any other data stripe of the vertical stripe is
 	 * silently corrupt, the reconstruction is garbage.
