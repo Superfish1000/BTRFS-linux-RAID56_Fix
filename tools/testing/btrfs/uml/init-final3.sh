@@ -304,8 +304,12 @@ dm_heal() {
 
 # The 4K blocks of $MNT/nocow that the in-place overwrite targets, at a 64K
 # stride so they land in different vertical stripes and on different devices.
-NOCOW_BLOCKS=32
-NOCOW_STRIDE=16          # in 4K blocks, so 64 KiB apart
+# Overridable so a scenario that needs MORE ambiguous full stripes than the
+# evidence ring has slots can ask for them, rather than having the ring's
+# overflow behaviour be untestable because the workload never overflows it.
+NOCOW_BLOCKS=${NOCOW_BLOCKS:-32}
+NOCOW_STRIDE=${NOCOW_STRIDE:-16}          # in 4K blocks, so 64 KiB apart
+NOCOW_SIZE_MB=${NOCOW_SIZE_MB:-2}
 # One RAID5 full stripe is (NDEV - 1) x BTRFS_STRIPE_LEN, i.e. 192 KiB on a
 # 4-device array.  Derived rather than fixed: a scenario that needs more
 # devices to keep the metadata writable would otherwise walk the wrong stride
@@ -1031,7 +1035,7 @@ nocow_replay_prep)
 	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
-	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	dd if=/dev/zero bs=1M count=$NOCOW_SIZE_MB status=none | tr '\000' 'A' > $MNT/nocow
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
 	acked=0
@@ -1247,23 +1251,60 @@ nocow_persist_scrub)
 	else
 		log "WIBDUMP_MISSING"
 	fi
-	if [ "${EVIDENCE:-0}" = 1 ] && [ -x $T/umltest/evidence ]; then
-		# Stream the evidence out WHILE the scrub runs.  Draining after
-		# it finishes would be waiting for a four-slot ring to have
-		# overflowed, which is the failure this design exists to avoid.
+	if [ "${EVIDENCE:-0}" != 0 ] && [ -x $T/umltest/evidence ]; then
+		# EVIDENCE picks what to do with the channel while the scrub
+		# runs.  1 is the real workflow; the others exist because the
+		# paths they reach had never been executed by anything.
+		#
+		#   1  drain continuously (the design: see below)
+		#   2  arm and deliberately do NOT drain, so the four-slot ring
+		#      fills and dropped_full has to count the rest
+		#   3  same, with btrfs.raid56_evidence_max_cols lowered on the
+		#      kernel command line so every stripe is "too wide" and
+		#      dropped_wide counts instead
+		#   4  hammer arm/read/disarm against the captures
 		EVDIR=$T/umltest/evdir.$TAG
 		rm -rf $EVDIR; mkdir -p $EVDIR
 		$T/umltest/evidence $MNT arm 2>&1 |
 			while read -r l; do log "evidence: $l"; done
 		btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1 &
 		spid=$!
-		while kill -0 $spid 2>/dev/null; do
-			$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
-				grep -E 'EVIDENCE stripe' |
+		case "${EVIDENCE}" in
+		1)
+			# Stream the evidence out WHILE the scrub runs.
+			# Draining after it finishes would be waiting for a
+			# four-slot ring to have overflowed, which is the
+			# failure this design exists to avoid.
+			while kill -0 $spid 2>/dev/null; do
+				n=$($T/umltest/evidence $MNT drain $EVDIR 2>&1 |
+					tee /tmp/ev.out | grep -c 'EVIDENCE stripe')
+				grep -E 'EVIDENCE stripe' /tmp/ev.out |
+					while read -r l; do log "evidence: $l"; done
+				# Only pause when there was nothing to take.  A
+				# scrub declines stripes in bursts, so sleeping
+				# after a productive drain is how a four-slot
+				# ring overflows while a helper is right there.
+				[ "${n:-0}" = 0 ] && sleep 1
+			done
+			;;
+		4)
+			# No drain: arm, read and disarm as fast as the ioctl
+			# allows, for as long as the scrub runs.  Nothing is
+			# asserted about what comes back -- the assertion is
+			# that the scrub finishes at all.
+			$T/umltest/evidence $MNT race 25 2>&1 |
 				while read -r l; do log "evidence: $l"; done
-			sleep 1
-		done
+			# The race leaves it disarmed; arm again so the
+			# counters below have somewhere to come from.
+			$T/umltest/evidence $MNT arm >/dev/null 2>&1
+			;;
+		esac
 		wait $spid
+		# Before draining anything: what did the kernel have to throw
+		# away?  Draining first would empty the ring and make a full
+		# ring indistinguishable from an idle one.
+		$T/umltest/evidence $MNT stats 2>&1 |
+			while read -r l; do log "evidence: $l"; done
 		$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
 			grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
 		$T/umltest/evidence $MNT disarm 2>&1 |

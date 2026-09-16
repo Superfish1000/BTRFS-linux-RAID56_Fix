@@ -68,6 +68,7 @@ the next recorded write:
 | `selftest.sh` | boots and reports the in-kernel btrfs self-tests |
 | `split_status.sh` | two arms: does a degraded read return a reconstruction its checksum already rejected? |
 | `unprovable.sh` | two arms: does scrub write a rebuild it cannot verify over good data? |
+| `evidence_drop.sh` | five arms: what the evidence channel does when it cannot keep a stripe -- ring full, stripe too wide, disarmed under a live capture |
 | `nocow_persist.sh` | three arms: does the stale record survive a mount, and is an ambiguous stripe declined? |
 | `age.sh` | ages a RAID5/6 filesystem and measures its stranded free space |
 
