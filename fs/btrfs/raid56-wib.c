@@ -1975,6 +1975,7 @@ int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
 	args->gen = slot->gen;
 	args->stale_cols = slot->stale_cols;
 	args->bad_parity = slot->bad_parity;
+	args->record_flags = slot->record_flags;
 	args->nr_data = slot->nr_data;
 	args->nr_parity = slot->nr_parity;
 	args->stripe_len = BTRFS_STRIPE_LEN;

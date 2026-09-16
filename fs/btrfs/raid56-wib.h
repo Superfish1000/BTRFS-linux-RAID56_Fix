@@ -438,6 +438,7 @@ struct btrfs_raid56_evidence_slot {
 	u64 gen;
 	u64 stale_cols;
 	u64 bad_parity;
+	u64 record_flags;
 	u32 nr_data;
 	u32 nr_parity;
 	u32 nr_bytes;

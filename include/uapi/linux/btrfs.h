@@ -1223,6 +1223,22 @@ struct btrfs_ioctl_raid56_stale_entry {
 
 #define BTRFS_RAID56_EVIDENCE_MAX_COLS	34
 
+/*
+ * The columns of this capture are mutually coherent: the block group was held
+ * read-only for the whole chunk scrub, so nothing could write to the stripe
+ * between the reads that produced them.
+ *
+ * Clear means the capture came from the write-intent log's mount-time
+ * recovery, which reaches the same verdict but takes no such hold
+ * (btrfs_inc_block_group_ro() is only on the user-scrub enumerate path).  The
+ * bytes are still the best copy anyone will get -- they are what the recovery
+ * read, at the earliest moment they existed together -- but a writer may have
+ * landed between two of those reads, so a reconstruction from them can be a
+ * value that never existed at any single instant.  Preserve it, label it, and
+ * do not let a tool present it as a candidate without saying so.
+ */
+#define BTRFS_RAID56_EVIDENCE_F_COHERENT	(1ULL << 0)
+
 struct btrfs_ioctl_raid56_evidence_args {
 	/* In: one of BTRFS_RAID56_EVIDENCE_*. */
 	__u64 op;
@@ -1232,6 +1248,8 @@ struct btrfs_ioctl_raid56_evidence_args {
 	__u64 full_stripe_start;
 	/* Out: newest generation at which the region gained a fault record. */
 	__u64 gen;
+	/* Out: BTRFS_RAID56_EVIDENCE_F_*. */
+	__u64 record_flags;
 	/* Out: bit i set: data column i is recorded stale. */
 	__u64 stale_cols;
 	/* Out: bit p set: parity p does not describe the data on disk. */

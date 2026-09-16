@@ -2467,6 +2467,17 @@ static void scrub_capture_evidence(struct scrub_ctx *sctx,
 	}
 
 	slot->full_stripe_start = full_stripe_start;
+	/*
+	 * Only the user-scrub path holds the block group read-only
+	 * (btrfs_inc_block_group_ro(), and mandatory for RAID56 there).  The
+	 * write-intent log's mount-time recovery reaches this same verdict
+	 * with no such hold, so its columns can have been read either side of
+	 * a write.  Capture it anyway -- it is the earliest and only moment
+	 * those bytes exist together, and the crash nobody was awake for is
+	 * exactly the case this is for -- but say which it was.
+	 */
+	if (bg->ro)
+		slot->record_flags |= BTRFS_RAID56_EVIDENCE_F_COHERENT;
 	if (btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
 				   nr_parity, &st)) {
 		slot->stale_cols = st.stale_cols;

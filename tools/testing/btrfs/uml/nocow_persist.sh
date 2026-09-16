@@ -108,6 +108,20 @@ fi
 # What the ioctl showed a helper before the scrub touched anything.  A record
 # the kernel holds but cannot hand over is not preserved in any useful sense.
 dump=$(grep -h 'wibdump-before: WIBDUMP' $T/umltest/nocow-persist-0/log.nocow_persist_scrub 2>/dev/null | tail -1)
+# The write hole's footprint, measured with no record at all.  The control arm
+# is a filesystem whose damage nothing recorded -- which is the state every
+# array damaged by an older kernel is in -- and the parity mismatch count is
+# arithmetic on what is already on the disks, so it works there anyway.
+ctrl_pm=$(grep -ho "parity_mismatch_vertical_stripes [0-9]*" \
+	$T/umltest/nocow-persist-1/log.* 2>/dev/null |
+	awk '{print $2}' | sort -n | tail -1)
+echo "parity mismatch found by the control arm's scrub: ${ctrl_pm:-0} vertical stripe(s)"
+if [ "${ctrl_pm:-0}" -eq 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- the control lost data but reported no parity mismatch,"
+	echo "        so the one detector that works without a record is blind"
+	exit 1
+fi
+
 echo "ioctl before the scrub: ${dump:-<none>}"
 if [ -n "$dump" ]; then
 	known=$(printf %s "$dump" | sed -n 's/.*known=\([0-9]*\).*/\1/p')

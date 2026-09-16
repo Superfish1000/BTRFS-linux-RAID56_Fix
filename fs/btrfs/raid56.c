@@ -3547,6 +3547,7 @@ static int finish_parity_scrub(struct btrfs_raid_bio *rbio)
 	struct btrfs_io_context *bioc = rbio->bioc;
 	void **pointers = rbio->finish_pointers;
 	unsigned long *pbitmap = &rbio->finish_pbitmap;
+	unsigned int nr_mismatch;
 	int nr_data = rbio->nr_data;
 	int sectornr;
 	bool has_qstripe;
@@ -3608,6 +3609,29 @@ static int finish_parity_scrub(struct btrfs_raid_bio *rbio)
 
 	for_each_set_bit(sectornr, &rbio->dbitmap, rbio->stripe_nsectors)
 		verify_one_parity_sector(rbio, pointers, sectornr);
+
+	/*
+	 * Whatever is still set did not match: verify_one_parity_sector()
+	 * clears the bit of every vertical stripe whose parity already
+	 * described the data.  So this is the write hole's footprint, measured
+	 * without needing any record to have been kept -- which is the only
+	 * way to measure it on a filesystem damaged by an older kernel.  It
+	 * was always known here and always corrected in silence.
+	 *
+	 * Say it out loud.  On an array that has never lost a device, a
+	 * non-zero count means writes were lost, and names where.
+	 */
+	nr_mismatch = bitmap_weight(&rbio->dbitmap, rbio->stripe_nsectors);
+	if (unlikely(nr_mismatch)) {
+		struct btrfs_raid56_write_stats *st = &bioc->fs_info->raid56_write_stats;
+
+		atomic64_add(nr_mismatch, &st->parity_mismatch);
+		atomic64_inc(&st->parity_mismatch_stripes);
+		btrfs_warn_rl(bioc->fs_info,
+"raid56: parity of full stripe %llu did not describe its data in %u of %u vertical stripe(s); rewriting it. On an array that has not lost a device this is the write hole, and the data it disagreed with may be what was lost",
+			      bioc->full_stripe_logical, nr_mismatch,
+			      rbio->stripe_nsectors);
+	}
 
 	kunmap_local(pointers[nr_data]);
 	__free_page(phys_to_page(p_paddr));

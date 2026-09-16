@@ -547,6 +547,25 @@ struct btrfs_raid56_write_stats {
 	 * one.  See can_nocow_file_extent().
 	 */
 	atomic64_t forced_cow;
+	/*
+	 * Vertical stripes whose parity on disk did NOT describe the data on
+	 * disk when a scrub checked it, and which the scrub therefore rewrote.
+	 *
+	 * This is the footprint of the RAID5/6 write hole, and it is the one
+	 * measurement that works on a filesystem damaged by an OLDER kernel:
+	 * it needs no write-intent record, because it is arithmetic on what is
+	 * already there.  finish_parity_scrub() has always known it -- it
+	 * clears the bit of every vertical stripe whose parity already matched,
+	 * so whatever is left is a mismatch -- and it has always corrected
+	 * them silently.  A non-zero count on an array that has never lost a
+	 * device means writes were lost, and says where.
+	 *
+	 * Counted, not gated on the write-intent log: an array that needs this
+	 * is exactly one that never had the log.
+	 */
+	atomic64_t parity_mismatch;
+	/* Full stripes in which at least one such vertical stripe was found. */
+	atomic64_t parity_mismatch_stripes;
 };
 
 struct btrfs_fs_info {

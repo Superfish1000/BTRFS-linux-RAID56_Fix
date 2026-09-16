@@ -34,7 +34,7 @@
 #define MAX_COLS 34
 
 struct ev_args {
-	uint64_t op, flags, full_stripe_start, gen, stale_cols, bad_parity;
+	uint64_t op, flags, full_stripe_start, gen, record_flags, stale_cols, bad_parity;
 	uint32_t nr_data, nr_parity, stripe_len, nr_queued;
 	uint64_t dropped_full, dropped_wide, captured;
 	uint64_t devid[MAX_COLS], physical[MAX_COLS];
@@ -106,6 +106,9 @@ static int drain(int fd, const char *outdir)
 				(unsigned long long)a->gen);
 			fprintf(f, "nr_data %u\nnr_parity %u\nstripe_len %u\n",
 				a->nr_data, a->nr_parity, a->stripe_len);
+			fprintf(f, "coherent %s\n",
+				(a->record_flags & 1) ? "yes" :
+				"NO -- captured by mount recovery without a block group hold");
 			fprintf(f, "stale_cols 0x%llx\nbad_parity 0x%llx\n",
 				(unsigned long long)a->stale_cols,
 				(unsigned long long)a->bad_parity);
