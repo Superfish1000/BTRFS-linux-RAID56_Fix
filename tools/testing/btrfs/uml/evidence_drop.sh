@@ -21,6 +21,10 @@
 #               column limit with btrfs.raid56_evidence_max_cols and drives
 #               the first of the two, rather than pretending the path does
 #               not exist.
+#   abandoned   a helper that arms, lets captures queue, and disarms without
+#               draining.  Those stripes are gone and nothing can get them
+#               back, so the kernel has to say so rather than free them
+#               quietly.
 #   disarmed    a helper arming and disarming while captures are in flight.
 #               The channel's lock used to live inside the object the disarm
 #               frees, so a capture could take a lock in freed memory; and a
@@ -127,6 +131,11 @@ arm wide 3 "btrfs.raid56_evidence_max_cols=1"
 read -r w_cap w_full w_wide w_wait <<<"$(stats_of wide)"
 echo "  captured=$w_cap dropped_full=$w_full dropped_wide=$w_wide waited=$w_wait"
 
+echo "== armed, never drained, then disarmed with entries queued =="
+arm abandon 5
+read -r a_cap a_full a_wide a_wait <<<"$(stats_of abandon)"
+echo "  captured=$a_cap dropped_full=$a_full dropped_wide=$a_wide waited=$a_wait"
+
 # The capture delay makes this deterministic rather than hopeful: every claimed
 # slot is held for two seconds before it is published, and the helper is arming
 # and disarming every few hundred microseconds, so a disarm lands inside that
@@ -142,7 +151,7 @@ fails=0
 say() { echo "  $1"; }
 bad() { echo "  FAIL: $1"; fails=$((fails+1)); }
 
-case "$d_cap$n_cap$f_cap$w_cap" in *'?'*)
+case "$d_cap$n_cap$f_cap$w_cap$a_cap" in *'?'*)
 	echo "RESULT: INCONCLUSIVE -- an arm did not report its counters"; exit 2;;
 esac
 
@@ -202,11 +211,17 @@ discarded() {
 		$T/umltest/results.evdrop-$1 $T/umltest/evdrop-$1/log.* 2>/dev/null |
 		awk '{s+=$1} END {print s+0}'
 }
-[ "$(discarded race)" -gt 0 ] 2>/dev/null || bad "arming and disarming without draining discarded nothing, so the warning path never ran"
-for a in drain nowait full wide; do
-	[ "$(discarded $a)" -eq 0 ] 2>/dev/null || bad "$a arm drained before disarming and still discarded queued evidence"
-done
+# The abandon arm is the one that reaches it.  The race arm cannot: its helper
+# reads immediately before every disarm, so the ring is empty by the time it
+# lets go -- which is worth knowing, and was worth finding out by asserting the
+# wrong thing once.
+[ "$(discarded abandon)" -gt 0 ] 2>/dev/null || bad "disarming with entries queued discarded them without saying so"
 for a in drain nowait full wide race; do
+	[ "$(discarded $a)" -eq 0 ] 2>/dev/null || bad "$a arm read before disarming and still discarded queued evidence"
+done
+[ "${a_cap:-0}" -gt 0 ] 2>/dev/null || bad "the abandon arm captured nothing, so it abandoned nothing"
+
+for a in drain nowait full wide abandon race; do
 	[ "$(splat_of $a)" = "0" ] || bad "$a arm produced a kernel splat"
 done
 

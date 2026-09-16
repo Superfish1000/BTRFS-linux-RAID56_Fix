@@ -1263,6 +1263,11 @@ nocow_persist_scrub)
 		#      kernel command line so every stripe is "too wide" and
 		#      dropped_wide counts instead
 		#   4  hammer arm/read/disarm against the captures
+		#   5  arm, never drain, and disarm with entries still
+		#      queued -- the one loss the kernel cannot undo, so it
+		#      has to say so.  Arm 4 cannot reach it: its helper
+		#      reads immediately before every disarm, so the ring is
+		#      empty by the time it lets go.
 		EVDIR=$T/umltest/evdir.$TAG
 		rm -rf $EVDIR; mkdir -p $EVDIR
 		$T/umltest/evidence $MNT arm 2>&1 |
@@ -1305,7 +1310,10 @@ nocow_persist_scrub)
 		# ring indistinguishable from an idle one.
 		$T/umltest/evidence $MNT stats 2>&1 |
 			while read -r l; do log "evidence: $l"; done
-		$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
+		# stats asks for zero bytes, so every queued entry comes back
+		# -ERANGE and stays queued: it reports without consuming.
+		[ "${EVIDENCE}" = 5 ] ||
+			$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
 			grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
 		$T/umltest/evidence $MNT disarm 2>&1 |
 			while read -r l; do log "evidence: $l"; done
