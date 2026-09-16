@@ -537,3 +537,101 @@ that walk the kernel's own last block -- `wib_dropped_bits()`,
 construction and are not any more, since the same kernel now writes both
 layouts; they all decode rather than index.
 
+
+---
+
+## 15. Protecting an ambiguous stripe: what two adversarial rounds established
+
+Design question from the user: during a scrub, when a stripe is found AMBIGUOUS,
+clone its bytes to an external recovery drive plugged in for the purpose, and
+prevent writes to that stripe meanwhile, so a post-scrub utility can test
+rebuild configurations and recover the file.
+
+Two workflows ran. **Both hit a spend limit and neither produced a synthesis**,
+so what follows is the completed subset, not a finished analysis.
+
+### What actually completed
+
+| angle | lenses run | verdict |
+|---|---|---|
+| fence for the clone window only | 4/4 | 4 fatal |
+| fence for the duration of the scrub | 4/4 | 4 fatal |
+| fence until the record is retired | 4/4 | 4 fatal |
+| make the RMW itself safe (no fence) | 1/4 | incomplete |
+| freeze the stripe's free space | 4/4 | 4 fatal |
+| opt-in forensic fence | **0/4** | **NOT REVIEWED** |
+| evacuate the neighbours | **0/4** | **NOT REVIEWED** |
+| stream during scrub, protect nothing | **0/4** | **NOT REVIEWED** |
+
+The two angles scored `0 fatal` are **not** survivors. Every one of their
+reviewers failed to run. Do not read those as passing.
+
+### The one claim that was tested and refuted
+
+The hypothesis was that protection could be free: since RAID5/6 forces CoW
+(`can_nocow_file_extent()`, inode.c ~1913, gating both BTRFS_ORDERED_NOCOW and
+BTRFS_ORDERED_PREALLOC), a committed extent is never overwritten in place, so
+the only way a committed stripe's content changes is a new allocation into its
+free space -- and removing that free space from the allocator would freeze the
+stripe with no fence, no refused write and no bystander held hostage.
+
+**Refuted.** `btrfs_repair_io_failure()` (bio.c:997) writes into a committed
+stripe with no allocation, no ordered extent, and without entering raid56.c at
+all. `btrfs_map_repair_block()` (volumes.c:9053) collapses the RAID56 write to
+a single device write -- its own comment says "Not update any other mirrors nor
+go through RMW path" -- so it writes one data column and does not recompute the
+parity. Its only guard is `sb_rdonly()`.
+
+So a freeze-only design has a hole, and would need a hold predicate in the
+repair path as a companion. That companion costs no availability: it only
+suppresses an opportunistic repair.
+
+### What was claimed but is NOT established
+
+The proposal's own weakest-point section argued this path is the *most likely*
+destroyer of an ambiguous stripe's evidence, and that because it writes a
+column without recomputing parity it turns "data stale, truth survives in the
+parity" into truth nowhere -- with the sharp edge that the helper's own clone
+pass is the read that triggers it.
+
+Worked through on paper, that does not follow. The write-back at bio.c:281 is
+reached only when the reconstruction PASSED its checksum (the guard at
+bio.c:274 declines only `BTRFS_CSUM_NONE`). In a stripe with a genuinely stale
+data column, reconstructing a checksummed neighbour consumes that stale column
+and yields a value that fails its checksum, so the repair never fires. The
+harmful case could not be reproduced by reasoning. **Needs a real test before
+anyone acts on it**, in either direction: if it is reachable it is serious, and
+if it is not, the freeze needs a smaller companion than claimed.
+
+### Other findings worth keeping (self-reported, spot-checked, not all verified)
+
+- A fence keyed on `full_stripe_logical` is satisfied vacuously by
+  `btrfs_remove_chunk()` (volumes.c:3518), which deletes the mapping rather
+  than writing -- reached from balance, the unused-bg cleaner (block-group.c:1818)
+  and bg reclaim (block-group.c:2049). Verified separately this session that
+  nothing in block-group.c calls any `btrfs_wib_*`; that is now fixed by
+  `btrfs_wib_forget_range()`, but a *fence* would have the same blind spot.
+- One refused write fails an entire ordered extent, up to BTRFS_MAX_EXTENT_SIZE
+  (128MiB, fs.h:74), across potentially many inodes -- so a fence's blast radius
+  is not bounded by the fenced stripe's size.
+- `mark_stale_sectors()`'s budget bail fires on transients (a flapping cable, a
+  controller reset), so any "fence until retired" design quarantines stripes
+  that were never permanently ambiguous, with no automatic release.
+- Automatic reclaim selects on `bg->used` alone (`should_reclaim_block_group()`,
+  block-group.c:1919; `do_reclaim_sweep()`, space-info.c:2156), so freezing free
+  space does not stop the reclaim worker handing the whole chunk to
+  `btrfs_relocate_chunk()` with no user action.
+- The evacuate design depends on REMAP_TREE, which is in
+  `BTRFS_FEATURE_INCOMPAT_SUPP` only under CONFIG_BTRFS_EXPERIMENTAL
+  (fs.h:334-347) and is mkfs-time. It cannot help a filesystem that develops an
+  ambiguous stripe tomorrow.
+- There is no REQ_FAILFAST anywhere in fs/btrfs and no btrfs-level IO timeout.
+  An AMBIGUOUS stripe is by definition one with a column on a member whose last
+  write did not land, so any design that reads it holds its lock across exactly
+  the reads that cost tens of seconds.
+
+### The decision this leaves
+
+Not "which design", but whether to re-run the missing adversarial passes at all.
+Three of the four angles the user's own answers pointed at were never reviewed.
+
