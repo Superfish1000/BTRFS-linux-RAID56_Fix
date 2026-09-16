@@ -849,9 +849,29 @@ Measured outcomes of the repair path on runs that reproduce:
 
 So repairs are succeeding WITH a verified checksum, which means the page they
 left behind matched its checksum and is correct. A sector that is both
-correct-by-checksum and zero is a contradiction, so the zeroed sectors are not
-the ones being repaired -- something zeroes a sector whose repair is never
-attempted, or attempted against the wrong sector.
+correct-by-checksum and zero is a contradiction. The `unrestored` guard above
+then ruled out the remaining possibility on that side: no sector is zeroed and
+left unrepaired either. So `zeroit` does not produce the zeros that reach the
+reader, and the search moves off the repair path entirely.
+
+### A second fix: kept, but it does not close this bug
+
+A zeroed sector must never be delivered as success. `btrfs_failed_bio` now
+carries `unrestored`: incremented when a repair is started, decremented by
+every path that accepts or fails it, and checked when the last repair
+completes. Anything still outstanding means a sector was zeroed by the failed
+checksum check and no repair put it back, so the read fails instead of
+returning zeros.
+
+It is safe where the previous attempt was not, because `zeroit` only runs when
+a checksum EXISTS to mismatch -- a nodatacow read never increments the counter,
+so degraded reads of unchecksummed data are untouched.
+
+**It never fires on the runs that reproduce the symptom.** So no sector is
+zeroed-and-unrestored, and `zeroit` is NOT the source of these particular
+zeros. Kept anyway as an invariant with no measured cost: it makes
+"zeroed and silently returned" unreachable by construction, which is worth
+having whether or not it is this bug.
 
 ### A fix that was tried, measured, and reverted
 

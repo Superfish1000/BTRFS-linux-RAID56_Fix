@@ -25,6 +25,26 @@ struct btrfs_failed_bio {
 	struct btrfs_bio *bbio;
 	int num_copies;
 	atomic_t repair_count;
+	/*
+	 * Sectors whose repair has been started and not yet accounted for.
+	 *
+	 * A sector only gets here because its checksum did not match, and
+	 * btrfs_data_csum_check() ZEROES the caller's pages on that path so a
+	 * partial read cannot expose stale bytes.  The content is therefore
+	 * already destroyed by the time the repair is submitted, and if the
+	 * repair neither restores it nor fails the bio, the caller is handed
+	 * those zeros as the file's data with no error at all.
+	 *
+	 * Every path that accepts a repair decrements this.  Anything still
+	 * outstanding when the last repair completes is a sector that was
+	 * zeroed and never put back, so the read fails rather than return it.
+	 *
+	 * This cannot affect data with no checksum: zeroit only runs when a
+	 * checksum exists to mismatch, so a nodatacow read never increments
+	 * it.  That distinction matters -- failing unverifiable reconstructions
+	 * outright was tried here and made every degraded nodatacow read fail.
+	 */
+	atomic_t unrestored;
 };
 
 /* Is this a data path I/O that needs storage layer checksum and repair? */
@@ -169,6 +189,22 @@ static int prev_repair_mirror(const struct btrfs_failed_bio *fbio, int cur_mirro
 static void btrfs_repair_done(struct btrfs_failed_bio *fbio)
 {
 	if (atomic_dec_and_test(&fbio->repair_count)) {
+		/*
+		 * A sector was zeroed by the failed checksum check and no
+		 * repair ever put it back.  Returning it would hand the caller
+		 * a run of zeros as the file's content, complete, at the right
+		 * length and with no error.  Fail the read instead.
+		 */
+		if (unlikely(atomic_read(&fbio->unrestored) > 0)) {
+			struct btrfs_fs_info *fs_info =
+				fbio->bbio->inode->root->fs_info;
+
+			btrfs_warn_rl(fs_info,
+"read at %llu: %d block(s) were zeroed by a failed checksum and no repair restored them; failing the read rather than returning zeros",
+				      fbio->bbio->file_offset,
+				      atomic_read(&fbio->unrestored));
+			fbio->bbio->bio.bi_status = BLK_STS_IOERR;
+		}
 		btrfs_bio_end_io(fbio->bbio, fbio->bbio->bio.bi_status);
 		mempool_free(fbio, &btrfs_failed_bio_pool);
 	}
@@ -245,6 +281,9 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 		break;
 	}
 
+	if (csum_result != BTRFS_CSUM_MISMATCH)
+		atomic_dec(&fbio->unrestored);
+
 	if (csum_result == BTRFS_CSUM_MISMATCH) {
 		bio_reset(&repair_bbio->bio, NULL, REQ_OP_READ);
 		repair_bbio->bio.bi_iter = repair_bbio->saved_iter;
@@ -253,6 +292,8 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 		if (mirror == fbio->bbio->mirror_num) {
 			btrfs_debug(fs_info, "no mirror left");
 			fbio->bbio->bio.bi_status = BLK_STS_IOERR;
+			/* Already failing the read; nothing left to account. */
+			atomic_dec(&fbio->unrestored);
 			goto done;
 		}
 
@@ -367,9 +408,11 @@ static struct btrfs_failed_bio *repair_one_sector(struct btrfs_bio *failed_bbio,
 		fbio->bbio = failed_bbio;
 		fbio->num_copies = num_copies;
 		atomic_set(&fbio->repair_count, 1);
+		atomic_set(&fbio->unrestored, 0);
 	}
 
 	atomic_inc(&fbio->repair_count);
+	atomic_inc(&fbio->unrestored);
 
 	repair_bio = bio_alloc_bioset(NULL, nr_steps, REQ_OP_READ, GFP_NOFS,
 				      &btrfs_repair_bioset);
