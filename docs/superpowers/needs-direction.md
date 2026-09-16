@@ -815,6 +815,26 @@ content that was never written, and with no error. This is the original
    with `sector_paddr_in_rbio(..., 0)`, so the rebuild writes into exactly the
    buffer verification reads.
 
+**MEASURED SINCE, and it moves the bug to the other half of the system.**
+`audit_delivered_sectors()` now walks, at the moment a degraded read hands its
+bios back, every DATA sector that is in the caller's bio and has a checksum
+available, and checks whether anything actually compared it against that
+checksum. Both verify paths -- verify_bio_data_sectors() for sectors read
+directly and verify_one_sector() for sectors rebuilt from parity -- record what
+they checked in rbio->verified_bitmap.
+
+    delivered_unchecked  0     in runs that still produce 3 wrong files each
+
+So the read path verifies everything it delivers. The wrong content is
+therefore NOT unverified -- it MATCHES its stored checksum. Data and checksum
+on disk are self-consistent with each other and both differ from what was
+written.
+
+That is a write-side or replay-side defect, not a read-side one, and it
+retires this as a read-path investigation. The remaining question is how a
+logical range comes to hold self-consistent content that was never written,
+while the same range reads correctly with every device present.
+
 **What that leaves, and why it needs a decision rather than another guess.**
 The data is checksummed, the extent is stable, the expectation is right, the
 rebuild path verifies, and a direct read would be verified by
@@ -826,11 +846,12 @@ unrelated content by chance, repeatedly, is not credible.
 The same file reads EIO with one device omitted and wrong-but-clean with
 another, so it is a function of which columns were used.
 
-Next step should be instrumentation INSIDE the delivery path rather than more
-hypotheses: count data sectors delivered by a RAID5/6 recovery against sectors
-actually csum-verified for the same bio, and report when they differ. That
-turns "some path we have not observed" into a named path. Six hypotheses have
-now died; the seventh should not be a guess.
+That instrumentation is now built (`delivered_unchecked`) and came back zero,
+so the next step is on the write/replay side: establish whether the affected
+extent's data and csum items were BOTH written from a value that was never the
+file's, or whether the inode ends up pointing at a range that was later reused.
+`_EXTENT` lines show the extent address is stable across boots, so it is not
+the inode being repointed after the fact.
 
 Reproduce: `DEGRADED_MOUNT=ro BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
 <kernel> tag flakey raid5:raid1 rw 4 2`, then read `_BAD`, `_EXTENT`,

@@ -186,12 +186,16 @@ static int alloc_rbio_pages(struct btrfs_raid_bio *rbio);
 
 static int finish_parity_scrub(struct btrfs_raid_bio *rbio);
 static void fill_data_csums(struct btrfs_raid_bio *rbio);
+static phys_addr_t *sector_paddrs_in_rbio(struct btrfs_raid_bio *rbio,
+					  int stripe_nr, int sector_nr,
+					  bool bio_list_only);
 static void scrub_rbio_work_locked(struct work_struct *work);
 
 static void free_raid_bio_pointers(struct btrfs_raid_bio *rbio)
 {
 	bitmap_free(rbio->error_bitmap);
 	bitmap_free(rbio->stripe_uptodate_bitmap);
+	bitmap_free(rbio->verified_bitmap);
 	kfree(rbio->stripe_pages);
 	kfree(rbio->bio_paddrs);
 	kfree(rbio->stripe_paddrs);
@@ -984,11 +988,58 @@ static void rbio_endio_bio_list(struct bio *cur, blk_status_t status)
  * this frees the rbio and runs through all the bios in the
  * bio_list and calls end_io on them
  */
+/*
+ * Did anything check every data sector this read is about to hand back?
+ *
+ * A degraded read delivers a mix: sectors read directly from a present device,
+ * verified by verify_bio_data_sectors(), and sectors rebuilt from the parity,
+ * verified by verify_one_sector().  Both set a bit in @verified_bitmap.  A
+ * sector that is in the caller's bio, has a checksum available, and carries no
+ * such bit reached the caller through NEITHER -- and that is the only way left
+ * for a checksummed read to return content that nothing rejected.
+ *
+ * Diagnostic only: it reports, it does not change what is returned.  Silence
+ * here is the claim that the read path has no unverified delivery; a non-zero
+ * count names the case that was missing.
+ */
+static void audit_delivered_sectors(struct btrfs_raid_bio *rbio, blk_status_t status)
+{
+	unsigned int unchecked = 0;
+
+	if (rbio->operation != BTRFS_RBIO_READ_REBUILD || status != BLK_STS_OK)
+		return;
+	if (!rbio->csum_bitmap || !rbio->csum_buf || !rbio->verified_bitmap)
+		return;
+
+	for (int stripe_nr = 0; stripe_nr < rbio->nr_data; stripe_nr++) {
+		for (int sector_nr = 0; sector_nr < rbio->stripe_nsectors; sector_nr++) {
+			const int idx = stripe_nr * rbio->stripe_nsectors + sector_nr;
+
+			if (!test_bit(idx, rbio->csum_bitmap))
+				continue;
+			if (!sector_paddrs_in_rbio(rbio, stripe_nr, sector_nr, true))
+				continue;
+			if (test_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
+				     rbio->verified_bitmap))
+				continue;
+			unchecked++;
+		}
+	}
+	if (unlikely(unchecked)) {
+		atomic64_add(unchecked,
+			     &rbio->bioc->fs_info->raid56_write_stats.delivered_unchecked);
+		btrfs_warn_rl(rbio->bioc->fs_info,
+"raid56: DELIVERED_UNCHECKED %u sector(s) of full stripe %llu returned to the caller with a checksum available that nothing compared them against",
+			      unchecked, rbio->bioc->full_stripe_logical);
+	}
+}
+
 static void rbio_orig_end_io(struct btrfs_raid_bio *rbio, blk_status_t status)
 {
 	struct bio *cur = bio_list_get(&rbio->bio_list);
 	struct bio *extra;
 
+	audit_delivered_sectors(rbio, status);
 	kfree(rbio->csum_buf);
 	bitmap_free(rbio->csum_bitmap);
 	rbio->csum_buf = NULL;
@@ -1125,6 +1176,7 @@ static struct btrfs_raid_bio *alloc_rbio(struct btrfs_fs_info *fs_info,
 	rbio->finish_pointers = kcalloc(real_stripes, sizeof(void *), GFP_NOFS);
 	rbio->error_bitmap = bitmap_zalloc(num_sectors, GFP_NOFS);
 	rbio->stripe_uptodate_bitmap = bitmap_zalloc(num_sectors, GFP_NOFS);
+	rbio->verified_bitmap = bitmap_zalloc(num_sectors, GFP_NOFS);
 
 	if (!rbio->stripe_pages || !rbio->bio_paddrs || !rbio->stripe_paddrs ||
 	    !rbio->finish_pointers || !rbio->error_bitmap || !rbio->stripe_uptodate_bitmap) {
@@ -1968,6 +2020,8 @@ static void verify_bio_data_sectors(struct btrfs_raid_bio *rbio,
 		btrfs_calculate_block_csum_pages(fs_info, paddrs, csum_buf);
 		if (unlikely(memcmp(csum_buf, expected_csum, fs_info->csum_size) != 0))
 			set_bit(total_sector_nr, rbio->error_bitmap);
+		else if (rbio->verified_bitmap)
+			set_bit(total_sector_nr, rbio->verified_bitmap);
 		total_sector_nr++;
 	}
 }
@@ -2318,6 +2372,9 @@ static void count_recover_verification(struct btrfs_raid_bio *rbio, int stripe_n
 	st = &rbio->bioc->fs_info->raid56_write_stats;
 	if (ret > 0) {
 		atomic64_inc(&st->recover_verified);
+		if (rbio->verified_bitmap)
+			set_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
+				rbio->verified_bitmap);
 		return;
 	}
 	atomic64_inc(&st->recover_unverified);

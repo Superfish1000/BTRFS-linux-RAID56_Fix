@@ -583,6 +583,13 @@ struct btrfs_raid56_write_stats {
 	 */
 	atomic64_t recover_unverified_nobitmap;
 	atomic64_t recover_unverified_nobit;
+	/*
+	 * Data sectors handed back by a degraded read that had a checksum
+	 * available and were compared against it by nothing.  This is the
+	 * number that has to be zero before a degraded read can be said to
+	 * verify what it returns.
+	 */
+	atomic64_t delivered_unchecked;
 };
 
 struct btrfs_fs_info {

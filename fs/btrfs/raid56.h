@@ -220,6 +220,17 @@ struct btrfs_raid_bio {
 	unsigned long *error_bitmap;
 
 	/*
+	 * Sectors something actually checked against a data checksum, during
+	 * this rbio.  Diagnostic: a degraded read delivers a MIX of sectors it
+	 * read directly (verified by verify_bio_data_sectors()) and sectors it
+	 * rebuilt from the parity (verified by verify_one_sector()).  If a data
+	 * sector is delivered to the caller with a checksum available and no
+	 * bit set here, it reached the caller through neither, which is the
+	 * only remaining way silent wrong data can be returned.
+	 */
+	unsigned long *verified_bitmap;
+
+	/*
 	 * Checksum buffer if the rbio is for data.  The buffer should cover
 	 * all data sectors (excluding P/Q sectors).
 	 */
