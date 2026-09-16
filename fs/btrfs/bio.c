@@ -231,6 +231,20 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 	else
 		csum_result = btrfs_data_csum_check(repair_bbio, dev, 0, paddrs);
 
+	switch (csum_result) {
+	case BTRFS_CSUM_MISMATCH:
+		atomic64_inc(&fs_info->raid56_write_stats.repair_csum_mismatch);
+		break;
+	case BTRFS_CSUM_NONE:
+		atomic64_inc(&fs_info->raid56_write_stats.repair_csum_none);
+		if (repair_read_is_reconstruction(fs_info, logical, mirror))
+			atomic64_inc(&fs_info->raid56_write_stats.repair_csum_none_raid56);
+		break;
+	default:
+		atomic64_inc(&fs_info->raid56_write_stats.repair_csum_ok);
+		break;
+	}
+
 	if (csum_result == BTRFS_CSUM_MISMATCH) {
 		bio_reset(&repair_bbio->bio, NULL, REQ_OP_READ);
 		repair_bbio->bio.bi_iter = repair_bbio->saved_iter;
@@ -276,6 +290,22 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 	 */
 	if (csum_result == BTRFS_CSUM_NONE &&
 	    repair_read_is_reconstruction(fs_info, logical, mirror)) {
+		/*
+		 * Do not PERSIST it, but do return it.
+		 *
+		 * Failing the read here instead was tried and reverted: it
+		 * makes every degraded read of unchecksummed data fail, even
+		 * when the reconstruction is perfectly good, which takes
+		 * nodatacow files on a degraded array from readable to
+		 * unreadable.  nocow_persist.sh catches it -- its control arm
+		 * goes from 8 damaged blocks to 0, not because nothing was
+		 * damaged but because nothing could be read at all.
+		 *
+		 * So the asymmetry is deliberate: an unverifiable
+		 * reconstruction is good enough to hand to a caller who asked
+		 * for it, and not good enough to write over the only other
+		 * copy.  Persisting is the irreversible half.
+		 */
 		btrfs_warn_rl(fs_info,
 "read error at logical %llu rebuilt from parity but not written back: block has no checksum, the rebuild cannot be verified",
 			      logical);

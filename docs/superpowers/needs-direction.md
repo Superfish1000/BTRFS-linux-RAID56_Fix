@@ -817,6 +817,60 @@ with no checksum consulted. That is the thread to pull: whether the affected
 range still has an extent covering it in the degraded mount, not whether the
 RAID5/6 code reconstructed it correctly.
 
+### The zeros are written by btrfs_data_csum_check()
+
+Found, and it is not a mystery any more. `btrfs_data_csum_check()`
+(fs/btrfs/inode.c) ends its mismatch path with:
+
+    zeroit:
+            btrfs_print_data_csum_error(...);
+            for (int i = 0; i < nr_steps; i++)
+                    memzero_page(phys_to_page(paddrs[i]), ...);
+
+On a checksum mismatch it ZEROES the caller's page, deliberately, so a partial
+read cannot expose stale bytes. `repair_one_sector()` then reads the repair
+directly back into those same pages (`bio_add_page(repair_bio,
+phys_to_page(paddrs[i]), ...)`). So the zeros are already accounted for: any
+sector that fails its checksum is zeroed, and it stays zeroed unless a repair
+puts something else there.
+
+That means the remaining question is not "where do zeros come from" but "how
+does a zeroed sector reach the reader with the bio still reporting success",
+since every path that should catch it sets BLK_STS_IOERR:
+`repair_one_sector()` when num_copies == 1, and `btrfs_end_repair_bio()` when
+the mirrors are exhausted.
+
+Measured outcomes of the repair path on runs that reproduce:
+
+    repair_csum_ok            32-48
+    repair_csum_mismatch      20-27
+    repair_csum_none          0
+    repair_csum_none_raid56   0
+
+So repairs are succeeding WITH a verified checksum, which means the page they
+left behind matched its checksum and is correct. A sector that is both
+correct-by-checksum and zero is a contradiction, so the zeroed sectors are not
+the ones being repaired -- something zeroes a sector whose repair is never
+attempted, or attempted against the wrong sector.
+
+### A fix that was tried, measured, and reverted
+
+Making the unverifiable-reconstruction branch of `btrfs_end_repair_bio()` fail
+the read (`bi_status = BLK_STS_IOERR`) instead of returning the content is
+policy-conformant on its face -- a reconstruction nothing can check is a guess,
+and the series refuses to persist those already.
+
+It is wrong, and the suite caught it. It makes EVERY degraded read of
+unchecksummed data fail, including the ones whose reconstruction is perfectly
+good, taking nodatacow files on a degraded array from readable to unreadable.
+`nocow_persist.sh`'s control arm drops from 8 damaged blocks to 0 -- not
+because nothing was damaged, but because nothing could be read at all.
+
+Reverted, with the asymmetry now stated in the code: an unverifiable
+reconstruction is good enough to hand to a caller who asked for it, and not
+good enough to write over the only other copy. Persisting is the irreversible
+half.
+
 ### Where the zeros are NOT, by measurement
 
 Every path that can make a btrfs data read return bytes it did not read was

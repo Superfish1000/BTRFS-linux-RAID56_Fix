@@ -154,7 +154,7 @@ verify_manifest() {
 	done < $T/umltest/manifest.$TAG
 	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
 	for g in /sys/fs/btrfs/*/raid56_write_profile; do
-		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_|delivered_' $g | tr '\n' ' ')"
+		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_|delivered_|repair_csum' $g | tr '\n' ' ')"
 	done
 	# Whose sectors are being returned unchecked?  Take the addresses the
 	# kernel just named and ask the extent tree who owns them.

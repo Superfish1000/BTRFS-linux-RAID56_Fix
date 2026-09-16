@@ -609,6 +609,18 @@ struct btrfs_raid56_write_stats {
 	atomic64_t delivered_nocsum;
 	/* Data sectors handed back by a degraded read that are entirely zero. */
 	atomic64_t delivered_zero;
+	/*
+	 * What btrfs_end_repair_bio() concluded about a repair read, split by
+	 * outcome.  A repair that reports BTRFS_CSUM_NONE is handed to the
+	 * READER -- only the write-back is suppressed -- so if that ever fires
+	 * for a block that does have a checksum item, unverified content is
+	 * being returned as the file's data.
+	 */
+	atomic64_t repair_csum_ok;
+	atomic64_t repair_csum_none;
+	atomic64_t repair_csum_mismatch;
+	/* The subset of repair_csum_none that was a RAID5/6 reconstruction. */
+	atomic64_t repair_csum_none_raid56;
 };
 
 struct btrfs_fs_info {
