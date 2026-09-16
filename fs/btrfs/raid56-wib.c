@@ -1971,6 +1971,26 @@ void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info)
 	ev = fs_info->raid56_evidence;
 	fs_info->raid56_evidence = NULL;
 	mutex_unlock(&fs_info->raid56_evidence_lock);
+	/*
+	 * Disarming with entries still queued throws them away, and they are
+	 * the one thing here that cannot be recovered afterwards: the stripe
+	 * they came from is not read again, and the scrub that held its
+	 * columns together has finished.  Refusing is not an option -- a
+	 * helper that died has to be able to have its memory freed, and this
+	 * is also the unmount path -- so say it instead of losing them
+	 * quietly.  A helper drains once more before disarming; one that does
+	 * not should be told it did.
+	 */
+	if (unlikely(ev && ev->nr))
+		/*
+		 * Rate limited, not because the message is unimportant but
+		 * because an unprivileged-of-nothing loop of ARM/DISARM would
+		 * otherwise be a way to fill the kernel log from userspace.
+		 * The first of a burst is what an operator needs.
+		 */
+		btrfs_warn_rl(fs_info,
+"raid56: evidence channel disarmed with %u captured stripe(s) still unread; they are discarded",
+			      ev->nr);
 	evidence_free(ev);
 }
 

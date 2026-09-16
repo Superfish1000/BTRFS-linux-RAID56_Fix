@@ -192,6 +192,20 @@ fi
 [ "${w_cap:-0}" -eq 0 ] 2>/dev/null || bad "a stripe was copied even though every stripe was too wide"
 
 [ "$(rc_of race)" = "0" ] || bad "the scrub boot did not finish while the channel was being armed and disarmed under it"
+
+# Disarming while entries are queued discards them, which is the one loss the
+# kernel cannot do anything about -- so it has to say so.  The race arm
+# disarms thousands of times without draining, so it reaches that path; the
+# arms that drain before disarming must not.
+discarded() {
+	grep -hac "disarmed with .* still unread" \
+		$T/umltest/results.evdrop-$1 $T/umltest/evdrop-$1/log.* 2>/dev/null |
+		awk '{s+=$1} END {print s+0}'
+}
+[ "$(discarded race)" -gt 0 ] 2>/dev/null || bad "arming and disarming without draining discarded nothing, so the warning path never ran"
+for a in drain nowait full wide; do
+	[ "$(discarded $a)" -eq 0 ] 2>/dev/null || bad "$a arm drained before disarming and still discarded queued evidence"
+done
 for a in drain nowait full wide race; do
 	[ "$(splat_of $a)" = "0" ] || bad "$a arm produced a kernel splat"
 done
