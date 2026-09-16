@@ -1317,6 +1317,13 @@ nocow_persist_scrub)
 			grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
 		$T/umltest/evidence $MNT disarm 2>&1 |
 			while read -r l; do log "evidence: $l"; done
+		# The kernel says when a disarm threw queued stripes away.  It
+		# is a KERN_WARNING, which "quiet" keeps off the console, and
+		# the dmesg dump further down filters for scrub messages, which
+		# this is not -- so take it out of the ring buffer here or it
+		# is invisible to the test that exists to check it.
+		dmesg | grep -o 'evidence channel disarmed with.*' |
+			while read -r l; do log "evidence: $l"; done
 		log "EVIDENCE_FILES=$(ls $EVDIR/*.data 2>/dev/null | wc -l) EVIDENCE_BYTES=$(cat $EVDIR/*.data 2>/dev/null | wc -c)"
 		while read -r l; do log "scrub: $l"; done < /tmp/scrub.out
 	else
