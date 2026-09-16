@@ -55,6 +55,13 @@ int main(int argc, char **argv)
 		memcpy(&e, a->buf + off, sizeof(e));
 		if (!e.length)
 			break;
+		printf("CSUMENT %s off=%llu len=%llu type=0x%x%s%s%s%s\n",
+		       argv[1], (unsigned long long)e.offset,
+		       (unsigned long long)e.length, e.type,
+		       (e.type & HAS_CSUMS) ? " HAS_CSUMS" : "",
+		       (e.type & NODATASUM) ? " NODATASUM" : "",
+		       (e.type & ZEROED) ? " ZEROED" : "",
+		       (e.type & COMPRESSED) ? " COMPRESSED" : "");
 		if (e.type & HAS_CSUMS) has += 1;
 		else if (e.type & NODATASUM) nosum += 1;
 		else if (e.type & ZEROED) zero += 1;

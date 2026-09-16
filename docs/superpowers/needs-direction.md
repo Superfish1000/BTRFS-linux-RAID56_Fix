@@ -761,3 +761,59 @@ never block.
   group is read-only, i.e. only during that chunk's scrub. A helper that drains
   the queue and reads the parity later races relocation and the allocator.
   Nothing enforces the ordering, and nothing warns.
+
+
+---
+
+## 18. A degraded rebuild returns sectors of a checksummed file with no checksum bit
+
+Fixed in this series: the degraded RAID5/6 read path never armed checksum
+verification at all (`fill_data_csums()` had one caller, the RMW *write* path),
+so every reconstruction was handed back unchecked. Arming it converts most of
+the silent wrong data into honest EIO.
+
+**What is left, and it is a separate defect.** Counters added alongside the fix
+(`recover_verified_sectors`, `recover_unverified_nobitmap`,
+`recover_unverified_nobit`, in `raid56_write_profile`) say this precisely:
+
+    recover_unverified_nobitmap  0     always
+    recover_unverified_nobit     16 or 32 per degraded boot
+
+So `fill_data_csums()` succeeds and builds a bitmap -- it is not bailing, and
+its "failed to get csum" warning never fires -- but
+`btrfs_lookup_csums_bitmap()` leaves specific sectors uncovered. Those sectors
+are in the caller's bio (the counter only counts sectors for which
+`sector_paddrs_in_rbio(..., true)` returns non-NULL), so they are being handed
+back to somebody as content.
+
+Two facts make this hard to explain and worth someone's attention:
+
+- The counts are exact multiples of 16 sectors. At 4 KiB sectors that is
+  65536 bytes -- exactly one column, BTRFS_STRIPE_LEN. Whole columns are
+  uncovered, not scattered sectors.
+- The files involved ARE fully checksummed. `BTRFS_IOC_GET_CSUMS` via
+  tools/testing/btrfs/csummap.c reports a single range per file,
+  `off=0 len=<full size> type=0x1 HAS_CSUMS`, no gaps, no NODATASUM.
+
+So a file whose every byte has a checksum item has a whole column's worth of
+sectors rebuilt from parity and returned without that checksum being consulted.
+
+Candidates not yet eliminated:
+- The lookup range. `fill_data_csums()` uses `rbio->bioc->full_stripe_logical`;
+  if that is not set the same way for a recover bioc as for an RMW one, the
+  lookup searches the wrong range. Most sectors DO verify, which argues
+  against it, but a boundary error would fit the "whole column" shape.
+- Bitmap index agreement. The bitmap is filled by logical offset from `start`
+  while `verify_one_sector()` indexes `stripe_nr * stripe_nsectors + sector_nr`.
+  These agree only if the rbio's stripe numbering is logical column order for
+  the rotated layout.
+- The caller may not be a file read at all (scrub, readahead), in which case
+  the sector is in a bio but no data checksum is expected to cover it -- which
+  would make the residual benign and the counter misnamed.
+
+Reproduce: `BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh <kernel> tag
+flakey raid5:raid1 rw 4 2`, then read `_RECOVER` and `_BADCSUM` lines from
+`results.<tag>`. Every unverified returned sector also logs a rate-limited
+warning naming its full stripe, but the harness runs the guest `quiet` so that
+warning does not reach the captured log -- add the pattern to a `kmsg` call to
+see it.

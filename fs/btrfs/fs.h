@@ -575,6 +575,14 @@ struct btrfs_raid56_write_stats {
 	atomic64_t recover_unverified;
 	/* Data sectors a degraded read rebuilt and a checksum vouched for. */
 	atomic64_t recover_verified;
+	/*
+	 * The unverified ones split by CAUSE, because they need different
+	 * answers.  @nobitmap: the rbio had no checksum bitmap at all, so
+	 * fill_data_csums() bailed for the whole stripe.  @nobit: the bitmap
+	 * existed but nothing covered this sector.
+	 */
+	atomic64_t recover_unverified_nobitmap;
+	atomic64_t recover_unverified_nobit;
 };
 
 struct btrfs_fs_info {

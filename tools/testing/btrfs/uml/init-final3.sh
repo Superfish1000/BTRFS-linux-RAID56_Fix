@@ -121,7 +121,7 @@ verify_manifest() {
 	done < $T/umltest/manifest.$TAG
 	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
 	for g in /sys/fs/btrfs/*/raid56_write_profile; do
-		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_(un)?verified' $g | tr '\n' ' ')"
+		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_' $g | tr '\n' ' ')"
 	done
 	[ "$bad" = 0 ] || kmsg "csum|error|corrupt" 5
 }

@@ -2321,6 +2321,10 @@ static void count_recover_verification(struct btrfs_raid_bio *rbio, int stripe_n
 		return;
 	}
 	atomic64_inc(&st->recover_unverified);
+	if (!rbio->csum_bitmap || !rbio->csum_buf)
+		atomic64_inc(&st->recover_unverified_nobitmap);
+	else
+		atomic64_inc(&st->recover_unverified_nobit);
 	btrfs_warn_rl(rbio->bioc->fs_info,
 "raid56: returning a sector of full stripe %llu rebuilt from the parity with nothing to check it against; if that parity does not describe the data, this is silently not what was written",
 		      rbio->bioc->full_stripe_logical);
