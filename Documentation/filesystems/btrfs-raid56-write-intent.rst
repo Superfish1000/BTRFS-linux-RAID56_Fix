@@ -321,7 +321,8 @@ Log full                                  RMW waits for in-flight ones; error re
 Crash after some data/parity writes       Stripe listed; scrubbed and parity regenerated at mount.
 Torn data or parity sector                Same; the regeneration reads what is on disk.
 Write error on a data or parity device    Stripe stays listed (error record) until scrubbed.
-Device pulled during writes               As above; scrubbed once it is back or replaced.
+Device pulled during writes               As above; scrubbed at the next mount, by a device
+                                          replace, or by any scrub -- see below.
 Crash after all writes, before the clear  Stripe listed; the scrub is a no-op.
 Crash during the clear (torn block)       Older block valid, same as above.
 Clear write I/O error                     Device keeps the older block, which lists a superset.
@@ -337,9 +338,8 @@ Repair write-back fails during recovery   Same.
 Unreadable sector without extent          Parity of that vertical stripe left alone (after the
                                           log replay, if any); the record is dropped.
 Device missing at recovery                Missing sectors rebuilt and verified; parity written
-                                          to the present devices; the stripe stays recorded and
-                                          is scrubbed again once the device is back or replaced,
-                                          so its stale sectors get repaired.
+                                          to the present devices; the stripe stays recorded
+                                          until something scrubs it again -- see below.
 Extent only in the tree log at recovery   Plain record: parity of every vertical stripe
                                           regenerated, covers it.  Error record: scrubbed again
                                           after the log replay.
@@ -365,6 +365,26 @@ In-place (nodatacow/prealloc) write       Recorded even when it covers the full 
 Older kernel                              Mounts read-only (compat_ro flag).
 Degraded before the crash                 Documented limit: detected, not silent (see above).
 ========================================  ========================================================
+
+What retires a record
+=====================
+
+Nothing retires a record on its own, and a device reappearing does not trigger
+anything: ``btrfs_wib_recover()`` runs at mount and nowhere else.  A stripe
+that stayed recorded is scrubbed again by one of three things, and until one of
+them happens its redundancy is not restored:
+
+* the next mount, which runs the recovery over every recorded stripe;
+* a device replace, which drives the ordinary scrub machinery
+  (``btrfs_scrub_dev()``) over the source device's stripes, so the plan the
+  record implies applies there too;
+* any ``btrfs scrub``, which consults the record for every full stripe it
+  reaches.
+
+So a filesystem that stays mounted after a write error keeps the record, keeps
+reading those sectors correctly -- the record is what makes a degraded read
+rebuild them rather than believe them -- and regains the redundancy at the next
+scrub or mount, not before.  Plugging the device back in is not enough.
 
 Verification
 ============
