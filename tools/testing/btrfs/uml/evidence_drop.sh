@@ -33,9 +33,16 @@
 # Every arm builds the same state as nocow_persist.sh's ambiguous case -- a
 # device failing writes, every parity recorded unusable -- because that is what
 # makes a scrub decline, which is what makes a capture happen.
+#
+# --judge re-reads the results of a previous run and applies the checks below
+# without booting anything, the way regress.sh --check-log does.  A check that
+# has to be corrected should not cost five arms' worth of boots to re-validate.
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: evidence_drop.sh <kernel> [ndev]}
+JUDGE=0
+if [ "${1:-}" = "--judge" ]; then JUDGE=1; shift; fi
+KERNEL=${1:-judge-only}
+[ "$JUDGE" = 1 ] || [ -n "${1:-}" ] || { echo "usage: evidence_drop.sh [--judge] <kernel> [ndev]" >&2; exit 2; }
 NDEV=${2:-4}
 FAIL=1
 PROFILE=raid5:raid1
@@ -54,6 +61,8 @@ SIZEMB=${SIZEMB:-8}
 
 arm() {	# tag evidence-mode [extra-cmdline]
 	local tag=evdrop-$1 mode=$2 cmdline="${3:-}" d ubds="" D
+
+	[ "$JUDGE" = 1 ] && return 0
 	D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D
 	rm -f $T/umltest/results.$tag
@@ -165,10 +174,18 @@ if [ "${f_full:-0}" -eq 0 ] 2>/dev/null; then
 fi
 [ "${f_cap:-0}" -le 4 ] 2>/dev/null || bad "the ring kept $f_cap stripe(s) with nothing draining it, but it only has 4 slots"
 [ "${f_cap:-0}" -gt 0 ] 2>/dev/null || bad "the ring filled without keeping anything"
-# A dead helper must cost ONE grace period, not one per declined stripe.  Not
-# zero either: if no capture ever slept, ->stalled was not what bounded it and
-# this proves nothing.
-[ "${f_wait:-0}" -eq 1 ] 2>/dev/null || bad "with nothing draining, $f_wait capture(s) waited out the grace period; exactly one should have"
+# A dead helper must not cost a grace period per declined stripe -- that is
+# what ->stalled is for.  It is not exactly one, though: "btrfs scrub start"
+# runs one scrub context per device, so up to that many captures can already
+# be asleep before the first of them times out and sets the flag.  The
+# property is that the count is bounded by the concurrency, not by how many
+# stripes were declined.
+#
+# Not zero either: if no capture ever slept, something other than ->stalled
+# bounded it and this arm proves nothing.
+[ "${f_wait:-0}" -ge 1 ] 2>/dev/null || bad "with nothing draining, no capture ever waited, so ->stalled is not what bounded this"
+[ "${f_wait:-0}" -lt "$total" ] 2>/dev/null || bad "with nothing draining, $f_wait of $total declined stripe(s) each waited out the grace period; ->stalled did not bound it"
+[ "${f_wait:-0}" -le "$NDEV" ] 2>/dev/null || bad "$f_wait captures waited with only $NDEV scrub context(s) to be asleep in"
 
 
 [ "${w_wide:-0}" -gt 0 ] 2>/dev/null || bad "no stripe was refused for width even with the limit at one column"
@@ -187,7 +204,7 @@ echo "RESULT: PASS -- a draining helper keeps all $d_cap declined stripe(s), $d_
 echo "        them only because the capture waited; the same run without waiting"
 echo "        loses $n_full.  With nothing draining, the ring keeps $f_cap, counts"
 echo "        $f_full dropped rather than overwriting, and waits out the grace"
-echo "        period $f_wait time(s) rather than once per stripe.  A stripe too wide"
+echo "        period $f_wait time(s) -- one per scrub context, not per stripe.  A stripe too wide"
 echo "        to copy is refused and counted ($w_wide), not half-copied.  Arming and"
 echo "        disarming under live captures neither hangs the scrub nor trips a"
 echo "        lock check, with a disarm landing inside every capture."
