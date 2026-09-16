@@ -10,6 +10,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-final3.sh
 cp $HERE/../raid56_wib_dump.py $T/umltest/ 2>/dev/null || true
+# The checksum reader the diagnostics use: it prints what the csum tree holds
+# for each sector next to the crc32c of the bytes the filesystem hands back, so
+# a sector that reads wrong can be attributed to the read path or to whatever
+# wrote it.  A missing compiler just means those lines are absent.
+cc -O2 -o $T/umltest/csummap $HERE/../csummap.c 2>/dev/null || true
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D
 rm -f $T/umltest/results.$TAG $T/umltest/manifest.$TAG $T/umltest/nocow.md5.$TAG $T/umltest/old.md5.$TAG

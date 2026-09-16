@@ -1086,6 +1086,19 @@ static void audit_delivered_sectors(struct btrfs_raid_bio *rbio, blk_status_t st
 			}
 			if (all_zero)
 				zeros++;
+			if (unlikely(btrfs_raid56_trace_reads())) {
+				const int idx = stripe_nr * rbio->stripe_nsectors + sector_nr;
+
+				btrfs_info(rbio->bioc->fs_info,
+"raid56: RTRACE deliver logical %llu csum_bit %d verified %d zero %d",
+					   rbio->bioc->full_stripe_logical +
+					   ((u64)stripe_nr << BTRFS_STRIPE_LEN_SHIFT) +
+					   ((u64)sector_nr << rbio->bioc->fs_info->sectorsize_bits),
+					   test_bit(idx, rbio->csum_bitmap) ? 1 : 0,
+					   test_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
+						    rbio->verified_bitmap) ? 1 : 0,
+					   all_zero ? 1 : 0);
+			}
 		}
 	}
 	if (unlikely(zeros)) {
@@ -3329,6 +3342,17 @@ MODULE_PARM_DESC(raid56_scrub_trusts_rebuild,
 bool btrfs_raid56_scrub_trusts_rebuild(void)
 {
 	return READ_ONCE(scrub_trusts_rebuild);
+}
+
+/* See btrfs_raid56_trace_reads() in volumes.h. */
+static bool trace_reads;
+module_param_named(raid56_trace_reads, trace_reads, bool, 0644);
+MODULE_PARM_DESC(raid56_trace_reads,
+		 "Log every data sector a RAID5/6 read returns, and what checked it (testing only)");
+
+bool btrfs_raid56_trace_reads(void)
+{
+	return READ_ONCE(trace_reads);
 }
 #endif
 

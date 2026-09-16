@@ -830,10 +830,19 @@ bool btrfs_raid56_stale_read_legacy(void);
  * scrub_note_unprovable().
  */
 bool btrfs_raid56_scrub_trusts_rebuild(void);
+/*
+ * Print one line per data sector that a RAID5/6 read hands back, saying
+ * whether a checksum was available for it and whether anything compared it.
+ * Not rate limited, because the question it answers is about a specific
+ * sector: a rate-limited line cannot tell "this sector was fine" from "this
+ * line was dropped".
+ */
+bool btrfs_raid56_trace_reads(void);
 #else
 static inline bool btrfs_raid56_allow_nodatacow(void) { return false; }
 static inline bool btrfs_raid56_stale_read_legacy(void) { return false; }
 static inline bool btrfs_raid56_scrub_trusts_rebuild(void) { return false; }
+static inline bool btrfs_raid56_trace_reads(void) { return false; }
 #endif
 
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,

@@ -8,6 +8,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-final3.sh
 cp $HERE/../raid56_wib_dump.py $T/umltest/ 2>/dev/null || true
+# The checksum reader the diagnostics use: it prints what the csum tree holds
+# for each sector next to the crc32c of the bytes the filesystem hands back, so
+# a sector that reads wrong can be attributed to the read path or to whatever
+# wrote it.  A missing compiler just means those lines are absent.
+cc -O2 -o $T/umltest/csummap $HERE/../csummap.c 2>/dev/null || true
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D; rm -f $T/umltest/results.$TAG $T/umltest/stop.$TAG $T/umltest/manifest.$TAG $T/umltest/nocow.md5.$TAG $T/umltest/old.md5.$TAG
 for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; done
@@ -19,7 +24,7 @@ boot() {
 		ubds="$ubds ubd$d=$D/disk$d.img"
 	done
 	timeout 1500 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw init=$T/umltest/init-final3.sh $ubds \
-		quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T DEGRADED_MOUNT=${DEGRADED_MOUNT:-} MODE=$mode OPTS=$OPTS PROFILE=$PROFILE CRASH=1 TAG=$TAG \
+		quiet con=null con0=fd:0,fd:1 ${EXTRA_CMDLINE:-} BTRFS_TEST_DIR=$T DEGRADED_MOUNT=${DEGRADED_MOUNT:-} MODE=$mode OPTS=$OPTS PROFILE=$PROFILE CRASH=1 TAG=$TAG \
 		MNTDEV=$mntdev NDEV=$NDEV FAIL=$FAIL $extra > $D/log.$mode.omit${omit// /-} 2>&1
 	echo "boot $mode omit=$omit rc=$?" >> $T/umltest/results.$TAG
 }

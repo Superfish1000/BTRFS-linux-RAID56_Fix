@@ -65,7 +65,7 @@ do_mount() {
 verify_manifest() {
 	# Every file whose fsync returned before the crash, name + md5.
 	[ -f $T/umltest/manifest.$TAG ] || return 0
-	local total=0 bad=0 srcok=0 f m sz srcmd got gotsz
+	local total=0 bad=0 srcok=0 silent=0 f m sz srcmd got gotsz
 	while read -r f m sz srcmd; do
 		total=$((total+1))
 		got=$(md5sum $f 2>/dev/null | awk '{print $1}')
@@ -85,6 +85,14 @@ verify_manifest() {
 			# tell them apart -- md5sum is perfectly happy to hash a
 			# truncated file and print a valid, different digest.
 			gotsz=$(stat -c %s "$f" 2>/dev/null || echo "?")
+			# The distinction that matters.  A read that FAILS is
+			# the checksum working: the caller is told the content
+			# is unavailable and no data is lost that was not
+			# already lost.  A read that SUCCEEDS with content
+			# nobody wrote is silent corruption -- the caller has
+			# no way to know.  Only the second is a defect in the
+			# read path, so count it on its own.
+			[ -n "$got" ] && [ "$gotsz" = "${sz:-?}" ] && silent=$((silent+1))
 			log "$1_BAD $f expected $m got ${got:-READFAIL} size ${gotsz} expected_size ${sz:-?}"
 			# A file that reads back COMPLETE with novel content and
 			# no error should be impossible: plain dd means the data
@@ -152,10 +160,16 @@ verify_manifest() {
 			awk '/^[ ]*0:/ {gsub(/\.\./,"",$4); print $4; exit}')
 		log "$1_EXTENT $f logical=$((${blk:-0} * 4096)) size=$(stat -c %s "$f" 2>/dev/null) head=$(od -An -tx1 -N16 "$f" 2>/dev/null | tr -d ' \n') tail=$(dd if="$f" bs=1 skip=$(( ${sz:-4096} - 16 )) count=16 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')"
 	done < $T/umltest/manifest.$TAG
-	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
+	log "$1_MANIFEST total=$total bad=$bad silent=$silent manifest_wrong=$srcok"
 	for g in /sys/fs/btrfs/*/raid56_write_profile; do
 		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_|delivered_|repair_csum' $g | tr '\n' ' ')"
 	done
+	# The per-sector trace, when btrfs.raid56_trace_reads=1 is on the kernel
+	# command line.  One line per data sector a RAID5/6 read returned, from
+	# three points: the first read, any repair, and the hand-back.  Printed
+	# at KERN_INFO, which "quiet" keeps off the console, so read the ring
+	# buffer instead.
+	dmesg | grep -o 'RTRACE .*' | while read -r l; do log "$1_RTRACE $l"; done
 	# Whose sectors are being returned unchecked?  Take the addresses the
 	# kernel just named and ask the extent tree who owns them.
 	log "$1_UNVERIFIED_ADDRS $(dmesg | grep -o 'UNVERIFIED_REBUILD logical [0-9]*' | awk '{print $3}' | sort -un | tr '\n' ' ')"
