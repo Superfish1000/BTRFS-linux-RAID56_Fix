@@ -1265,6 +1265,14 @@ struct btrfs_ioctl_raid56_evidence_args {
 	__u64 dropped_wide;
 	/* Out: stripes captured since ARM. */
 	__u64 captured;
+	/*
+	 * Out: stripes whose capture had to sleep waiting for the reader to
+	 * free a slot, whether or not it then got one.  A non-zero count means
+	 * the reader is only just keeping up; dropped_full means it did not.
+	 */
+	__u64 waited;
+	/* Room for further counters without moving the ioctl number again. */
+	__u64 reserved[8];
 	/* Out: device id and physical offset of each column. */
 	__u64 devid[BTRFS_RAID56_EVIDENCE_MAX_COLS];
 	__u64 physical[BTRFS_RAID56_EVIDENCE_MAX_COLS];

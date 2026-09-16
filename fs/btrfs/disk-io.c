@@ -1878,6 +1878,7 @@ void btrfs_free_fs_roots(struct btrfs_fs_info *fs_info)
 static void btrfs_init_scrub(struct btrfs_fs_info *fs_info)
 {
 	mutex_init(&fs_info->scrub_lock);
+	mutex_init(&fs_info->raid56_evidence_lock);
 	atomic_set(&fs_info->scrubs_running, 0);
 	atomic_set(&fs_info->scrub_pause_req, 0);
 	atomic_set(&fs_info->scrubs_paused, 0);

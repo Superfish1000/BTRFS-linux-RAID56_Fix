@@ -447,12 +447,20 @@ struct btrfs_raid56_evidence_slot {
 	void *data;
 };
 
+/* Every field is protected by fs_info->raid56_evidence_lock. */
 struct btrfs_raid56_evidence {
-	spinlock_t lock;
 	u32 head;
 	u32 nr;
+	/*
+	 * A capture has already waited out the full grace period for a slot
+	 * once and nothing drained.  Set so the rest of the scrub does not pay
+	 * that wait per declined stripe; cleared as soon as a read arrives,
+	 * because a helper that is reading again is a helper worth waiting for.
+	 */
+	bool stalled;
 	u64 dropped_full;
 	u64 dropped_wide;
+	u64 waited;
 	u64 captured;
 	struct btrfs_raid56_evidence_slot slots[BTRFS_RAID56_EVIDENCE_SLOTS];
 };

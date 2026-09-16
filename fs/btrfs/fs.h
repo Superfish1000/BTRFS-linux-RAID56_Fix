@@ -763,10 +763,20 @@ struct btrfs_fs_info {
 	struct btrfs_wib *wib;
 	/*
 	 * Armed by BTRFS_IOC_RAID56_EVIDENCE only, so a filesystem nobody is
-	 * watching allocates nothing.  RCU-free pointer: readers take
-	 * ->lock, the arm/disarm path is serialised by the ioctl's own
-	 * exclusivity.
+	 * watching allocates nothing.
+	 *
+	 * The lock lives here rather than inside the channel, and it covers
+	 * the POINTER as well as the contents.  It used to sit inside the
+	 * object, which meant a capture could read the pointer, have disarm
+	 * free the object, and then take a lock in freed memory.  Nothing
+	 * serialises the ioctl against itself either, so two arms could both
+	 * allocate.  A lock with the fs_info's lifetime closes both.
+	 *
+	 * It is a mutex, not a spinlock: a capture holds it across a copy of
+	 * every data column -- up to a megabyte -- and arming allocates the
+	 * slots under GFP_KERNEL.  Every caller is in process context.
 	 */
+	struct mutex raid56_evidence_lock;
 	struct btrfs_raid56_evidence *raid56_evidence;
 	/* How RAID56 writes divide, see rmw_assemble_write_bios(). */
 	struct btrfs_raid56_write_stats raid56_write_stats;

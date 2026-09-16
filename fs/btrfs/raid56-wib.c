@@ -1828,34 +1828,123 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
  * racing anything.  The alternative is issuing more reads to an array that is
  * failing by construction, on a path with no REQ_FAILFAST and no timeout.
  */
+/*
+ * A hint, deliberately taken without the lock: it exists so that a filesystem
+ * nobody is watching pays one load per declined stripe rather than a mutex.
+ * It can go stale the instant it is read, so it is only ever used to skip work
+ * -- btrfs_raid56_evidence_claim() decides for real, under the lock.
+ */
 bool btrfs_raid56_evidence_armed(const struct btrfs_fs_info *fs_info)
 {
 	return READ_ONCE(fs_info->raid56_evidence) != NULL;
+}
+
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Lower the column count at which the channel refuses to copy a stripe.
+ *
+ * A stripe is refused when it has more columns than the header can name
+ * (BTRFS_RAID56_EVIDENCE_MAX_COLS, 34) or more data than a slot can hold
+ * (BTRFS_RAID56_EVIDENCE_MAX_BYTES, sixteen columns' worth).  The second is
+ * the one a real array hits first: a RAID5 exceeds it at eighteen devices.
+ * UML tops out at sixteen block devices, so neither refusal, nor the
+ * dropped_wide counter that reports it, could be reached by any test on this
+ * rig.  With this set, an ordinary four-device array reaches the first.
+ */
+static unsigned int evidence_max_cols;
+module_param_named(raid56_evidence_max_cols, evidence_max_cols, uint, 0644);
+MODULE_PARM_DESC(raid56_evidence_max_cols,
+		 "Refuse to copy a stripe wider than this many columns; 0 for the real limit (testing only)");
+#endif
+
+/*
+ * How long a capture will wait for the helper to free a slot before giving up
+ * on the stripe.
+ *
+ * Measured, before this existed: a scrub declining nine stripes with a helper
+ * draining once a second kept four and dropped five.  The stripes arrive in
+ * bursts, faster than any poll interval, so "drain more often" cannot fix it
+ * -- the capture has to be willing to wait.  Scrub is background work and this
+ * is the one moment those bytes exist together, so a few seconds of scrub is a
+ * good trade for a full stripe of evidence.
+ *
+ * The total is bounded, and a capture that waits it out in vain sets ->stalled
+ * so the rest of the scrub does not pay it again: a helper that died costs one
+ * grace period, not one per declined stripe.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Hold the window between claiming a slot and publishing it open for this
+ * long.
+ *
+ * That window is the one the locking rework is about: a disarm landing inside
+ * it used to clear the channel pointer, block on the channel's own lock, and
+ * never be woken, because the capture then saw a NULL pointer and returned
+ * without releasing that lock.  It is a memcpy wide, so a test can only hope
+ * to hit it; with this set it hits it every time.
+ */
+static unsigned int evidence_capture_delay_ms;
+module_param_named(raid56_evidence_capture_delay_ms, evidence_capture_delay_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_evidence_capture_delay_ms,
+		 "Hold a claimed evidence slot this long before publishing it (testing only)");
+#endif
+
+#define EVIDENCE_WAIT_STEP_MS	50
+static unsigned int evidence_wait_ms = 5000;
+module_param_named(raid56_evidence_wait_ms, evidence_wait_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_evidence_wait_ms,
+		 "How long a declined stripe waits for a free evidence slot, 0 to drop immediately");
+
+static u32 evidence_col_limit(void)
+{
+#ifdef CONFIG_BTRFS_DEBUG
+	unsigned int v = READ_ONCE(evidence_max_cols);
+
+	if (v && v < BTRFS_RAID56_EVIDENCE_MAX_COLS)
+		return v;
+#endif
+	return BTRFS_RAID56_EVIDENCE_MAX_COLS;
+}
+
+static void evidence_free(struct btrfs_raid56_evidence *ev)
+{
+	if (!ev)
+		return;
+	for (int i = 0; i < BTRFS_RAID56_EVIDENCE_SLOTS; i++)
+		kvfree(ev->slots[i].data);
+	kfree(ev);
 }
 
 int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_raid56_evidence *ev;
 
-	if (fs_info->raid56_evidence)
-		return 0;
-
+	/*
+	 * Allocate before taking the lock, and drop it again if someone else
+	 * armed in the meantime.  Testing the pointer first and allocating
+	 * after left two concurrent arms both allocating, with the loser's
+	 * four megabytes of slots unreachable for the life of the mount.
+	 */
 	ev = kzalloc(sizeof(*ev), GFP_KERNEL);
 	if (!ev)
 		return -ENOMEM;
-	spin_lock_init(&ev->lock);
 	for (int i = 0; i < BTRFS_RAID56_EVIDENCE_SLOTS; i++) {
 		ev->slots[i].data = kvmalloc(BTRFS_RAID56_EVIDENCE_MAX_BYTES,
 					     GFP_KERNEL);
 		if (!ev->slots[i].data) {
-			while (--i >= 0)
-				kvfree(ev->slots[i].data);
-			kfree(ev);
+			evidence_free(ev);
 			return -ENOMEM;
 		}
 	}
-	/* Publish last: a capture that sees the pointer must see the slots. */
-	smp_store_release(&fs_info->raid56_evidence, ev);
+
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	if (fs_info->raid56_evidence) {
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		evidence_free(ev);
+		return 0;
+	}
+	fs_info->raid56_evidence = ev;
+	mutex_unlock(&fs_info->raid56_evidence_lock);
 	btrfs_info(fs_info,
 		   "raid56: evidence channel armed, %u slots of %u bytes",
 		   BTRFS_RAID56_EVIDENCE_SLOTS,
@@ -1865,20 +1954,24 @@ int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info)
 
 void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_raid56_evidence *ev = fs_info->raid56_evidence;
+	struct btrfs_raid56_evidence *ev;
 
-	if (!ev)
-		return;
-	WRITE_ONCE(fs_info->raid56_evidence, NULL);
 	/*
-	 * Captures run from the scrub thread and only ever hold ->lock; take
-	 * it once to wait for any that is mid-copy before freeing under it.
+	 * Unpublish under the lock, free outside it.  Every capture and every
+	 * read runs wholly under the same lock, so once it is released here
+	 * none of them can be holding a reference: they either took the lock
+	 * before this and finished, or take it after and find NULL.
+	 *
+	 * The lock being in fs_info rather than in @ev is what makes that
+	 * true.  With the lock inside the object, a capture that had read the
+	 * pointer but not yet taken the lock was invisible to any handshake
+	 * done here, and locked freed memory a moment later.
 	 */
-	spin_lock(&ev->lock);
-	spin_unlock(&ev->lock);
-	for (int i = 0; i < BTRFS_RAID56_EVIDENCE_SLOTS; i++)
-		kvfree(ev->slots[i].data);
-	kfree(ev);
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	ev = fs_info->raid56_evidence;
+	fs_info->raid56_evidence = NULL;
+	mutex_unlock(&fs_info->raid56_evidence_lock);
+	evidence_free(ev);
 }
 
 /*
@@ -1895,61 +1988,123 @@ void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info)
 struct btrfs_raid56_evidence_slot *
 btrfs_raid56_evidence_claim(struct btrfs_fs_info *fs_info, u32 nr_data, u32 nr_parity)
 {
-	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+	struct btrfs_raid56_evidence *ev;
 	struct btrfs_raid56_evidence_slot *slot;
+	unsigned int waited_ms = 0;
+	bool waited = false;
 
-	if (!ev)
-		return NULL;
-
-	spin_lock(&ev->lock);
-	if (nr_data + nr_parity > BTRFS_RAID56_EVIDENCE_MAX_COLS ||
-	    (u64)nr_data * BTRFS_STRIPE_LEN > BTRFS_RAID56_EVIDENCE_MAX_BYTES) {
-		ev->dropped_wide++;
-		spin_unlock(&ev->lock);
-		return NULL;
+	for (;;) {
+		mutex_lock(&fs_info->raid56_evidence_lock);
+		ev = fs_info->raid56_evidence;
+		if (!ev) {
+			mutex_unlock(&fs_info->raid56_evidence_lock);
+			return NULL;
+		}
+		if (nr_data + nr_parity > evidence_col_limit() ||
+		    (u64)nr_data * BTRFS_STRIPE_LEN > BTRFS_RAID56_EVIDENCE_MAX_BYTES) {
+			ev->dropped_wide++;
+			mutex_unlock(&fs_info->raid56_evidence_lock);
+			return NULL;
+		}
+		if (ev->nr < BTRFS_RAID56_EVIDENCE_SLOTS)
+			break;
+		/*
+		 * Full.  The oldest entry is the one the helper is about to
+		 * read, so it is never the one to throw away -- wait for the
+		 * helper instead, and only drop this stripe once waiting has
+		 * stopped being worth it.
+		 */
+		if (ev->stalled || waited_ms >= READ_ONCE(evidence_wait_ms)) {
+			/*
+			 * Counted here as well as on the success path: ->waited
+			 * is "captures that had to sleep", so that a helper
+			 * which died shows up as ONE of them for the whole
+			 * scrub.  Counting only the ones that went on to get a
+			 * slot would make the ->stalled bound -- the thing that
+			 * keeps a dead helper from costing a grace period per
+			 * declined stripe -- unobservable from outside.
+			 */
+			if (waited)
+				ev->waited++;
+			ev->stalled = true;
+			ev->dropped_full++;
+			mutex_unlock(&fs_info->raid56_evidence_lock);
+			return NULL;
+		}
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		msleep(EVIDENCE_WAIT_STEP_MS);
+		waited_ms += EVIDENCE_WAIT_STEP_MS;
+		waited = true;
 	}
-	if (ev->nr == BTRFS_RAID56_EVIDENCE_SLOTS) {
-		ev->dropped_full++;
-		spin_unlock(&ev->lock);
-		return NULL;
-	}
+	if (waited)
+		ev->waited++;
 	slot = &ev->slots[(ev->head + ev->nr) % BTRFS_RAID56_EVIDENCE_SLOTS];
 	memset(slot, 0, offsetof(struct btrfs_raid56_evidence_slot, data));
 	slot->nr_data = nr_data;
 	slot->nr_parity = nr_parity;
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(READ_ONCE(evidence_capture_delay_ms)))
+		msleep(READ_ONCE(evidence_capture_delay_ms));
+#endif
 	/* Held across the copy; commit() releases it. */
 	return slot;
 }
 
+/*
+ * Publish the slot claimed above and release the lock.  Every path out of
+ * btrfs_raid56_evidence_claim() that returned a slot MUST reach here.
+ *
+ * This used to re-read fs_info->raid56_evidence and return early when it was
+ * NULL, which is the one case where returning early is fatal: a disarm that
+ * had just cleared the pointer was by then blocked on the very lock this call
+ * was supposed to release, and never woke up.
+ */
 void btrfs_raid56_evidence_commit(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+	struct btrfs_raid56_evidence *ev = fs_info->raid56_evidence;
 
-	if (!ev)
-		return;
+	lockdep_assert_held(&fs_info->raid56_evidence_lock);
+	/* Cannot have been disarmed: disarm needs the lock we are holding. */
+	ASSERT(ev);
 	ev->nr++;
 	ev->captured++;
-	spin_unlock(&ev->lock);
+	mutex_unlock(&fs_info->raid56_evidence_lock);
 }
 
 int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
 			       struct btrfs_ioctl_raid56_evidence_args *args,
 			       void __user *ubuf)
 {
-	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+	struct btrfs_raid56_evidence *ev;
 	struct btrfs_raid56_evidence_slot *slot;
 	void *copy;
 	u32 nr_bytes;
 	int ret = 0;
 
-	if (!ev)
-		return -ENODEV;
-
+	/*
+	 * Allocate the bounce buffer first: the pointer is only meaningful
+	 * while the lock is held, so everything that can sleep for its own
+	 * reasons happens either side of it.
+	 */
 	copy = kvmalloc(BTRFS_RAID56_EVIDENCE_MAX_BYTES, GFP_KERNEL);
 	if (!copy)
 		return -ENOMEM;
 
-	spin_lock(&ev->lock);
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	ev = fs_info->raid56_evidence;
+	if (!ev) {
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		kvfree(copy);
+		return -ENODEV;
+	}
+	/*
+	 * Somebody is reading, so waiting for a slot is worth doing again.
+	 * Cleared on every read, including the ones that find nothing queued:
+	 * that is exactly a helper polling an empty ring, which is the state
+	 * this is meant to trust.
+	 */
+	ev->stalled = false;
+	args->waited = ev->waited;
 	args->dropped_full = ev->dropped_full;
 	args->dropped_wide = ev->dropped_wide;
 	args->captured = ev->captured;
@@ -1957,7 +2112,7 @@ int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
 		args->nr_queued = 0;
 		args->buf_size = 0;
 		args->nr_data = 0;
-		spin_unlock(&ev->lock);
+		mutex_unlock(&fs_info->raid56_evidence_lock);
 		kvfree(copy);
 		return -ENOENT;
 	}
@@ -1967,7 +2122,7 @@ int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
 		/* Say how much is needed and leave the entry queued. */
 		args->buf_size = nr_bytes;
 		args->nr_queued = ev->nr;
-		spin_unlock(&ev->lock);
+		mutex_unlock(&fs_info->raid56_evidence_lock);
 		kvfree(copy);
 		return -ERANGE;
 	}
@@ -1986,7 +2141,7 @@ int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
 	ev->nr--;
 	args->nr_queued = ev->nr;
 	args->buf_size = nr_bytes;
-	spin_unlock(&ev->lock);
+	mutex_unlock(&fs_info->raid56_evidence_lock);
 
 	if (nr_bytes && copy_to_user(ubuf, copy, nr_bytes))
 		ret = -EFAULT;
@@ -2376,9 +2531,9 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 
 void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 {
-	btrfs_raid56_evidence_disarm(fs_info);
 	struct btrfs_wib *wib = fs_info->wib;
 
+	btrfs_raid56_evidence_disarm(fs_info);
 	if (!wib)
 		return;
 	fs_info->wib = NULL;

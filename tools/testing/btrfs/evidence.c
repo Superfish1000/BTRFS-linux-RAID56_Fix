@@ -11,6 +11,8 @@
  *   evidence <mountpoint> arm
  *   evidence <mountpoint> drain <outdir>
  *   evidence <mountpoint> disarm
+ *   evidence <mountpoint> stats            counters only, ring left alone
+ *   evidence <mountpoint> race <seconds>   arm/disarm/read as fast as possible
  *
  * Only the DATA columns are in the payload.  The parity is named, not copied:
  * every column's devid and physical offset is in the header, and the block
@@ -26,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <time.h>
 
 #define BTRFS_IOCTL_MAGIC 0x94
 #define BTRFS_RAID56_EVIDENCE_ARM	0
@@ -36,7 +39,8 @@
 struct ev_args {
 	uint64_t op, flags, full_stripe_start, gen, record_flags, stale_cols, bad_parity;
 	uint32_t nr_data, nr_parity, stripe_len, nr_queued;
-	uint64_t dropped_full, dropped_wide, captured;
+	uint64_t dropped_full, dropped_wide, captured, waited;
+	uint64_t reserved[8];
 	uint64_t devid[MAX_COLS], physical[MAX_COLS];
 	uint64_t buf_size;
 	uint8_t buf[];
@@ -136,12 +140,83 @@ static int drain(int fd, const char *outdir)
 	return 0;
 }
 
+/*
+ * The counters, without draining anything.  A READ on an empty ring returns
+ * -ENOENT and still fills the header, which is the only way to ask "how much
+ * did you have to throw away" without consuming what is queued.
+ */
+static int stats(int fd)
+{
+	struct ev_args *a = calloc(1, sizeof(*a) + CAP);
+	int ret = 0;
+
+	if (!a)
+		return 1;
+	a->op = BTRFS_RAID56_EVIDENCE_READ;
+	a->buf_size = 0;		/* want nothing back but the header */
+	if (ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, a) < 0 &&
+	    errno != ENOENT && errno != ERANGE) {
+		fprintf(stderr, "STATS: %s\n", strerror(errno));
+		ret = 1;
+	} else {
+		printf("EVIDENCE_STATS captured=%llu dropped_full=%llu dropped_wide=%llu waited=%llu queued=%u\n",
+		       (unsigned long long)a->captured,
+		       (unsigned long long)a->dropped_full,
+		       (unsigned long long)a->dropped_wide,
+		       (unsigned long long)a->waited, a->nr_queued);
+	}
+	free(a);
+	return ret;
+}
+
+/*
+ * Hammer arm, read and disarm for @secs seconds.
+ *
+ * The window this is aiming at is between a capture claiming a slot and
+ * publishing it: a disarm landing there used to clear the pointer, block on
+ * the channel's own lock waiting for the capture to finish, and then never be
+ * woken, because the capture saw a NULL pointer and returned without
+ * releasing that lock.  The same pointer read could also outlive the object it
+ * pointed at.  Neither is visible from userspace as anything but a hang or a
+ * splat, so this does not check a return value -- the test is that the scrub
+ * running alongside it finishes and the kernel logs nothing.
+ */
+static int race(int fd, int secs)
+{
+	struct ev_args *a = calloc(1, sizeof(*a) + CAP);
+	time_t end = time(NULL) + secs;
+	unsigned long n = 0;
+
+	if (!a)
+		return 1;
+	while (time(NULL) < end) {
+		memset(a, 0, sizeof(*a));
+		a->op = BTRFS_RAID56_EVIDENCE_ARM;
+		ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, a);
+
+		memset(a, 0, sizeof(*a));
+		a->op = BTRFS_RAID56_EVIDENCE_READ;
+		a->buf_size = CAP;
+		ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, a);
+
+		memset(a, 0, sizeof(*a));
+		a->op = BTRFS_RAID56_EVIDENCE_DISARM;
+		ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, a);
+		n++;
+	}
+	printf("EVIDENCE_RACE_ROUNDS %lu\n", n);
+	free(a);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int fd, ret;
 
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s <mountpoint> arm|drain <dir>|disarm\n", argv[0]);
+		fprintf(stderr,
+			"usage: %s <mountpoint> arm|drain <dir>|disarm|stats|race <secs>\n",
+			argv[0]);
 		return 2;
 	}
 	fd = open(argv[1], O_RDONLY);
@@ -155,6 +230,10 @@ int main(int argc, char **argv)
 		ret = simple(fd, BTRFS_RAID56_EVIDENCE_DISARM);
 	else if (!strcmp(argv[2], "drain") && argc >= 4)
 		ret = drain(fd, argv[3]);
+	else if (!strcmp(argv[2], "stats"))
+		ret = stats(fd);
+	else if (!strcmp(argv[2], "race") && argc >= 4)
+		ret = race(fd, atoi(argv[3]));
 	else {
 		fprintf(stderr, "unknown command\n");
 		ret = 2;
