@@ -594,14 +594,35 @@ column without recomputing parity it turns "data stale, truth survives in the
 parity" into truth nowhere -- with the sharp edge that the helper's own clone
 pass is the read that triggers it.
 
-Worked through on paper, that does not follow. The write-back at bio.c:281 is
-reached only when the reconstruction PASSED its checksum (the guard at
-bio.c:274 declines only `BTRFS_CSUM_NONE`). In a stripe with a genuinely stale
-data column, reconstructing a checksummed neighbour consumes that stale column
-and yields a value that fails its checksum, so the repair never fires. The
-harmful case could not be reproduced by reasoning. **Needs a real test before
-anyone acts on it**, in either direction: if it is reachable it is serious, and
-if it is not, the freeze needs a smaller companion than claimed.
+Worked through on paper, that does not follow. RESOLVED by taking it per
+VERTICAL stripe, which is the piece missing from the first pass: a wib bit
+covers a whole 64KiB column, but the parity equation and the repair write-back
+are both per sector row.
+
+`repair_read_is_reconstruction()` (bio.c:186) is true for any mirror > 1 on
+RAID5/6, and the guard at bio.c:274 declines only `BTRFS_CSUM_NONE`, so the
+write-back does fire for a checksummed block that reconstructed cleanly. Two
+cases, neither harmful:
+
+- The row where the column is stale. The reconstruction of a checksummed
+  neighbour consumes that stale column, so it does not match the true value and
+  its checksum fails. No write-back, and the parity-implied value of the stale
+  column survives untouched.
+- Any other row. The reconstruction is correct and the write-back fires, but
+  the parity for that row was computed by the filesystem from the correct
+  sector and the corruption happened afterwards -- so restoring it makes the
+  row consistent again rather than breaking it, and that sector does not appear
+  in the equation for the stale row.
+
+So the claim that this path is the likeliest destroyer of the evidence, and
+that the helper's own clone pass triggers it, is **not supported**. A
+measurement would still beat an argument and this series has been wrong by
+reasoning before, so instrument it if the repair path is ever touched -- but
+nothing should be designed around it.
+
+What survives is the narrower point, and it is enough on its own: this is a
+writer into a committed stripe that takes NO allocation, so a freeze keyed on
+the allocator is incomplete whether or not this particular path is dangerous.
 
 ### Other findings worth keeping (self-reported, spot-checked, not all verified)
 
