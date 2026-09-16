@@ -687,6 +687,13 @@ struct btrfs_fs_info {
 	struct btrfs_stripe_hash_table *stripe_hash_table;
 	/* RAID56 write-intent log, see raid56-wib.c. */
 	struct btrfs_wib *wib;
+	/*
+	 * Armed by BTRFS_IOC_RAID56_EVIDENCE only, so a filesystem nobody is
+	 * watching allocates nothing.  RCU-free pointer: readers take
+	 * ->lock, the arm/disarm path is serialised by the ioctl's own
+	 * exclusivity.
+	 */
+	struct btrfs_raid56_evidence *raid56_evidence;
 	/* How RAID56 writes divide, see rmw_assemble_write_bios(). */
 	struct btrfs_raid56_write_stats raid56_write_stats;
 

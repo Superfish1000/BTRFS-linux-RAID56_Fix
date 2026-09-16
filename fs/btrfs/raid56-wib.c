@@ -1643,6 +1643,7 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 
 	st->stale_cols = 0;
 	st->bad_parity = 0;
+	st->gen = 0;
 
 	if (!wib)
 		return false;
@@ -1674,6 +1675,8 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 			st->stale_cols |= BIT_ULL(i);
 		if (i < nr_parity && (e->stale_par & mask))
 			st->bad_parity |= BIT(i);
+		if ((e->stale | e->stale_par | e->sticky) & mask)
+			st->gen = max(st->gen, e->gen);
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return st->stale_cols || st->bad_parity;
@@ -1810,6 +1813,186 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
  * quietly clearing it, and clear it anyway, because keeping it would pin an
  * entry that nothing will ever complete.
  */
+/*
+ * The evidence channel.
+ *
+ * A scrub that declines to repair an ambiguous full stripe is holding, at that
+ * instant, the only mutually coherent copy of its data columns that anything
+ * will ever have: freshly read, read-only for the whole chunk scrub so nothing
+ * can be writing, and about to be dropped.  Copy them for a helper that is
+ * listening, and only then -- an unwatched filesystem must pay nothing.
+ *
+ * The parity is deliberately NOT copied.  Every column's devid and physical
+ * offset is handed over instead, and the block group stays read-only until the
+ * chunk's scrub finishes, so a helper reads the parity off the device without
+ * racing anything.  The alternative is issuing more reads to an array that is
+ * failing by construction, on a path with no REQ_FAILFAST and no timeout.
+ */
+bool btrfs_raid56_evidence_armed(const struct btrfs_fs_info *fs_info)
+{
+	return READ_ONCE(fs_info->raid56_evidence) != NULL;
+}
+
+int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_raid56_evidence *ev;
+
+	if (fs_info->raid56_evidence)
+		return 0;
+
+	ev = kzalloc(sizeof(*ev), GFP_KERNEL);
+	if (!ev)
+		return -ENOMEM;
+	spin_lock_init(&ev->lock);
+	for (int i = 0; i < BTRFS_RAID56_EVIDENCE_SLOTS; i++) {
+		ev->slots[i].data = kvmalloc(BTRFS_RAID56_EVIDENCE_MAX_BYTES,
+					     GFP_KERNEL);
+		if (!ev->slots[i].data) {
+			while (--i >= 0)
+				kvfree(ev->slots[i].data);
+			kfree(ev);
+			return -ENOMEM;
+		}
+	}
+	/* Publish last: a capture that sees the pointer must see the slots. */
+	smp_store_release(&fs_info->raid56_evidence, ev);
+	btrfs_info(fs_info,
+		   "raid56: evidence channel armed, %u slots of %u bytes",
+		   BTRFS_RAID56_EVIDENCE_SLOTS,
+		   (unsigned int)BTRFS_RAID56_EVIDENCE_MAX_BYTES);
+	return 0;
+}
+
+void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_raid56_evidence *ev = fs_info->raid56_evidence;
+
+	if (!ev)
+		return;
+	WRITE_ONCE(fs_info->raid56_evidence, NULL);
+	/*
+	 * Captures run from the scrub thread and only ever hold ->lock; take
+	 * it once to wait for any that is mid-copy before freeing under it.
+	 */
+	spin_lock(&ev->lock);
+	spin_unlock(&ev->lock);
+	for (int i = 0; i < BTRFS_RAID56_EVIDENCE_SLOTS; i++)
+		kvfree(ev->slots[i].data);
+	kfree(ev);
+}
+
+/*
+ * Reserve the slot the next capture will fill, or NULL if there is nothing to
+ * fill it into.  The caller copies into slot->data and then calls
+ * btrfs_raid56_evidence_commit() to publish it.
+ *
+ * The ring never overwrites a queued entry.  Dropping the OLDEST evidence to
+ * make room for the newest would be the wrong way round: the helper is
+ * draining in order, and the entry it has not read yet is the one it is about
+ * to.  A full ring means the helper is not keeping up, which is a fact worth
+ * reporting rather than papering over.
+ */
+struct btrfs_raid56_evidence_slot *
+btrfs_raid56_evidence_claim(struct btrfs_fs_info *fs_info, u32 nr_data, u32 nr_parity)
+{
+	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+	struct btrfs_raid56_evidence_slot *slot;
+
+	if (!ev)
+		return NULL;
+
+	spin_lock(&ev->lock);
+	if (nr_data + nr_parity > BTRFS_RAID56_EVIDENCE_MAX_COLS ||
+	    (u64)nr_data * BTRFS_STRIPE_LEN > BTRFS_RAID56_EVIDENCE_MAX_BYTES) {
+		ev->dropped_wide++;
+		spin_unlock(&ev->lock);
+		return NULL;
+	}
+	if (ev->nr == BTRFS_RAID56_EVIDENCE_SLOTS) {
+		ev->dropped_full++;
+		spin_unlock(&ev->lock);
+		return NULL;
+	}
+	slot = &ev->slots[(ev->head + ev->nr) % BTRFS_RAID56_EVIDENCE_SLOTS];
+	memset(slot, 0, offsetof(struct btrfs_raid56_evidence_slot, data));
+	slot->nr_data = nr_data;
+	slot->nr_parity = nr_parity;
+	/* Held across the copy; commit() releases it. */
+	return slot;
+}
+
+void btrfs_raid56_evidence_commit(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+
+	if (!ev)
+		return;
+	ev->nr++;
+	ev->captured++;
+	spin_unlock(&ev->lock);
+}
+
+int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
+			       struct btrfs_ioctl_raid56_evidence_args *args,
+			       void __user *ubuf)
+{
+	struct btrfs_raid56_evidence *ev = READ_ONCE(fs_info->raid56_evidence);
+	struct btrfs_raid56_evidence_slot *slot;
+	void *copy;
+	u32 nr_bytes;
+	int ret = 0;
+
+	if (!ev)
+		return -ENODEV;
+
+	copy = kvmalloc(BTRFS_RAID56_EVIDENCE_MAX_BYTES, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	spin_lock(&ev->lock);
+	args->dropped_full = ev->dropped_full;
+	args->dropped_wide = ev->dropped_wide;
+	args->captured = ev->captured;
+	if (!ev->nr) {
+		args->nr_queued = 0;
+		args->buf_size = 0;
+		args->nr_data = 0;
+		spin_unlock(&ev->lock);
+		kvfree(copy);
+		return -ENOENT;
+	}
+	slot = &ev->slots[ev->head];
+	nr_bytes = slot->nr_bytes;
+	if (nr_bytes > args->buf_size) {
+		/* Say how much is needed and leave the entry queued. */
+		args->buf_size = nr_bytes;
+		args->nr_queued = ev->nr;
+		spin_unlock(&ev->lock);
+		kvfree(copy);
+		return -ERANGE;
+	}
+	args->full_stripe_start = slot->full_stripe_start;
+	args->gen = slot->gen;
+	args->stale_cols = slot->stale_cols;
+	args->bad_parity = slot->bad_parity;
+	args->nr_data = slot->nr_data;
+	args->nr_parity = slot->nr_parity;
+	args->stripe_len = BTRFS_STRIPE_LEN;
+	memcpy(args->devid, slot->devid, sizeof(args->devid));
+	memcpy(args->physical, slot->physical, sizeof(args->physical));
+	memcpy(copy, slot->data, nr_bytes);
+	ev->head = (ev->head + 1) % BTRFS_RAID56_EVIDENCE_SLOTS;
+	ev->nr--;
+	args->nr_queued = ev->nr;
+	args->buf_size = nr_bytes;
+	spin_unlock(&ev->lock);
+
+	if (nr_bytes && copy_to_user(ubuf, copy, nr_bytes))
+		ret = -EFAULT;
+	kvfree(copy);
+	return ret;
+}
+
 void btrfs_wib_forget_range(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;
@@ -2192,6 +2375,7 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 
 void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 {
+	btrfs_raid56_evidence_disarm(fs_info);
 	struct btrfs_wib *wib = fs_info->wib;
 
 	if (!wib)

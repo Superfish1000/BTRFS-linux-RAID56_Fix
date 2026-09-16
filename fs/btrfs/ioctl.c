@@ -5599,6 +5599,67 @@ out_unlock:
  *
  * CAP_SYS_ADMIN: the addresses here describe where other tenants' data lives.
  */
+/*
+ * Arm, drain or disarm the evidence channel.
+ *
+ * ARM allocates the ring, so a filesystem nobody is watching pays nothing and
+ * captures nothing.  READ takes the oldest queued entry and copies its data
+ * columns out; -ENOENT means the queue is empty, which is the normal answer
+ * while a scrub is running and finding nothing wrong.  -ERANGE means the
+ * caller's buffer is too small and reports the size needed, leaving the entry
+ * queued.  DISARM frees the ring.
+ *
+ * CAP_SYS_ADMIN: this hands out raw stripe contents, which is every byte of
+ * whatever files happen to live in that stripe, regardless of their ownership.
+ */
+static int btrfs_ioctl_raid56_evidence(struct btrfs_fs_info *fs_info,
+				       void __user *argp)
+{
+	struct btrfs_ioctl_raid56_evidence_args *args;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	args = memdup_user(argp, sizeof(*args));
+	if (IS_ERR(args))
+		return PTR_ERR(args);
+
+	if (args->flags) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	switch (args->op) {
+	case BTRFS_RAID56_EVIDENCE_ARM:
+		ret = btrfs_raid56_evidence_arm(fs_info);
+		break;
+	case BTRFS_RAID56_EVIDENCE_DISARM:
+		btrfs_raid56_evidence_disarm(fs_info);
+		ret = 0;
+		break;
+	case BTRFS_RAID56_EVIDENCE_READ:
+		ret = btrfs_raid56_evidence_take(fs_info, args,
+			(u8 __user *)argp + offsetof(
+				struct btrfs_ioctl_raid56_evidence_args, buf));
+		/*
+		 * -ENOENT and -ERANGE still carry counters and the size the
+		 * caller needs, so the header goes back either way.
+		 */
+		if (ret && ret != -ENOENT && ret != -ERANGE)
+			goto out;
+		if (copy_to_user(argp, args, sizeof(*args)))
+			ret = -EFAULT;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+out:
+	kfree(args);
+	return ret;
+}
+
 static int btrfs_ioctl_raid56_stale_stripes(struct btrfs_fs_info *fs_info,
 					    void __user *argp)
 {
@@ -5831,6 +5892,8 @@ long btrfs_ioctl(struct file *file, unsigned int
 		return btrfs_ioctl_get_csums(file, argp);
 	case BTRFS_IOC_RAID56_STALE_STRIPES:
 		return btrfs_ioctl_raid56_stale_stripes(fs_info, argp);
+	case BTRFS_IOC_RAID56_EVIDENCE:
+		return btrfs_ioctl_raid56_evidence(fs_info, argp);
 	}
 
 	return -ENOTTY;

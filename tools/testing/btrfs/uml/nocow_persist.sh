@@ -38,6 +38,8 @@ cp $HERE/init-final3.sh $T/umltest/init-final3.sh
 # and run from hostfs inside the guest; a missing compiler just means the
 # scenario logs WIBDUMP_MISSING and the record check below is skipped.
 cc -O2 -o $T/umltest/wibdump $HERE/../wibdump.c 2>/dev/null || true
+# The reference consumer for BTRFS_IOC_RAID56_EVIDENCE; same deal.
+cc -O2 -o $T/umltest/evidence $HERE/../evidence.c 2>/dev/null || true
 ulimit -c 0
 
 # The device whose writes fail is also the one omitted for the probe.
@@ -66,7 +68,8 @@ arm() {	# tag-suffix nopersist fakebadpar -> echoes "<bad>"
 	}
 
 	boot nocow_persist_prep  none /dev/mapper/d0 "NOPERSIST=$nopersist FAKEBADPAR=$fakebadpar"
-	boot nocow_persist_scrub none /dev/mapper/d0
+	# Only the ambiguous arm reaches the verdict that captures evidence.
+	boot nocow_persist_scrub none /dev/mapper/d0 "EVIDENCE=$fakebadpar"
 	boot nocow_probe "$FAIL" $MNTPROBE PROBE=after
 	cat $T/umltest/nocow.bad.after.$tag 2>/dev/null || echo "?"
 }
@@ -135,13 +138,23 @@ echo "== ambiguous: named column, no usable parity =="
 amb=$(arm 2 0 1)
 amb_sticky=$(sticky_after 2)
 amb_msg=$(grep -c 'left untouched' $T/umltest/nocow-persist-2/log.nocow_persist_scrub 2>/dev/null || echo 0)
+amb_ev=$(sed -n 's/.*EVIDENCE_FILES=\([0-9]*\).*/\1/p' \
+	$T/umltest/nocow-persist-2/log.nocow_persist_scrub 2>/dev/null | tail -1)
+amb_evb=$(sed -n 's/.*EVIDENCE_BYTES=\([0-9]*\).*/\1/p' \
+	$T/umltest/nocow-persist-2/log.nocow_persist_scrub 2>/dev/null | tail -1)
 echo "  blocks unrecoverable: $amb   records kept: $amb_sticky   declined stripes: $amb_msg"
+echo "  evidence streamed out during the scrub: ${amb_ev:-0} stripe(s), ${amb_evb:-0} bytes"
 if [ "$amb" = "?" ] || [ "$amb_sticky" = "?" ]; then
 	echo "RESULT: INCONCLUSIVE -- the ambiguous arm did not report"; exit 2
 fi
 if [ "$amb_msg" -eq 0 ] 2>/dev/null; then
 	echo "RESULT: FAIL -- the scrub never declined a stripe, so the ambiguous"
 	echo "        branch was not reached and this arm proves nothing"
+	exit 1
+fi
+if [ "${amb_ev:-0}" -eq 0 ] 2>/dev/null; then
+	echo "RESULT: FAIL -- the scrub declined $amb_msg stripe(s) but streamed no"
+	echo "        evidence, so the clone never reached the recovery target"
 	exit 1
 fi
 if [ "$amb" -ne 0 ] 2>/dev/null; then

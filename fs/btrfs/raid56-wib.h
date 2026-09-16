@@ -15,6 +15,7 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <uapi/linux/btrfs_tree.h>
+#include <uapi/linux/btrfs.h>
 
 struct btrfs_fs_info;
 
@@ -410,6 +411,13 @@ struct btrfs_wib_stripe_state {
 	u64 stale_cols;
 	/* Bit p: parity p of the full stripe is recorded stale. */
 	u32 bad_parity;
+	/*
+	 * Newest generation at which any region covering this stripe gained a
+	 * fault record.  A logical address is reused once its extent is freed,
+	 * so without this a helper cannot tell whether the extent it finds
+	 * there now is the one that was damaged.
+	 */
+	u64 gen;
 };
 
 bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
@@ -417,6 +425,47 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 			    struct btrfs_wib_stripe_state *st);
 void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
 				   u64 full_stripe_start, int parity, bool stale);
+/*
+ * A copy of the data columns of one full stripe a scrub declined to repair,
+ * taken at the verdict from the buffers the scrub already holds.
+ */
+#define BTRFS_RAID56_EVIDENCE_SLOTS	4
+/* 16 columns of BTRFS_STRIPE_LEN.  Wider stripes are named but not copied. */
+#define BTRFS_RAID56_EVIDENCE_MAX_BYTES	(16 * BTRFS_STRIPE_LEN)
+
+struct btrfs_raid56_evidence_slot {
+	u64 full_stripe_start;
+	u64 gen;
+	u64 stale_cols;
+	u64 bad_parity;
+	u32 nr_data;
+	u32 nr_parity;
+	u32 nr_bytes;
+	u64 devid[BTRFS_RAID56_EVIDENCE_MAX_COLS];
+	u64 physical[BTRFS_RAID56_EVIDENCE_MAX_COLS];
+	void *data;
+};
+
+struct btrfs_raid56_evidence {
+	spinlock_t lock;
+	u32 head;
+	u32 nr;
+	u64 dropped_full;
+	u64 dropped_wide;
+	u64 captured;
+	struct btrfs_raid56_evidence_slot slots[BTRFS_RAID56_EVIDENCE_SLOTS];
+};
+
+int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info);
+bool btrfs_raid56_evidence_armed(const struct btrfs_fs_info *fs_info);
+struct btrfs_raid56_evidence_slot *
+btrfs_raid56_evidence_claim(struct btrfs_fs_info *fs_info, u32 nr_data, u32 nr_parity);
+void btrfs_raid56_evidence_commit(struct btrfs_fs_info *fs_info);
+int btrfs_raid56_evidence_take(struct btrfs_fs_info *fs_info,
+			       struct btrfs_ioctl_raid56_evidence_args *args,
+			       void __user *ubuf);
+
 void btrfs_wib_forget_range(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info);
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed);

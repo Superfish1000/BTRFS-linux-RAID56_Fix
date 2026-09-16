@@ -717,3 +717,41 @@ harness produces them together:
 
 Then: without the guard the block must come back wrong after the scrub, and
 with it the block must be reported unrepaired and left alone.
+
+
+---
+
+## 17. The evidence channel captures only on the user-scrub path
+
+BTRFS_IOC_RAID56_EVIDENCE streams the data columns of an ambiguous full stripe
+out during a scrub. The capture is wired into scrub_raid56_parity_stripe()'s
+AMBIGUOUS branch only.
+
+**The gap, and it is the important one.** Mount-time recovery reaches its own
+verdict through btrfs_scrub_raid56_full_stripe() (scrub.c ~3670) and captures
+nothing. That is the 3 a.m. case the user asked about: the machine crashes with
+nobody there, comes back up, recovery runs, and ordinary filesystem activity
+starts eroding the evidence before anyone can plug a drive in.
+
+It is also the one place the block group is NOT held read-only.
+btrfs_inc_block_group_ro() appears only at scrub.c:3248, on the user-scrub
+enumerate path; the recovery entry takes a block group reference and no RO. So
+the coherence argument that makes the user-scrub capture sound -- nothing can be
+writing while we copy -- does not hold there, and wiring the capture in
+unchanged would hand out a snapshot that may not correspond to any instant.
+
+Deciding what to do about that is a design question, not a mechanical one:
+either take the RO in the recovery path (and inherit its -ENOSPC behaviour on a
+degraded mount), or capture without it and label the result as possibly torn,
+or leave recovery uncaptured and require a scrub before the evidence is
+collectable.
+
+**Smaller things also open:**
+- No test exercises the ring's drop paths (dropped_full, dropped_wide). The
+  counters exist and are reported; nothing proves they are right.
+- Stripes wider than 16 columns are named but not copied
+  (BTRFS_RAID56_EVIDENCE_MAX_BYTES). Untested; no such array was built.
+- The helper must pread the parity itself. That is sound only while the block
+  group is read-only, i.e. only during that chunk's scrub. A helper that drains
+  the queue and reads the parity later races relocation and the allocator.
+  Nothing enforces the ordering, and nothing warns.

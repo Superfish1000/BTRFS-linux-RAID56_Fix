@@ -1110,7 +1110,33 @@ nocow_persist_scrub)
 	else
 		log "WIBDUMP_MISSING"
 	fi
-	btrfs scrub start -B $MNT 2>&1 | while read -r l; do log "scrub: $l"; done
+	if [ "${EVIDENCE:-0}" = 1 ] && [ -x $T/umltest/evidence ]; then
+		# Stream the evidence out WHILE the scrub runs.  Draining after
+		# it finishes would be waiting for a four-slot ring to have
+		# overflowed, which is the failure this design exists to avoid.
+		EVDIR=$T/umltest/evdir.$TAG
+		rm -rf $EVDIR; mkdir -p $EVDIR
+		$T/umltest/evidence $MNT arm 2>&1 |
+			while read -r l; do log "evidence: $l"; done
+		btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1 &
+		spid=$!
+		while kill -0 $spid 2>/dev/null; do
+			$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
+				grep -E 'EVIDENCE stripe' |
+				while read -r l; do log "evidence: $l"; done
+			sleep 1
+		done
+		wait $spid
+		$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
+			grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
+		$T/umltest/evidence $MNT disarm 2>&1 |
+			while read -r l; do log "evidence: $l"; done
+		log "EVIDENCE_FILES=$(ls $EVDIR/*.data 2>/dev/null | wc -l) EVIDENCE_BYTES=$(cat $EVDIR/*.data 2>/dev/null | wc -c)"
+		while read -r l; do log "scrub: $l"; done < /tmp/scrub.out
+	else
+		btrfs scrub start -B $MNT 2>&1 |
+			while read -r l; do log "scrub: $l"; done
+	fi
 	stats "after scrub"
 	kmsg "scrub|write-intent" 6
 	# Did the scrub REPAIR, or merely decline to make things worse?  A

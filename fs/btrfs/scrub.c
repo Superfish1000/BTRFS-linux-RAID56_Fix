@@ -2399,6 +2399,87 @@ static bool scrub_stripe_has_unverifiable(struct scrub_stripe *stripe)
 	return false;
 }
 
+/*
+ * Copy the data columns of a full stripe the scrub is about to walk away from.
+ *
+ * This is the only moment they are all in memory at once, mutually coherent
+ * (the block group is read-only for the whole chunk scrub, so nothing is
+ * writing) and not yet overwritten.  A helper that armed the evidence channel
+ * gets them; if nobody armed it this costs one unlocked pointer read.
+ *
+ * The parity is named, not copied.  Every column's devid and physical offset
+ * is handed over, and the block group stays read-only until this chunk's scrub
+ * ends, so a helper reads the parity off the device without racing anything --
+ * rather than this path issuing more I/O to an array that is failing by
+ * construction, on a path with no REQ_FAILFAST and no timeout.
+ *
+ * The column-to-device mapping is derived rather than looked up, so it is
+ * checked against the columns scrub already resolved: if the derivation cannot
+ * reproduce those, the parity entries it produces are not trustworthy either
+ * and the capture is abandoned rather than handed over wrong.
+ */
+static void scrub_capture_evidence(struct scrub_ctx *sctx,
+				   struct btrfs_chunk_map *map,
+				   struct btrfs_block_group *bg,
+				   u64 full_stripe_start, int data_stripes)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const int nr_parity = map->num_stripes - data_stripes;
+	const u64 fstripe_len = btrfs_stripe_nr_to_offset(data_stripes);
+	struct btrfs_raid56_evidence_slot *slot;
+	struct btrfs_wib_stripe_state st = { 0 };
+	u64 rot;
+	u32 rem;
+
+	if (!btrfs_raid56_evidence_armed(fs_info))
+		return;
+
+	rot = div_u64_rem(full_stripe_start - bg->start, fstripe_len, &rem);
+	if (rem)
+		return;
+
+	slot = btrfs_raid56_evidence_claim(fs_info, data_stripes, nr_parity);
+	if (!slot)
+		return;
+
+	for (int c = 0; c < map->num_stripes; c++) {
+		const int idx = (rot + c) % map->num_stripes;
+		const struct btrfs_device *dev = map->stripes[idx].dev;
+
+		slot->devid[c] = dev ? dev->devid : 0;
+		slot->physical[c] = map->stripes[idx].physical +
+				    (rot << BTRFS_STRIPE_LEN_SHIFT);
+	}
+	/* The derivation has to reproduce what scrub already resolved. */
+	for (int i = 0; i < data_stripes; i++) {
+		const struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
+
+		if (!stripe->dev || slot->devid[i] != stripe->dev->devid ||
+		    slot->physical[i] != stripe->physical) {
+			btrfs_warn_rl(fs_info,
+"scrub: not capturing evidence for full stripe %llu: the column mapping does not agree with the stripes already read",
+				      full_stripe_start);
+			slot->nr_bytes = 0;
+			slot->full_stripe_start = 0;
+			btrfs_raid56_evidence_commit(fs_info);
+			return;
+		}
+	}
+
+	slot->full_stripe_start = full_stripe_start;
+	if (btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
+				   nr_parity, &st)) {
+		slot->stale_cols = st.stale_cols;
+		slot->bad_parity = st.bad_parity;
+		slot->gen = st.gen;
+	}
+	for (int i = 0; i < data_stripes; i++)
+		memcpy((u8 *)slot->data + ((size_t)i << BTRFS_STRIPE_LEN_SHIFT),
+		       sctx->raid56_data_stripes[i].buffer, BTRFS_STRIPE_LEN);
+	slot->nr_bytes = (u32)data_stripes << BTRFS_STRIPE_LEN_SHIFT;
+	btrfs_raid56_evidence_commit(fs_info);
+}
+
 static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 						 struct btrfs_chunk_map *map,
 						 u64 full_stripe_start,
@@ -2635,6 +2716,8 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	 * this one is the specific one.
 	 */
 	if (regen_parity && plan == SCRUB_WIB_AMBIGUOUS) {
+		scrub_capture_evidence(sctx, map, bg, full_stripe_start,
+				       data_stripes);
 		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
 		btrfs_warn_rl(fs_info,
 "scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",

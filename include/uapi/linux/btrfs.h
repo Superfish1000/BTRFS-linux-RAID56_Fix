@@ -1200,6 +1200,62 @@ struct btrfs_ioctl_raid56_stale_entry {
 	__u64 gen;
 };
 
+/*
+ * Evidence from a full stripe a scrub declined to repair.
+ *
+ * The moment a scrub classifies a stripe ambiguous is the moment its data
+ * columns are in kernel memory, freshly read, mutually coherent (the block
+ * group is read-only for the whole chunk scrub), and before anything can
+ * overwrite them.  ARM asks for them to be kept; READ takes one; DISARM stops.
+ * Nothing is captured while nobody is listening, so an ordinary scrub on a
+ * healthy filesystem allocates nothing and copies nothing.
+ *
+ * Only the DATA columns are copied.  The parity is named rather than copied --
+ * @devid and @physical cover every column including the parities, and while
+ * the scrub holds the block group read-only a helper can read them off the
+ * device itself without racing anything.  That keeps the kernel's new work to
+ * a memcpy of pages it already holds, with no extra I/O to an array that is
+ * failing by construction.
+ */
+#define BTRFS_RAID56_EVIDENCE_ARM	0
+#define BTRFS_RAID56_EVIDENCE_READ	1
+#define BTRFS_RAID56_EVIDENCE_DISARM	2
+
+#define BTRFS_RAID56_EVIDENCE_MAX_COLS	34
+
+struct btrfs_ioctl_raid56_evidence_args {
+	/* In: one of BTRFS_RAID56_EVIDENCE_*. */
+	__u64 op;
+	/* In: must be 0. */
+	__u64 flags;
+	/* Out: logical start of the full stripe this evidence came from. */
+	__u64 full_stripe_start;
+	/* Out: newest generation at which the region gained a fault record. */
+	__u64 gen;
+	/* Out: bit i set: data column i is recorded stale. */
+	__u64 stale_cols;
+	/* Out: bit p set: parity p does not describe the data on disk. */
+	__u64 bad_parity;
+	/* Out: geometry.  Columns 0..nr_data-1 are data, the rest parity. */
+	__u32 nr_data;
+	__u32 nr_parity;
+	__u32 stripe_len;
+	/* Out: entries still queued after this one. */
+	__u32 nr_queued;
+	/* Out: stripes that were classified but not captured. */
+	__u64 dropped_full;
+	__u64 dropped_wide;
+	/* Out: stripes captured since ARM. */
+	__u64 captured;
+	/* Out: device id and physical offset of each column. */
+	__u64 devid[BTRFS_RAID56_EVIDENCE_MAX_COLS];
+	__u64 physical[BTRFS_RAID56_EVIDENCE_MAX_COLS];
+	/* In: buffer capacity in bytes.  Out: bytes written. */
+	__u64 buf_size;
+	/* Out: the data columns, nr_data * stripe_len bytes. */
+	__u8 buf[];
+};
+
 struct btrfs_ioctl_raid56_stale_args {
 	/* In/out: report regions at or after this address; updated to resume. */
 	__u64 bytenr;
@@ -1343,6 +1399,8 @@ struct btrfs_ioctl_raid56_stale_args {
 					struct btrfs_ioctl_subvol_wait)
 #define BTRFS_IOC_GET_CSUMS _IOWR(BTRFS_IOCTL_MAGIC, 66, \
 				  struct btrfs_ioctl_get_csums_args)
+#define BTRFS_IOC_RAID56_EVIDENCE _IOWR(BTRFS_IOCTL_MAGIC, 68, \
+				   struct btrfs_ioctl_raid56_evidence_args)
 #define BTRFS_IOC_RAID56_STALE_STRIPES _IOWR(BTRFS_IOCTL_MAGIC, 67, \
 					     struct btrfs_ioctl_raid56_stale_args)
 
