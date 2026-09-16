@@ -129,6 +129,19 @@ static struct btrfs_bio *btrfs_split_bio(struct btrfs_fs_info *fs_info,
 	return bbio;
 }
 
+#ifdef CONFIG_BTRFS_DEBUG
+/* See btrfs_split_bio_status_legacy() in bio.h. */
+static bool split_bio_status_legacy;
+module_param_named(split_bio_status_legacy, split_bio_status_legacy, bool, 0644);
+MODULE_PARM_DESC(split_bio_status_legacy,
+		 "Drop a split bio's error when the failing half completes last, as it did before (testing only: restores a known defect)");
+
+bool btrfs_split_bio_status_legacy(void)
+{
+	return READ_ONCE(split_bio_status_legacy);
+}
+#endif
+
 void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
 {
 	/* Make sure we're already in task context. */
@@ -157,8 +170,38 @@ void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status)
 		cmpxchg(&bbio->status, BLK_STS_OK, status);
 
 	if (atomic_dec_and_test(&bbio->pending_ios)) {
-		/* Load split bio's error which might be set above. */
-		if (status == BLK_STS_OK)
+		/*
+		 * Take the first error any half of the bio recorded, whichever
+		 * half happens to be finishing now.
+		 *
+		 * bbio->bio.bi_status only holds the status of the LAST
+		 * completion to run, and for a split bio that is not
+		 * necessarily the half that failed.  A read split at a stripe
+		 * boundary has one half served straight from a device and the
+		 * other half, when its device is missing, reconstructed by
+		 * raid56_parity_recover() on a workqueue -- so the failing
+		 * half routinely finishes last.  When it did, bbio->bio
+		 * .bi_status had already been set to BLK_STS_OK by the half
+		 * that succeeded, and loading the saved error only when the
+		 * current status was OK left it that way.
+		 *
+		 * end_bbio_data_read() then read one status for the whole
+		 * original bio and marked every folio uptodate, including the
+		 * ones belonging to the half that failed -- which hold
+		 * whatever the failed reconstruction left behind.  A degraded
+		 * RAID5 read returned those bytes as the file's content, at
+		 * the right length, with no error, on data that is fully
+		 * checksummed: the checksum had already been compared, found
+		 * wrong, and the read failed on it, and then the failure was
+		 * dropped.  The same applies to a write whose failing half
+		 * finishes last, where it would be reported as having
+		 * succeeded.
+		 *
+		 * bbio->status is BLK_STS_OK until some half fails and holds
+		 * the first error after that, so it is the right answer for
+		 * the bio as a whole either way.
+		 */
+		if (likely(!btrfs_split_bio_status_legacy()) || status == BLK_STS_OK)
 			bbio->bio.bi_status = READ_ONCE(bbio->status);
 
 		if (bbio_has_ordered_extent(bbio)) {
@@ -280,6 +323,12 @@ static void btrfs_end_repair_bio(struct btrfs_bio *repair_bbio,
 		atomic64_inc(&fs_info->raid56_write_stats.repair_csum_ok);
 		break;
 	}
+
+	if (unlikely(btrfs_raid56_trace_reads()))
+		btrfs_info(fs_info,
+"raid56: RTRACE repair logical %llu file_offset %llu mirror %d status %d csum_result %d",
+			   logical, repair_bbio->file_offset, mirror,
+			   repair_bbio->bio.bi_status, csum_result);
 
 	if (csum_result != BTRFS_CSUM_MISMATCH)
 		atomic_dec(&fbio->unrestored);
@@ -471,8 +520,16 @@ static void btrfs_check_read_bio(struct btrfs_bio *bbio, struct btrfs_device *de
 		offset += step;
 
 		if (IS_ALIGNED(offset, sectorsize)) {
-			if (status ||
-			    !btrfs_data_csum_ok(bbio, dev, offset - sectorsize, paddrs))
+			bool csum_ok = !status &&
+				btrfs_data_csum_ok(bbio, dev, offset - sectorsize, paddrs);
+
+			if (unlikely(btrfs_raid56_trace_reads()))
+				btrfs_info(fs_info,
+"raid56: RTRACE read logical %llu file_offset %llu mirror %d status %d csum_ok %d",
+					   round_down(iter->bi_sector << SECTOR_SHIFT, sectorsize),
+					   bbio->file_offset + offset - sectorsize,
+					   bbio->mirror_num, status, csum_ok);
+			if (!csum_ok)
 				fbio = repair_one_sector(bbio, offset - sectorsize,
 							 paddrs, fbio);
 		}

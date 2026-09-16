@@ -121,6 +121,19 @@ struct btrfs_bio *btrfs_bio_alloc(unsigned int nr_vecs, blk_opf_t opf,
 				  btrfs_bio_end_io_t end_io, void *private);
 void btrfs_bio_end_io(struct btrfs_bio *bbio, blk_status_t status);
 
+#ifdef CONFIG_BTRFS_DEBUG
+/*
+ * Restore the way btrfs_bio_end_io() used to decide the status of a split bio:
+ * load the saved first error only when the half finishing last succeeded.  The
+ * negative control for that fix -- with this on, a degraded RAID5/6 read whose
+ * failing half finishes last returns its unusable reconstruction as the file's
+ * content with no error.
+ */
+bool btrfs_split_bio_status_legacy(void);
+#else
+static inline bool btrfs_split_bio_status_legacy(void) { return false; }
+#endif
+
 /* Submit using blkcg_punt_bio_submit. */
 #define REQ_BTRFS_CGROUP_PUNT			REQ_FS_PRIVATE
 
