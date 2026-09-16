@@ -781,78 +781,55 @@ for "delivered as file content".
 
 ---
 
-## 19. STILL OPEN: a degraded read returns checksummed data that nothing rejected
+## 19. The RAID5/6 read path is closed; the residual is bounded OUTSIDE it
 
-After arming verification on the degraded read path, a small number of files
-per run (0-4) still read back COMPLETE, at exactly the right length, with
-content that was never written, and with no error. This is the original
-"impossible" symptom, reduced but not eliminated.
+A degraded read used to reconstruct and return data with verification never
+armed (`fill_data_csums()` had one caller, the RMW *write* path). Fixed. The
+read path is now audited at the point of delivery and the audit is clean:
 
-**Eliminated, each with evidence, not argument:**
+    delivered_unchecked      0    sectors with a checksum that nothing compared
+    delivered_nocsum         0    sectors delivered with no checksum at all
+    delivered_audit_skipped  0    rbios the audit could not examine
 
-1. *Test manifest duplicates.* Zero duplicate names across 14 manifests.
-2. *Wrong expectation.* The writers now record the digest of the bytes handed
-   to dd alongside the read-back digest. For every surviving case the two
-   AGREE at write time, so the expectation is genuinely what was written.
-3. *Holes read as zeros.* Computed the all-zeros digest for every observed
-   length; no match.
-4. *Another file's content.* Cross-referenced every wrong digest against every
-   manifest entry in the same run; no match.
-5. *NODATACOW / no checksums.* `lsattr` shows no C flag, and
-   `BTRFS_IOC_GET_CSUMS` (tools/testing/btrfs/csummap.c) reports one range per
-   file, `off=0 len=<full size> HAS_CSUMS`, no gaps.
-6. *Unverified rebuilds.* `recover_unverified_sectors` is 0 in runs that still
-   produce the symptom -- the addresses returned unverified are free space
-   (item 18) and are disjoint from the affected files' extents.
-7. *Degraded read-write mounts mutating the array between boots.* Added
-   `DEGRADED_MOUNT=ro` so the degraded passes observe instead of repair. The
-   symptom survives it.
-8. *Metadata divergence between RAID1 copies.* Logged every tracked file's
-   extent address in every boot: identical in all of them, including the boots
-   that read it right and the boots that read it wrong.
-9. *Verification checking different memory than is delivered.*
-   `recover_vertical_step()` and `verify_one_sector()` both select their pages
-   with `sector_paddr_in_rbio(..., 0)`, so the rebuild writes into exactly the
-   buffer verification reads.
+The third counter exists because the first two are only meaningful if the audit
+actually ran; without it a zero could not be told from never looking.
 
-**MEASURED SINCE, and it moves the bug to the other half of the system.**
-`audit_delivered_sectors()` now walks, at the moment a degraded read hands its
-bios back, every DATA sector that is in the caller's bio and has a checksum
-available, and checks whether anything actually compared it against that
-checksum. Both verify paths -- verify_bio_data_sectors() for sectors read
-directly and verify_one_sector() for sectors rebuilt from parity -- record what
-they checked in rbio->verified_bitmap.
+**So the residual is not in this path.** A few files per run (0-4) still read
+back complete, at the right length, with content never written and no error --
+but with all three counters at zero, the RAID5/6 recovery delivered nothing
+unverified, nothing unchecksummed, and nothing unexamined.
 
-    delivered_unchecked  0     in runs that still produce 3 wrong files each
+### The signature, which is the lead
 
-So the read path verifies everything it delivers. The wrong content is
-therefore NOT unverified -- it MATCHES its stored checksum. Data and checksum
-on disk are self-consistent with each other and both differ from what was
-written.
+Logging the actual bytes rather than digests shows the corruption is NOT
+whole-file. The head of the file reads as zeros while the tail is intact:
 
-That is a write-side or replay-side defect, not a read-side one, and it
-retires this as a read-path investigation. The remaining question is how a
-logical range comes to hold self-consistent content that was never written,
-while the same range reads correctly with every device present.
+    bg1-6  head=00000000000000000000000000000000  tail=029ecc...  (tail correct)
+    bg2-7  head=05000000000000000000000000000000  tail=9e1c26...  (tail correct)
 
-**What that leaves, and why it needs a decision rather than another guess.**
-The data is checksummed, the extent is stable, the expectation is right, the
-rebuild path verifies, and a direct read would be verified by
-`btrfs_check_read_bio()`. For wrong content to be delivered unrejected, either
-it was never verified by a path none of the above instrumentation observes, or
-it was compared against a checksum that matches it -- and a crc32c matching
-unrelated content by chance, repeatedly, is not credible.
+Per-sector mapping shows at least one case where exactly one 4 KiB sector in
+the middle of the file is entirely zero (`bg1-5 sectors=12
+all_zero_sectors=[1]`), with the rest of the file correct. Others are partially
+corrupt within a sector.
 
-The same file reads EIO with one device omitted and wrong-but-clean with
-another, so it is a function of which columns were used.
+A sector reading as zeros with no error is what a HOLE reads as -- legitimately,
+with no checksum consulted. That is the thread to pull: whether the affected
+range still has an extent covering it in the degraded mount, not whether the
+RAID5/6 code reconstructed it correctly.
 
-That instrumentation is now built (`delivered_unchecked`) and came back zero,
-so the next step is on the write/replay side: establish whether the affected
-extent's data and csum items were BOTH written from a value that was never the
-file's, or whether the inode ends up pointing at a range that was later reused.
-`_EXTENT` lines show the extent address is stable across boots, so it is not
-the inode being repointed after the fact.
+### Eliminated, each with evidence
+
+Manifest duplicates; wrong expectation (source digest recorded alongside the
+read-back, they agree every time); whole-file zeros; another tracked file's
+content; NODATACOW; unverified rebuilds (those addresses are free space, with a
+working positive control on the resolver); degraded read-write mounts mutating
+the array between boots (`DEGRADED_MOUNT=ro`, symptom survives); RAID1 metadata
+divergence (per-boot extent map identical in every boot); verification reading
+different memory than is delivered (both use `sector_paddr_in_rbio(..., 0)`).
+
+Ten hypotheses have died. The next step is not an eleventh -- it is to check
+whether the file's extent still covers the zeroed sector on the degraded mount.
 
 Reproduce: `DEGRADED_MOUNT=ro BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
-<kernel> tag flakey raid5:raid1 rw 4 2`, then read `_BAD`, `_EXTENT`,
-`_RECOVER`, `_UNVERIFIED_ADDRS` and `_RESOLVE_CONTROL` from `results.<tag>`.
+<kernel> tag flakey raid5:raid1 rw 4 2`, then read `_BADZERO`, `_EXTENT`,
+`_BAD`, `_RECOVER` from `results.<tag>`.

@@ -111,6 +111,20 @@ verify_manifest() {
 				# which is a different finding from a stable
 				# wrong value.
 				log "$1_BADINFO $f second_read=$(md5sum "$f" 2>/dev/null | awk '{print $1}')"
+				# How much of the file is zeros, and where?  The
+				# head reads as zeros while the tail is intact,
+				# so the interesting number is which SECTORS are
+				# zeroed -- a whole 4K sector points somewhere
+				# very different from a partial one.
+				zmd=$(head -c 4096 /dev/zero | md5sum | awk '{print $1}')
+				zsec=""
+				nsec=$(( ( $(stat -c %s "$f" 2>/dev/null || echo 0) + 4095 ) / 4096 ))
+				for k in $(seq 0 $((nsec - 1))); do
+					m1=$(dd if="$f" bs=4096 skip=$k count=1 status=none 2>/dev/null |
+					     md5sum | awk '{print $1}')
+					[ "$m1" = "$zmd" ] && zsec="$zsec $k"
+				done
+				log "$1_BADZERO $f sectors=$nsec all_zero_sectors=[${zsec:- none}]"
 				# The decisive one: is this range checksummed
 				# at all?
 				[ -x $T/umltest/csummap ] &&
@@ -128,11 +142,11 @@ verify_manifest() {
 	while read -r f m sz srcmd; do
 		blk=$(filefrag -v "$f" 2>/dev/null |
 			awk '/^[ ]*0:/ {gsub(/\.\./,"",$4); print $4; exit}')
-		log "$1_EXTENT $f logical=$((${blk:-0} * 4096)) size=$(stat -c %s "$f" 2>/dev/null)"
+		log "$1_EXTENT $f logical=$((${blk:-0} * 4096)) size=$(stat -c %s "$f" 2>/dev/null) head=$(od -An -tx1 -N16 "$f" 2>/dev/null | tr -d ' \n') tail=$(dd if="$f" bs=1 skip=$(( ${sz:-4096} - 16 )) count=16 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')"
 	done < $T/umltest/manifest.$TAG
 	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
 	for g in /sys/fs/btrfs/*/raid56_write_profile; do
-		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_|delivered_unchecked' $g | tr '\n' ' ')"
+		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_|delivered_' $g | tr '\n' ' ')"
 	done
 	# Whose sectors are being returned unchecked?  Take the addresses the
 	# kernel just named and ask the extent tree who owns them.

@@ -590,6 +590,23 @@ struct btrfs_raid56_write_stats {
 	 * verify what it returns.
 	 */
 	atomic64_t delivered_unchecked;
+	/*
+	 * Degraded reads whose delivery could NOT be audited, because the rbio
+	 * had no checksum bitmap by the time it handed its bios back.  Without
+	 * this, a zero @delivered_unchecked cannot be told apart from never
+	 * having looked -- which is the same vacuous green this series has been
+	 * caught by before.
+	 */
+	atomic64_t delivered_audit_skipped;
+	/*
+	 * Data sectors a degraded read handed back for which the rbio's
+	 * checksum bitmap had NO bit -- so nothing verified them and nothing
+	 * could.  @delivered_unchecked deliberately excludes these (it counts
+	 * sectors that HAD a checksum available and were not compared against
+	 * it), which made them invisible: both verify paths skip a sector with
+	 * no csum bit, and so did the audit.
+	 */
+	atomic64_t delivered_nocsum;
 };
 
 struct btrfs_fs_info {

@@ -1005,26 +1005,54 @@ static void rbio_endio_bio_list(struct bio *cur, blk_status_t status)
 static void audit_delivered_sectors(struct btrfs_raid_bio *rbio, blk_status_t status)
 {
 	unsigned int unchecked = 0;
+	unsigned int nocsum = 0;
 
 	if (rbio->operation != BTRFS_RBIO_READ_REBUILD || status != BLK_STS_OK)
 		return;
-	if (!rbio->csum_bitmap || !rbio->csum_buf || !rbio->verified_bitmap)
+	if (!rbio->csum_bitmap || !rbio->csum_buf || !rbio->verified_bitmap) {
+		/*
+		 * Cannot audit this one: without the bitmap there is no way to
+		 * say which sectors had a checksum available.  Count it, or a
+		 * zero above would be indistinguishable from never looking --
+		 * and this is exactly the case where nothing was verified.
+		 */
+		for (int stripe_nr = 0; stripe_nr < rbio->nr_data; stripe_nr++) {
+			for (int s = 0; s < rbio->stripe_nsectors; s++) {
+				if (sector_paddrs_in_rbio(rbio, stripe_nr, s, true)) {
+					atomic64_inc(&rbio->bioc->fs_info->
+						     raid56_write_stats.delivered_audit_skipped);
+					return;
+				}
+			}
+		}
 		return;
+	}
 
 	for (int stripe_nr = 0; stripe_nr < rbio->nr_data; stripe_nr++) {
 		for (int sector_nr = 0; sector_nr < rbio->stripe_nsectors; sector_nr++) {
 			const int idx = stripe_nr * rbio->stripe_nsectors + sector_nr;
 
-			if (!test_bit(idx, rbio->csum_bitmap))
-				continue;
 			if (!sector_paddrs_in_rbio(rbio, stripe_nr, sector_nr, true))
 				continue;
+			if (!test_bit(idx, rbio->csum_bitmap)) {
+				/*
+				 * Delivered, and no checksum covers it.  Both
+				 * verify paths skip these, so nothing checked
+				 * it and nothing could -- count it separately
+				 * rather than let it hide behind a zero.
+				 */
+				nocsum++;
+				continue;
+			}
 			if (test_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
 				     rbio->verified_bitmap))
 				continue;
 			unchecked++;
 		}
 	}
+	if (unlikely(nocsum))
+		atomic64_add(nocsum,
+			     &rbio->bioc->fs_info->raid56_write_stats.delivered_nocsum);
 	if (unlikely(unchecked)) {
 		atomic64_add(unchecked,
 			     &rbio->bioc->fs_info->raid56_write_stats.delivered_unchecked);
