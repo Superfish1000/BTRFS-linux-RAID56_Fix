@@ -194,6 +194,116 @@ Limits
 * A device that acknowledges a flush and loses the data anyway is outside
   what any of this can protect against.
 
+Filesystems that were already damaged
+=====================================
+
+The log protects a filesystem from the moment it is enabled.  An array that
+was written by a kernel without it, and crashed, carries inconsistent stripes
+that no record describes.  Nothing can say which side of such a stripe is
+wrong -- that is what the record was for -- but three things are still
+possible, and this is what they are for.
+
+Finding the damage without a record
+-----------------------------------
+
+A scrub compares the parity it reads against the parity it computes from the
+data on the same disks.  That is arithmetic on what is already there: it needs
+no record, so it works on an array damaged by any older kernel.  Two counters
+in ``/sys/fs/btrfs/<uuid>/raid56_write_profile`` report it::
+
+    parity_mismatch_vertical_stripes   vertical stripes whose parity did not
+                                       describe the data
+    parity_mismatch_full_stripes       full stripes containing at least one
+
+A non-zero count on an array that has never lost a device is the write hole's
+footprint.  The data is still readable -- every device holds what was last
+written to it -- but the redundancy of those stripes is gone: if a device
+fails now, reconstruction from that parity produces a value nobody wrote.
+With data checksums that is detected; for ``nodatasum`` data it is not.
+
+Naming the members, when there is a record
+------------------------------------------
+
+Where the log does have records, ``BTRFS_IOC_RAID56_STALE_STRIPES`` hands them
+to userspace: the regions recorded, and for each whether the log can name the
+data column whose write failed (``stale``), knows only that something went
+wrong (``sticky``), or knows the parity does not describe the data
+(``stale_par``).  ``tools/testing/btrfs/wibdump.c`` is a reference reader.  A
+named member is repairable; an unnamed one is the ambiguous case below.
+
+Each region also carries the newest filesystem generation at which any block in
+it gained a fault record, and a helper has to honour it.  Everything else a
+record says can be re-derived by reading the disks; this cannot.  A logical
+address is reused once its extent is freed and reallocated, so an extent found
+there that is *newer* than that generation was written after the record and the
+record does not describe it.  Repairing it on the record's say-so would damage
+data that was never at risk.  The evidence header carries the same generation
+for the same reason.
+
+Copying out an ambiguous stripe: the evidence channel
+-----------------------------------------------------
+
+A scrub that reaches a stripe it cannot decide leaves it alone -- recomputing
+the parity would destroy the only surviving copy of what was acknowledged, and
+rebuilding the data would invent a value nothing committed.  At that instant
+the scrub is holding the only mutually coherent copy of the stripe's data
+columns that will ever exist: freshly read, with the block group read-only for
+the whole chunk scrub so nothing can be writing, and about to be dropped.
+
+``BTRFS_IOC_RAID56_EVIDENCE`` copies it out.  ``ARM`` before the scrub, ``READ``
+repeatedly while it runs, ``DISARM`` afterwards; each ``READ`` returns one full
+stripe's data columns and a header naming every column's devid and physical
+offset.  Nothing is allocated until a helper arms it, so an unwatched
+filesystem pays nothing.
+
+Read *during* the scrub, not after.  The kernel holds four slots; waiting until
+the scrub finishes means waiting for them to have overflowed.  A capture that
+finds the ring full waits up to ``btrfs.raid56_evidence_wait_ms`` (5 s by
+default) for the helper rather than discarding the stripe, and the ring never
+overwrites the entry a helper has not read yet -- the oldest entry is the one
+it is about to take.  Four counters come back with every ``READ``::
+
+    captured        stripes copied out since ARM
+    waited          of those, how many had to wait for a free slot -- non-zero
+                    means the helper is only just keeping up
+    dropped_full    stripes lost because it did not keep up at all
+    dropped_wide    stripes too wide to copy: more columns than the header
+                    can name, or more data than a slot holds (sixteen
+                    columns' worth, which an 18-device RAID5 exceeds)
+
+``dropped_full`` and ``dropped_wide`` are the count of evidence that no longer
+exists anywhere.  They are reported rather than hidden precisely because there
+is nothing else to be done about them afterwards.
+
+The parity is deliberately **not** copied.  It is named instead -- devid and
+physical offset per column -- and the block group stays read-only until that
+chunk's scrub ends, so a helper reads the parity straight off the device
+without racing anything.  Issuing more reads to an array that is failing by
+construction, from a path with no ``REQ_FAILFAST`` and no timeout, is the
+alternative that was rejected.
+
+The header carries ``BTRFS_RAID56_EVIDENCE_F_COHERENT``.  It is set when the
+block group was held read-only for the capture, which is the case on the
+user-scrub path.  The write-intent log's mount-time recovery reaches the same
+verdict with no such hold, so its columns may have been read either side of a
+write; that capture is still made -- it is the earliest moment those bytes
+exist together, and a crash nobody was awake for is exactly the case this is
+for -- but the flag is clear and a helper must treat it as a best-effort copy.
+
+``tools/testing/btrfs/evidence.c`` is a reference consumer: it drains to a
+directory (the "recovery drive") while the scrub runs, one ``.data`` file of
+the data columns and one ``.meta`` file per stripe.
+
+What this does not do
+---------------------
+
+None of it repairs anything by itself, and none of it writes to the array.  It
+copies out and describes; reconstructing a file from a captured stripe -- by
+trying a rebuild from each candidate parity, or from each candidate stale
+column, and checking the result -- is offline work for a userspace tool on the
+copy, not something the kernel guesses at.  That is the whole point: a stripe
+reaches this path precisely because there is nothing left that can decide it.
+
 Failure points
 ==============
 
