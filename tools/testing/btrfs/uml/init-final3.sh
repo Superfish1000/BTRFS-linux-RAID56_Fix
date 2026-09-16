@@ -119,9 +119,42 @@ verify_manifest() {
 			fi
 		fi
 	done < $T/umltest/manifest.$TAG
+	# The extent map of every tracked file, once per boot.  If a file reads
+	# back with content that MATCHES a checksum and yet is not what was
+	# written, the metadata must be describing different data -- and then
+	# its extent address will differ between the boot that reads it right
+	# and the boot that reads it wrong.  That is a statement about
+	# metadata, not about the RAID5 data, and it is cheap to check.
+	while read -r f m sz srcmd; do
+		blk=$(filefrag -v "$f" 2>/dev/null |
+			awk '/^[ ]*0:/ {gsub(/\.\./,"",$4); print $4; exit}')
+		log "$1_EXTENT $f logical=$((${blk:-0} * 4096)) size=$(stat -c %s "$f" 2>/dev/null)"
+	done < $T/umltest/manifest.$TAG
 	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
 	for g in /sys/fs/btrfs/*/raid56_write_profile; do
 		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_' $g | tr '\n' ' ')"
+	done
+	# Whose sectors are being returned unchecked?  Take the addresses the
+	# kernel just named and ask the extent tree who owns them.
+	log "$1_UNVERIFIED_ADDRS $(dmesg | grep -o 'UNVERIFIED_REBUILD logical [0-9]*' | awk '{print $3}' | sort -un | tr '\n' ' ')"
+	dmesg | grep -o "UNVERIFIED_REBUILD logical [0-9]*" | awk '{print $3}' |
+		sort -un | head -4 | while read -r lg; do
+		own=$(btrfs inspect-internal logical-resolve -P "$lg" $MNT 2>&1 | head -3 | tr '\n' ' ')
+		log "$1_UNVERIFIED_OWNER logical=$lg -> ${own:-<unresolved>}"
+	done
+	# CONTROL for the above.  A "nothing owns this" answer from a degraded
+	# read-only mount is worth nothing unless resolving a KNOWN extent on
+	# the same mount works.  Take a file that exists and resolve its own
+	# first extent; if that fails too, the tool cannot answer here and the
+	# unowned verdicts above mean nothing.
+	for probe in $MNT/old $MNT/bg1-1; do
+		[ -f "$probe" ] || continue
+		blk=$(filefrag -v "$probe" 2>/dev/null |
+			awk '/^[ ]*0:/ {gsub(/\.\./,"",$4); print $4; exit}')
+		[ -n "$blk" ] || continue
+		lg=$((blk * 4096))
+		own=$(btrfs inspect-internal logical-resolve -P "$lg" $MNT 2>&1 | head -2 | tr '\n' ' ')
+		log "$1_RESOLVE_CONTROL $probe logical=$lg -> ${own:-<unresolved>}"
 	done
 	[ "$bad" = 0 ] || kmsg "csum|error|corrupt" 5
 }
@@ -415,7 +448,17 @@ remount)
 	finish
 	;;
 degraded)
-	do_mount $OPTS,degraded $MNTDEV
+	# DEGRADED_MOUNT=ro makes this pass OBSERVE instead of mutate.
+	#
+	# A degraded read-write mount runs the write-intent log's recovery and
+	# can write: it repairs, it regenerates parity, and on RAID5/6 with a
+	# device missing it does that from reconstructions.  With one such boot
+	# per omitted device, the second is no longer looking at the array the
+	# first one saw, and a mismatch against the original manifest stops
+	# meaning "the filesystem lost this" and starts meaning "the filesystem
+	# lost this, or an earlier degraded mount rewrote it".  nocow_probe
+	# already mounts ro for exactly this reason.
+	do_mount ${DEGRADED_MOUNT:-$OPTS},degraded $MNTDEV
 	kmsg "write-intent log:" 3
 	verify_old DEGRADED
 	ls $MNT/new >/dev/null 2>&1 && log "new exists (unexpected, was not committed)"

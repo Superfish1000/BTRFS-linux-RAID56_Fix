@@ -19,7 +19,7 @@ boot() {
 		ubds="$ubds ubd$d=$D/disk$d.img"
 	done
 	timeout 1500 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw init=$T/umltest/init-final3.sh $ubds \
-		quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T MODE=$mode OPTS=$OPTS PROFILE=$PROFILE CRASH=1 TAG=$TAG \
+		quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T DEGRADED_MOUNT=${DEGRADED_MOUNT:-} MODE=$mode OPTS=$OPTS PROFILE=$PROFILE CRASH=1 TAG=$TAG \
 		MNTDEV=$mntdev NDEV=$NDEV FAIL=$FAIL $extra > $D/log.$mode.omit${omit// /-} 2>&1
 	echo "boot $mode omit=$omit rc=$?" >> $T/umltest/results.$TAG
 }

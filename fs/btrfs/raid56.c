@@ -2325,9 +2325,17 @@ static void count_recover_verification(struct btrfs_raid_bio *rbio, int stripe_n
 		atomic64_inc(&st->recover_unverified_nobitmap);
 	else
 		atomic64_inc(&st->recover_unverified_nobit);
+	/*
+	 * Print the sector's own logical address, not just the stripe's: the
+	 * question this has to answer is WHOSE sector it is, and that needs an
+	 * address btrfs_ioctl_logical_to_ino() can resolve.
+	 */
 	btrfs_warn_rl(rbio->bioc->fs_info,
-"raid56: returning a sector of full stripe %llu rebuilt from the parity with nothing to check it against; if that parity does not describe the data, this is silently not what was written",
-		      rbio->bioc->full_stripe_logical);
+"raid56: UNVERIFIED_REBUILD logical %llu (full stripe %llu col %d) returned from the parity with nothing to check it against",
+		      rbio->bioc->full_stripe_logical +
+		      ((u64)stripe_nr << BTRFS_STRIPE_LEN_SHIFT) +
+		      ((u64)sector_nr << rbio->bioc->fs_info->sectorsize_bits),
+		      rbio->bioc->full_stripe_logical, stripe_nr);
 }
 
 /*

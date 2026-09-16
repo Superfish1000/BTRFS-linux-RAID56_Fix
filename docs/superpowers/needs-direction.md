@@ -765,55 +765,73 @@ never block.
 
 ---
 
-## 18. A degraded rebuild returns sectors of a checksummed file with no checksum bit
+## 18. RESOLVED: the unverified rebuilt sectors are free space
 
-Fixed in this series: the degraded RAID5/6 read path never armed checksum
-verification at all (`fill_data_csums()` had one caller, the RMW *write* path),
-so every reconstruction was handed back unchecked. Arming it converts most of
-the silent wrong data into honest EIO.
+The counters showed 16-32 sectors per degraded boot rebuilt and returned with
+no checksum bit. Resolved: those addresses are not owned by anything.
+`btrfs inspect-internal logical-resolve` returns ENOENT for every one of them,
+and -- the part that makes that answer worth anything -- resolving a KNOWN
+file's extent on the SAME degraded read-only mount succeeds
+(`inode 257 offset 0 root 5`). So the resolver works there and the negative is
+real: they are free-space sectors of the same stripe, which have no checksum
+for the honest reason that there is nothing there to checksum.
 
-**What is left, and it is a separate defect.** Counters added alongside the fix
-(`recover_verified_sectors`, `recover_unverified_nobitmap`,
-`recover_unverified_nobit`, in `raid56_write_profile`) say this precisely:
+Benign. The counter's "in the caller's bio" test is not a tight enough proxy
+for "delivered as file content".
 
-    recover_unverified_nobitmap  0     always
-    recover_unverified_nobit     16 or 32 per degraded boot
+---
 
-So `fill_data_csums()` succeeds and builds a bitmap -- it is not bailing, and
-its "failed to get csum" warning never fires -- but
-`btrfs_lookup_csums_bitmap()` leaves specific sectors uncovered. Those sectors
-are in the caller's bio (the counter only counts sectors for which
-`sector_paddrs_in_rbio(..., true)` returns non-NULL), so they are being handed
-back to somebody as content.
+## 19. STILL OPEN: a degraded read returns checksummed data that nothing rejected
 
-Two facts make this hard to explain and worth someone's attention:
+After arming verification on the degraded read path, a small number of files
+per run (0-4) still read back COMPLETE, at exactly the right length, with
+content that was never written, and with no error. This is the original
+"impossible" symptom, reduced but not eliminated.
 
-- The counts are exact multiples of 16 sectors. At 4 KiB sectors that is
-  65536 bytes -- exactly one column, BTRFS_STRIPE_LEN. Whole columns are
-  uncovered, not scattered sectors.
-- The files involved ARE fully checksummed. `BTRFS_IOC_GET_CSUMS` via
-  tools/testing/btrfs/csummap.c reports a single range per file,
-  `off=0 len=<full size> type=0x1 HAS_CSUMS`, no gaps, no NODATASUM.
+**Eliminated, each with evidence, not argument:**
 
-So a file whose every byte has a checksum item has a whole column's worth of
-sectors rebuilt from parity and returned without that checksum being consulted.
+1. *Test manifest duplicates.* Zero duplicate names across 14 manifests.
+2. *Wrong expectation.* The writers now record the digest of the bytes handed
+   to dd alongside the read-back digest. For every surviving case the two
+   AGREE at write time, so the expectation is genuinely what was written.
+3. *Holes read as zeros.* Computed the all-zeros digest for every observed
+   length; no match.
+4. *Another file's content.* Cross-referenced every wrong digest against every
+   manifest entry in the same run; no match.
+5. *NODATACOW / no checksums.* `lsattr` shows no C flag, and
+   `BTRFS_IOC_GET_CSUMS` (tools/testing/btrfs/csummap.c) reports one range per
+   file, `off=0 len=<full size> HAS_CSUMS`, no gaps.
+6. *Unverified rebuilds.* `recover_unverified_sectors` is 0 in runs that still
+   produce the symptom -- the addresses returned unverified are free space
+   (item 18) and are disjoint from the affected files' extents.
+7. *Degraded read-write mounts mutating the array between boots.* Added
+   `DEGRADED_MOUNT=ro` so the degraded passes observe instead of repair. The
+   symptom survives it.
+8. *Metadata divergence between RAID1 copies.* Logged every tracked file's
+   extent address in every boot: identical in all of them, including the boots
+   that read it right and the boots that read it wrong.
+9. *Verification checking different memory than is delivered.*
+   `recover_vertical_step()` and `verify_one_sector()` both select their pages
+   with `sector_paddr_in_rbio(..., 0)`, so the rebuild writes into exactly the
+   buffer verification reads.
 
-Candidates not yet eliminated:
-- The lookup range. `fill_data_csums()` uses `rbio->bioc->full_stripe_logical`;
-  if that is not set the same way for a recover bioc as for an RMW one, the
-  lookup searches the wrong range. Most sectors DO verify, which argues
-  against it, but a boundary error would fit the "whole column" shape.
-- Bitmap index agreement. The bitmap is filled by logical offset from `start`
-  while `verify_one_sector()` indexes `stripe_nr * stripe_nsectors + sector_nr`.
-  These agree only if the rbio's stripe numbering is logical column order for
-  the rotated layout.
-- The caller may not be a file read at all (scrub, readahead), in which case
-  the sector is in a bio but no data checksum is expected to cover it -- which
-  would make the residual benign and the counter misnamed.
+**What that leaves, and why it needs a decision rather than another guess.**
+The data is checksummed, the extent is stable, the expectation is right, the
+rebuild path verifies, and a direct read would be verified by
+`btrfs_check_read_bio()`. For wrong content to be delivered unrejected, either
+it was never verified by a path none of the above instrumentation observes, or
+it was compared against a checksum that matches it -- and a crc32c matching
+unrelated content by chance, repeatedly, is not credible.
 
-Reproduce: `BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh <kernel> tag
-flakey raid5:raid1 rw 4 2`, then read `_RECOVER` and `_BADCSUM` lines from
-`results.<tag>`. Every unverified returned sector also logs a rate-limited
-warning naming its full stripe, but the harness runs the guest `quiet` so that
-warning does not reach the captured log -- add the pattern to a `kmsg` call to
-see it.
+The same file reads EIO with one device omitted and wrong-but-clean with
+another, so it is a function of which columns were used.
+
+Next step should be instrumentation INSIDE the delivery path rather than more
+hypotheses: count data sectors delivered by a RAID5/6 recovery against sectors
+actually csum-verified for the same bio, and report when they differ. That
+turns "some path we have not observed" into a named path. Six hypotheses have
+now died; the seventh should not be a guess.
+
+Reproduce: `DEGRADED_MOUNT=ro BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
+<kernel> tag flakey raid5:raid1 rw 4 2`, then read `_BAD`, `_EXTENT`,
+`_RECOVER`, `_UNVERIFIED_ADDRS` and `_RESOLVE_CONTROL` from `results.<tag>`.
