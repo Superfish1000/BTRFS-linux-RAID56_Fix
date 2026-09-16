@@ -86,6 +86,7 @@ int main(int argc, char **argv)
 	struct stat st;
 	int fd, has = 0, nosum = 0, zero = 0, other = 0;
 	int mismatch = 0, holes = 0, zerosum = 0, unreadable = 0;
+	uint64_t walked = 0;
 
 	if (argc < 2) { fprintf(stderr, "usage: csummap <file>\n"); return 2; }
 	crc32c_init();
@@ -123,7 +124,13 @@ int main(int argc, char **argv)
 		else if (e.type & ZEROED) zero += 1;
 		else other += 1;
 		off += sizeof(e);
-		if (e.type & HAS_CSUMS) {
+		/*
+		 * Exact equality, not a mask: the kernel appends the csum bytes
+		 * only when the type is HAS_CSUMS on its own
+		 * (btrfs_ioctl_get_csums()), so testing a bit would desync the
+		 * walk the first time that flag is ever combined with another.
+		 */
+		if (e.type == HAS_CSUMS) {
 			const uint8_t *sums = a->buf + off;
 			uint64_t nsec = e.length / SECTORSIZE;
 
@@ -164,7 +171,18 @@ int main(int argc, char **argv)
 			}
 			off += nsec * 4;
 		}
+		walked = off;
 	}
+	/*
+	 * The walk above assumes a 4-byte csum.  On a filesystem with a wider
+	 * one it desyncs after the first entry and every number below is
+	 * fiction, so say when the entries did not account for the buffer.
+	 */
+	if (walked != a->buf_size)
+		printf("CSUMMAP %s WALK_DESYNC consumed=%llu of %llu -- "
+		       "csum width is probably not 4 bytes; ignore the numbers\n",
+		       argv[1], (unsigned long long)walked,
+		       (unsigned long long)a->buf_size);
 	printf("CSUMMAP %s size=%lld ranges: has_csums=%d nodatasum=%d zeroed=%d other=%d "
 	       "sectors: mismatch=%d csum_holes=%d stored_is_zeros=%d eio=%d zerocsum=%08x\n",
 	       argv[1], (long long)st.st_size, has, nosum, zero, other,

@@ -20,6 +20,126 @@ pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails+1)); }
 note() { printf '  ....  %s\n' "$1"; }
 
+check_scenario() { # <tag> <resultfile> <label>
+	local tag=$1 f=$2 label=$3
+	local d=$T/umltest/$tag
+
+	# Splats land in the per-boot logs, not in the results file: run3.sh
+	# writes only "boot ... rc=N" there.  Searching $f for "BUG:" can never
+	# match, which is why this used to pass unconditionally.  init-final3.sh
+	# does log KERNEL_SPLAT into the results, so check both.
+	if grep -aqrE "BUG:|KASAN|Oops|possible circular|hung task|INFO: task" $d 2>/dev/null \
+	   || grep -aq "KERNEL_SPLAT" $f; then
+		fail "$label: kernel splat"
+		grep -ahrE "BUG:|KASAN|Oops|hung task" $d 2>/dev/null | head -2
+		return
+	fi
+	# A boot that was killed rather than finishing invalidates everything
+	# after it: the background writers record a file in the manifest as soon
+	# as dd returns, so a kill mid-flight leaves the manifest naming files
+	# whose data never landed, and the verification below then reports that
+	# as corruption.  timeout(1) exits 124.  Say "the setup died" instead of
+	# letting it masquerade as lost data.
+	if grep -aq "rc=124" $f; then
+		fail "$label: a boot timed out -- setup incomplete, verification not meaningful"
+		grep -a "rc=124" $f | head -2
+		return
+	fi
+
+	# The verdict the scenarios actually emit.  verify_manifest() prefixes
+	# both lines with the caller's label, so they read
+	#     [recover]  FULL_MANIFEST total=48 bad=0
+	#     [degraded] DEGRADED_BAD <file> expected <md5> got <md5>
+	# An earlier version of this greped for "] BAD " and "VERIFY total=",
+	# neither of which any scenario emits, so both corruption checks were
+	# dead and a run could report success with files reading back wrong.
+	# Match the prefix, not a guess at it.
+	if grep -aq "STALE_SECTOR_SILENT_CORRUPTION" $f; then
+		fail "$label: committed data read back wrong"
+		grep -a "SILENT_CORRUPTION" $f | head -3
+		return
+	fi
+	# _BAD lines are two different findings wearing one name, and calling
+	# both "read back wrong" made a documented exposure look like
+	# corruption.  Split them by what the read actually did:
+	#
+	#   wrong data  the read SUCCEEDED and md5sum printed a full hash that
+	#               differs from the manifest.  Serious: the filesystem
+	#               handed back content nobody asked it to keep.
+	#   read failed  md5sum printed nothing, so the read errored.  That is
+	#               what a crash followed by a device loss looks like: the
+	#               write-intent log records stripe ADDRESSES, not content,
+	#               so a stripe whose data is gone cannot be rebuilt and the
+	#               kernel says so ("has unrepairable sectors").  See
+	#               needs-direction item 1.  Nondeterministic by nature --
+	#               it depends on how many sub-stripe writes the crash
+	#               caught in flight, measured at 10 and 13 across two runs
+	#               of the same kernel -- so failing on the count would make
+	#               the suite report a regression at random.
+	local nwrong nreadfail
+	nwrong=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | wc -l)
+	nreadfail=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '!(/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/)' | wc -l)
+	if [ "${nwrong:-0}" != 0 ]; then
+		fail "$label: $nwrong file(s) read back complete with different content"
+		grep -aE "([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | head -3
+		return
+	fi
+	[ "${nreadfail:-0}" != 0 ] && \
+		note "$label: $nreadfail file(s) unreadable after crash + device loss (expected, needs-direction item 1)"
+	local badcount nmanifest nsilent
+	badcount=$(grep -aoE "MANIFEST total=[0-9]+ bad=[0-9]+" $f | grep -o "bad=[0-9]*" |
+		   cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+	# The scenario's own count of files that read back COMPLETE, at the
+	# right size, with content nobody wrote.  A second opinion on the
+	# nwrong check above rather than a repeat of it: nwrong needs a full
+	# md5 on the _BAD line, this needs the size to match too, and they are
+	# computed by different code.  Both must be zero.
+	nsilent=$(grep -aoE "MANIFEST total=[0-9]+ bad=[0-9]+ silent=[0-9]+" $f |
+		  grep -o "silent=[0-9]*" | cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+	# Only the scenarios that run background writers build a manifest, so
+	# its absence is not a failure -- but it does mean the only content
+	# check this scenario made is verify_old() on a single file, which is
+	# worth saying rather than leaving to be inferred from a silent zero.
+	nmanifest=$(grep -ac "MANIFEST total=" $f)
+	[ "${nmanifest:-0}" != 0 ] || note "$label: no manifest (content checked by verify_old only)"
+	[ "${nsilent:-0}" != 0 ] && { fail "$label: $nsilent file(s) returned complete with content nobody wrote"; return; }
+	# badcount used to fail outright on any non-zero value, which
+	# double-counted the very read failures the nwrong/nreadfail split had
+	# just classified as expected: every bad file emits one _BAD line, so
+	# badcount IS nwrong + nreadfail.  As a verdict it contradicted the
+	# split; as a cross-check it is worth keeping, because a disagreement
+	# means the _BAD parsing above missed a line and its zero meant
+	# nothing.
+	if [ "${badcount:-0}" -ne $((nwrong + nreadfail)) ] 2>/dev/null; then
+		fail "$label: the manifest counted $badcount bad file(s) but $((nwrong + nreadfail)) _BAD line(s) parsed -- the corruption checks above are not seeing everything"
+		return
+	fi
+	for m in MKFS_FAIL UMOUNT_FAIL CHECK_FAIL CRASH_ARM_FAIL DM_CREATE_FAIL \
+		 DM_RELOAD_FAIL NOCOW_READ_FAIL REMOUNT_RW_FAIL; do
+		grep -aq "$m" $f && { fail "$label: $m"; return; }
+	done
+	grep -aq "FULL_READ_OK" $f || { fail "$label: committed data did not read back after recovery"; return; }
+	local nrec ndeg nfail
+	nrec=$(grep -ac "boot recover .*rc=0" $f)
+	ndeg=$(grep -ac "DEGRADED_READ_OK" $f)
+	nfail=$(grep -ac "MOUNT_FAIL\|REPLAY_FAILED" $f)
+	[ "$nrec" -ge 1 ] || { fail "$label: recovery mount did not succeed"; return; }
+	[ "$ndeg" -ge 1 ] || { fail "$label: no degraded read succeeded"; return; }
+	pass "$label: recovered, $ndeg degraded reads OK"
+	[ "$nfail" -gt 0 ] && note "$label: $nfail mount(s) refused -- expected where the metadata profile cannot survive the omission"
+	return 0
+}
+
+# --check-log <tag> <file> <label>: re-judge a log this suite already produced,
+# without re-running anything.  Useful for a log kept from an earlier run, and
+# it is how check_scenario()'s corruption checks are themselves tested: doctor
+# a real log and confirm each check flags it.  Exits non-zero if anything
+# failed.  Placed here so it runs before the suite's own stages do.
+if [ "${1:-}" = "--check-log" ]; then
+	check_scenario "${2:?tag}" "${3:?result file}" "${4:-relog}"
+	exit $((fails != 0))
+fi
+
 # --self-check: prove the checking logic actually detects a regression, by
 # doctoring a real sweep and confirming each check flags it.  A suite that has
 # only ever passed is not evidence of anything.
@@ -230,97 +350,6 @@ grep -aqE "BUG:|KASAN|Oops|WARNING:" $LOG/selftest \
 	&& { fail "kernel splat during self tests"; grep -aE "BUG:|KASAN|Oops|WARNING:" $LOG/selftest | head -3; } \
 	|| pass "no kernel splat"
 
-check_scenario() { # <tag> <resultfile> <label>
-	local tag=$1 f=$2 label=$3
-	local d=$T/umltest/$tag
-
-	# Splats land in the per-boot logs, not in the results file: run3.sh
-	# writes only "boot ... rc=N" there.  Searching $f for "BUG:" can never
-	# match, which is why this used to pass unconditionally.  init-final3.sh
-	# does log KERNEL_SPLAT into the results, so check both.
-	if grep -aqrE "BUG:|KASAN|Oops|possible circular|hung task|INFO: task" $d 2>/dev/null \
-	   || grep -aq "KERNEL_SPLAT" $f; then
-		fail "$label: kernel splat"
-		grep -ahrE "BUG:|KASAN|Oops|hung task" $d 2>/dev/null | head -2
-		return
-	fi
-	# A boot that was killed rather than finishing invalidates everything
-	# after it: the background writers record a file in the manifest as soon
-	# as dd returns, so a kill mid-flight leaves the manifest naming files
-	# whose data never landed, and the verification below then reports that
-	# as corruption.  timeout(1) exits 124.  Say "the setup died" instead of
-	# letting it masquerade as lost data.
-	if grep -aq "rc=124" $f; then
-		fail "$label: a boot timed out -- setup incomplete, verification not meaningful"
-		grep -a "rc=124" $f | head -2
-		return
-	fi
-
-	# The verdict the scenarios actually emit.  verify_manifest() prefixes
-	# both lines with the caller's label, so they read
-	#     [recover]  FULL_MANIFEST total=48 bad=0
-	#     [degraded] DEGRADED_BAD <file> expected <md5> got <md5>
-	# An earlier version of this greped for "] BAD " and "VERIFY total=",
-	# neither of which any scenario emits, so both corruption checks were
-	# dead and a run could report success with files reading back wrong.
-	# Match the prefix, not a guess at it.
-	if grep -aq "STALE_SECTOR_SILENT_CORRUPTION" $f; then
-		fail "$label: committed data read back wrong"
-		grep -a "SILENT_CORRUPTION" $f | head -3
-		return
-	fi
-	# _BAD lines are two different findings wearing one name, and calling
-	# both "read back wrong" made a documented exposure look like
-	# corruption.  Split them by what the read actually did:
-	#
-	#   wrong data  the read SUCCEEDED and md5sum printed a full hash that
-	#               differs from the manifest.  Serious: the filesystem
-	#               handed back content nobody asked it to keep.
-	#   read failed  md5sum printed nothing, so the read errored.  That is
-	#               what a crash followed by a device loss looks like: the
-	#               write-intent log records stripe ADDRESSES, not content,
-	#               so a stripe whose data is gone cannot be rebuilt and the
-	#               kernel says so ("has unrepairable sectors").  See
-	#               needs-direction item 1.  Nondeterministic by nature --
-	#               it depends on how many sub-stripe writes the crash
-	#               caught in flight, measured at 10 and 13 across two runs
-	#               of the same kernel -- so failing on the count would make
-	#               the suite report a regression at random.
-	local nwrong nreadfail
-	nwrong=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | wc -l)
-	nreadfail=$(grep -aE "^\[.*\] ([A-Z_]*_)?BAD " $f | awk '!(/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/)' | wc -l)
-	if [ "${nwrong:-0}" != 0 ]; then
-		fail "$label: $nwrong file(s) read back complete with different content"
-		grep -aE "([A-Z_]*_)?BAD " $f | awk '/ got [0-9a-f]{32} / || / got [0-9a-f]{32}$/' | head -3
-		return
-	fi
-	[ "${nreadfail:-0}" != 0 ] && \
-		note "$label: $nreadfail file(s) unreadable after crash + device loss (expected, needs-direction item 1)"
-	local badcount nmanifest
-	badcount=$(grep -aoE "MANIFEST total=[0-9]+ bad=[0-9]+" $f | grep -o "bad=[0-9]*" |
-		   cut -d= -f2 | awk '{s+=$1} END {print s+0}')
-	# Only the scenarios that run background writers build a manifest, so
-	# its absence is not a failure -- but it does mean the only content
-	# check this scenario made is verify_old() on a single file, which is
-	# worth saying rather than leaving to be inferred from a silent zero.
-	nmanifest=$(grep -ac "MANIFEST total=" $f)
-	[ "${nmanifest:-0}" != 0 ] || note "$label: no manifest (content checked by verify_old only)"
-	[ "${badcount:-0}" != 0 ] && { fail "$label: $badcount file(s) verified wrong"; return; }
-	for m in MKFS_FAIL UMOUNT_FAIL CHECK_FAIL CRASH_ARM_FAIL DM_CREATE_FAIL \
-		 DM_RELOAD_FAIL NOCOW_READ_FAIL REMOUNT_RW_FAIL; do
-		grep -aq "$m" $f && { fail "$label: $m"; return; }
-	done
-	grep -aq "FULL_READ_OK" $f || { fail "$label: committed data did not read back after recovery"; return; }
-	local nrec ndeg nfail
-	nrec=$(grep -ac "boot recover .*rc=0" $f)
-	ndeg=$(grep -ac "DEGRADED_READ_OK" $f)
-	nfail=$(grep -ac "MOUNT_FAIL\|REPLAY_FAILED" $f)
-	[ "$nrec" -ge 1 ] || { fail "$label: recovery mount did not succeed"; return; }
-	[ "$ndeg" -ge 1 ] || { fail "$label: no degraded read succeeded"; return; }
-	pass "$label: recovered, $ndeg degraded reads OK"
-	[ "$nfail" -gt 0 ] && note "$label: $nfail mount(s) refused -- expected where the metadata profile cannot survive the omission"
-	return 0
-}
 
 echo "== sysfs toggle under load =="
 ( cd $HERE && ./misc3.sh $K rg-toggle toggle raid5:raid1 rw 4 ) > $LOG/toggle 2>&1

@@ -1048,6 +1048,28 @@ Both arms still detect the damage. Only the silent delivery changes -- which is
 the distinction `verify_manifest()` now counts separately, because summing a
 read that fails together with a read that lies had been hiding exactly this.
 
+**How far it reaches.** The lost status is `bbio->bio.bi_status`, which is
+what every `end_io` callback reads to decide whether its I/O succeeded, so the
+same hole was open to all of them -- buffered data reads
+(`end_bbio_data_read()`), metadata reads, compressed I/O
+(`compression.c:234`), direct and encoded I/O (`btrfs_encoded_read_endio()`),
+relocation (`relocation.c:4095`) and scrub (`scrub_read_endio()`). Each takes
+its answer from the last completion to run, and until now so did the status.
+Only the degraded buffered read was measured; the rest is a code fact about a
+shared field, and every one of them is fixed by the same load. Which of them
+can actually be reached with a split bio was not measured -- scrub, for one,
+submits stripe-aligned reads of at most `BTRFS_STRIPE_LEN` and so may never
+split.
+
+Every path that writes `bbio->bio.bi_status` either passes the value straight
+into `btrfs_bio_end_io()` (`simple_end_io_work()`, `btrfs_raid56_end_io()`,
+`orig_write_end_io_work()`, `run_one_async_done()`, `btrfs_repair_done()`) or
+clears it before completion as `btrfs_check_read_bio()` does, so loading
+`bbio->status` unconditionally cannot invent an error. Repair bios never reach
+`btrfs_bio_end_io()` at all -- `btrfs_check_read_bio()` diverts the repair
+bioset to `btrfs_end_repair_bio()` first -- so a repair retried against another
+mirror carries no stale status into its second attempt.
+
 **What this retires.** The `unrestored` guard in `struct btrfs_failed_bio`
 never fired on any reproducing run and still does not; it stays as an invariant
 with no measured cost, but it was never this bug. The open question at the end
