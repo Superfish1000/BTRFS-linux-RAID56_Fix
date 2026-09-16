@@ -65,10 +65,18 @@ do_mount() {
 verify_manifest() {
 	# Every file whose fsync returned before the crash, name + md5.
 	[ -f $T/umltest/manifest.$TAG ] || return 0
-	local total=0 bad=0 f m sz got gotsz
-	while read -r f m sz; do
+	local total=0 bad=0 srcok=0 f m sz srcmd got gotsz
+	while read -r f m sz srcmd; do
 		total=$((total+1))
 		got=$(md5sum $f 2>/dev/null | awk '{print $1}')
+		if [ -n "$got" ] && [ -n "$srcmd" ] && [ "$got" = "$srcmd" ] && [ "$got" != "$m" ]; then
+			# Reads back as what was WRITTEN.  The manifest's
+			# read-back digest was taken through a degraded path
+			# and is the thing that was wrong.
+			srcok=$((srcok+1))
+			log "$1_SRCOK $f readback-digest was wrong, data is what dd wrote"
+			continue
+		fi
 		if [ "$got" != "$m" ]; then
 			bad=$((bad+1))
 			# Size as well as hash.  A file that reads back COMPLETE
@@ -78,9 +86,43 @@ verify_manifest() {
 			# truncated file and print a valid, different digest.
 			gotsz=$(stat -c %s "$f" 2>/dev/null || echo "?")
 			log "$1_BAD $f expected $m got ${got:-READFAIL} size ${gotsz} expected_size ${sz:-?}"
+			# A file that reads back COMPLETE with novel content and
+			# no error should be impossible: plain dd means the data
+			# is checksummed, and a wrong reconstruction must fail
+			# that checksum.  One of those is untrue.  Report the
+			# things that would say which, for the readable case
+			# only -- a READFAIL is the checksum doing its job.
+			if [ -n "$got" ]; then
+				log "$1_BADINFO $f attr=[$(lsattr -d "$f" 2>/dev/null | awk '{print $1}')] $(stat -c 'ino=%i size=%s blocks=%b' "$f" 2>/dev/null)"
+				if [ -x /usr/sbin/filefrag ] || command -v filefrag >/dev/null 2>&1; then
+					filefrag -v "$f" 2>/dev/null | sed -n '4,8p' |
+						while read -r l; do log "$1_BADFRAG $f $l"; done
+				fi
+				# Does the kernel object when the same bytes are
+				# re-read directly, bypassing nothing?  If the
+				# read is clean twice, no checksum is being
+				# consulted for this range at all.
+				dd if="$f" of=/dev/null bs=4096 status=none 2>/dev/null &&
+					log "$1_BADINFO $f reread=clean" ||
+					log "$1_BADINFO $f reread=EIO"
+				# A second digest.  If two reads of the same
+				# file in the same boot disagree, the value is
+				# being reconstructed differently each time,
+				# which is a different finding from a stable
+				# wrong value.
+				log "$1_BADINFO $f second_read=$(md5sum "$f" 2>/dev/null | awk '{print $1}')"
+				# The decisive one: is this range checksummed
+				# at all?
+				[ -x $T/umltest/csummap ] &&
+					$T/umltest/csummap "$f" 2>&1 |
+					while read -r l; do log "$1_BADCSUM $l"; done
+			fi
 		fi
 	done < $T/umltest/manifest.$TAG
-	log "$1_MANIFEST total=$total bad=$bad"
+	log "$1_MANIFEST total=$total bad=$bad manifest_wrong=$srcok"
+	for g in /sys/fs/btrfs/*/raid56_write_profile; do
+		[ -f $g ] && log "$1_RECOVER $(grep -E 'recover_(un)?verified' $g | tr '\n' ' ')"
+	done
 	[ "$bad" = 0 ] || kmsg "csum|error|corrupt" 5
 }
 verify_nocow() {
@@ -112,9 +154,25 @@ writers_start() {
 				head -c $((sz * 4096)) /dev/urandom > $f
 				sync -f $f
 			else
-				dd if=/dev/urandom of=$f bs=4096 count=$sz conv=fsync status=none \
-					&& echo "$f $(md5sum $f | awk '{print $1}') $((sz * 4096))" \
+				# Record BOTH the digest of the bytes handed to
+				# dd and the digest of reading the file back.
+				#
+				# They can differ, and that is the point.  The
+				# read-back happens while dm-flakey is already
+				# erroring a device, so it can be served by a
+				# reconstruction from parity -- and if that
+				# reconstruction is wrong, the manifest records
+				# an expectation that was never written.  A
+				# later mismatch against the read-back digest
+				# but a match against the source digest means
+				# the test was wrong, not the filesystem.
+				src=/tmp/src.$w.$i
+				head -c $((sz * 4096)) /dev/urandom > $src
+				srcmd=$(md5sum $src | awk '{print $1}')
+				dd if=$src of=$f bs=4096 conv=fsync status=none \
+					&& echo "$f $(md5sum $f | awk '{print $1}') $((sz * 4096)) $srcmd" \
 						>> $T/umltest/manifest.$TAG
+				rm -f $src
 			fi
 			i=$((i+1))
 		done

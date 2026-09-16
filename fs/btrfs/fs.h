@@ -566,6 +566,15 @@ struct btrfs_raid56_write_stats {
 	atomic64_t parity_mismatch;
 	/* Full stripes in which at least one such vertical stripe was found. */
 	atomic64_t parity_mismatch_stripes;
+	/*
+	 * Data sectors a degraded read rebuilt from the parity and handed back
+	 * WITHOUT anything having checked them, because no checksum covered
+	 * that sector.  Every one of these is a sector where a stale parity
+	 * would be returned to the caller as if it were the file's content.
+	 */
+	atomic64_t recover_unverified;
+	/* Data sectors a degraded read rebuilt and a checksum vouched for. */
+	atomic64_t recover_verified;
 };
 
 struct btrfs_fs_info {

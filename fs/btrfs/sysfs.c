@@ -1396,7 +1396,7 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 	const struct btrfs_raid56_write_stats *st = &fs_info->raid56_write_stats;
 
 	return sysfs_emit(buf,
-		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\nraid56_forced_cow %llu\nparity_mismatch_vertical_stripes %llu\nparity_mismatch_full_stripes %llu\n",
+		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\nraid56_forced_cow %llu\nparity_mismatch_vertical_stripes %llu\nparity_mismatch_full_stripes %llu\nrecover_verified_sectors %llu\nrecover_unverified_sectors %llu\n",
 		(unsigned long long)atomic64_read(&st->full),
 		(unsigned long long)atomic64_read(&st->inplace),
 		(unsigned long long)atomic64_read(&st->partial),
@@ -1405,7 +1405,9 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&st->partial_resident),
 		(unsigned long long)atomic64_read(&st->forced_cow),
 		(unsigned long long)atomic64_read(&st->parity_mismatch),
-		(unsigned long long)atomic64_read(&st->parity_mismatch_stripes));
+		(unsigned long long)atomic64_read(&st->parity_mismatch_stripes),
+		(unsigned long long)atomic64_read(&st->recover_verified),
+		(unsigned long long)atomic64_read(&st->recover_unverified));
 }
 BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
 

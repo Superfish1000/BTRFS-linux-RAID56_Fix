@@ -185,6 +185,7 @@ static void index_rbio_pages(struct btrfs_raid_bio *rbio);
 static int alloc_rbio_pages(struct btrfs_raid_bio *rbio);
 
 static int finish_parity_scrub(struct btrfs_raid_bio *rbio);
+static void fill_data_csums(struct btrfs_raid_bio *rbio);
 static void scrub_rbio_work_locked(struct work_struct *work);
 
 static void free_raid_bio_pointers(struct btrfs_raid_bio *rbio)
@@ -2292,6 +2293,40 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
 }
 
 /*
+ * Record whether a rebuilt DATA sector that is actually being RETURNED was
+ * vouched for by anything.
+ *
+ * @ret is verify_one_sector()'s: 1 checked and correct, 0 not checked at all.
+ * The second is the dangerous one -- the sector is handed to the caller as the
+ * file's content on the strength of a parity that may not describe it.
+ *
+ * Only sectors in the caller's bio are counted.  A recovery rebuilds every
+ * column of the vertical stripe, including sectors that hold no extent, and
+ * those have no checksum for the honest reason that there is nothing there to
+ * checksum.  Counting them would bury the sectors that matter under free
+ * space and make the number say nothing.
+ */
+static void count_recover_verification(struct btrfs_raid_bio *rbio, int stripe_nr,
+				       int sector_nr, int ret)
+{
+	struct btrfs_raid56_write_stats *st;
+
+	if (stripe_nr >= rbio->nr_data)
+		return;
+	if (!sector_paddrs_in_rbio(rbio, stripe_nr, sector_nr, true))
+		return;
+	st = &rbio->bioc->fs_info->raid56_write_stats;
+	if (ret > 0) {
+		atomic64_inc(&st->recover_verified);
+		return;
+	}
+	atomic64_inc(&st->recover_unverified);
+	btrfs_warn_rl(rbio->bioc->fs_info,
+"raid56: returning a sector of full stripe %llu rebuilt from the parity with nothing to check it against; if that parity does not describe the data, this is silently not what was written",
+		      rbio->bioc->full_stripe_logical);
+}
+
+/*
  * Cross-check a RAID6 single-erasure reconstruction against the second
  * syndrome.
  *
@@ -2503,6 +2538,7 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 		ret = verify_one_sector(rbio, faila, sector_nr);
 		if (ret < 0)
 			return ret;
+		count_recover_verification(rbio, faila, sector_nr, ret);
 
 		/*
 		 * A RAID6 stripe with a single failed data sector was rebuilt
@@ -2523,6 +2559,7 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 		ret = verify_one_sector(rbio, failb, sector_nr);
 		if (ret < 0)
 			return ret;
+		count_recover_verification(rbio, failb, sector_nr, ret);
 
 		set_bit(rbio_sector_index(rbio, failb, sector_nr),
 			rbio->stripe_uptodate_bitmap);
@@ -2596,6 +2633,29 @@ static void recover_rbio(struct btrfs_raid_bio *rbio)
 	 * caller should have set error bitmap correctly.
 	 */
 	ASSERT(bitmap_weight(rbio->error_bitmap, rbio->nr_sectors));
+
+	/*
+	 * Fill the data csums so the reconstruction can be checked against
+	 * them.  verify_one_sector() is called on every rebuilt sector by
+	 * recover_vertical(), and has a branch for BTRFS_RBIO_READ_REBUILD --
+	 * so this path was built to verify and simply was never armed: nothing
+	 * populated csum_bitmap for a read, and verify_one_sector() returns 0
+	 * immediately when it is NULL.
+	 *
+	 * Without this, a reconstruction is handed back unchecked.  That is
+	 * fine when the parity describes the data, and silent corruption when
+	 * it does not -- which is the state a lost write leaves behind.  A
+	 * degraded read then returns, with no error, bytes that were never
+	 * written: measured at 6 files per pair of runs in
+	 * tools/testing/btrfs/uml/dmfail34.sh, stable across re-reads and
+	 * varying with which device is missing, on data that
+	 * BTRFS_IOC_GET_CSUMS confirms is checksummed.
+	 *
+	 * rmw_read_wait_recover() has always done this for the read half of a
+	 * read-modify-write.  The read path is the one that hands the bytes to
+	 * a caller, so it needed it more.
+	 */
+	fill_data_csums(rbio);
 
 	/* For recovery, we need to read all sectors including P/Q. */
 	ret = alloc_rbio_pages(rbio);
