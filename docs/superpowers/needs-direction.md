@@ -989,3 +989,68 @@ whether the file's extent still covers the zeroed sector on the degraded mount.
 Reproduce: `DEGRADED_MOUNT=ro BTRFS_TEST_DIR=... tools/testing/btrfs/uml/dmfail34.sh
 <kernel> tag flakey raid5:raid1 rw 4 2`, then read `_BADZERO`, `_EXTENT`,
 `_BAD`, `_RECOVER` from `results.<tag>`.
+
+## 20. RESOLVED: the residual was a split bio's error being dropped
+
+Section 19 is right that the RAID5/6 read path delivered nothing unverified,
+and right that the residual is outside it. It is in `btrfs_bio_end_io()`, one
+level up, and the framing that kept it hidden for so long was "where do the
+zeros come from". The zeros were a subset of the damage, not the damage.
+
+**The measurement that turned it.** `csummap` was extended to print, per
+sector, the checksum the csum tree holds next to the crc32c of the bytes the
+filesystem returns. For every affected file:
+
+    CSUMSEC bg2-5 sec=0  stored=02fe82b4 actual=46127271 MISMATCH
+    ...
+    CSUMSEC bg2-5 sec=8  stored=8ab3b38a actual=98f94189 MISMATCH   (zeros)
+    CSUMSEC bg2-5 sec=9  stored=51774fce actual=98f94189 MISMATCH   (zeros)
+    CSUMSEC bg2-5 sec=10 stored=cc8721c7 actual=cc8721c7 MATCH
+    CSUMMAP ... mismatch=10 csum_holes=0 stored_is_zeros=0
+
+So the checksums are correct, the delivered bytes are wrong, most of the wrong
+bytes are not zeros at all, and nothing objected. Not "a hole read as zeros",
+not "a zero page was checksummed", not "no checksum covers this": the read path
+returned data it did not verify.
+
+**The footprint.** Every corrupted run ends exactly at a 64 KiB stripe-column
+boundary and covers precisely the columns on the missing device; sectors past
+the boundary read back correct. That held for all 19 occurrences collected
+before the cause was known, and 64 KiB is `BTRFS_STRIPE_LEN` -- the point at
+which `btrfs_submit_chunk()` splits a bio.
+
+**The cause.** A split read becomes a clone for the first half and the
+original, advanced, for the rest. `btrfs_bio_end_io()` keeps the first error in
+`bbio->status` and copied it into `bbio->bio.bi_status` only when the half
+finishing LAST had succeeded. On a degraded array the present half is read
+straight off a device while the missing half goes through
+`raid56_parity_recover()` on a workqueue, so the failing half routinely
+finishes last -- and by then `bbio->bio.bi_status` was already `BLK_STS_OK`.
+`end_bbio_data_read()` reads one status for the whole original bio and marks
+every folio uptodate on it, so the failed half's folios -- holding the
+reconstruction the checksum had already rejected -- were handed back as the
+file's content.
+
+Writes had the same hole: a write whose failing half finished last was reported
+as having succeeded.
+
+**Fixed** by loading `bbio->status` unconditionally; it is `BLK_STS_OK` until
+some half fails and holds the first error after that.
+
+**Measured**, `tools/testing/btrfs/uml/split_status.sh`, three rounds summed
+across every degraded boot, with `split_bio_status_legacy=1` as the negative
+control:
+
+    control: 29 files damaged, 8 of them returned silently
+    fixed  : 30 files damaged, 0 of them returned silently
+
+Both arms still detect the damage. Only the silent delivery changes -- which is
+the distinction `verify_manifest()` now counts separately, because summing a
+read that fails together with a read that lies had been hiding exactly this.
+
+**What this retires.** The `unrestored` guard in `struct btrfs_failed_bio`
+never fired on any reproducing run and still does not; it stays as an invariant
+with no measured cost, but it was never this bug. The open question at the end
+of section 19 -- whether the extent still covers the zeroed sector -- is moot:
+it does, and the sector was reconstructed, checked, rejected, and returned
+anyway.

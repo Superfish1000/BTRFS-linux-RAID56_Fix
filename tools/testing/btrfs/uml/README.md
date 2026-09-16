@@ -66,6 +66,9 @@ the next recorded write:
 | `staleq.sh` | leaves a sector stale behind an accepted write, then reads it back |
 | `misc3.sh` | single-boot scenarios: replace, convert, toggle, scrub, writers |
 | `selftest.sh` | boots and reports the in-kernel btrfs self-tests |
+| `split_status.sh` | two arms: does a degraded read return a reconstruction its checksum already rejected? |
+| `unprovable.sh` | two arms: does scrub write a rebuild it cannot verify over good data? |
+| `nocow_persist.sh` | three arms: does the stale record survive a mount, and is an ambiguous stripe declined? |
 | `age.sh` | ages a RAID5/6 filesystem and measures its stranded free space |
 
 `init-final3.sh` runs as init inside the guest and holds every scenario; the
