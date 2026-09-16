@@ -3117,6 +3117,17 @@ bool btrfs_raid56_allow_nodatacow(void)
 {
 	return READ_ONCE(allow_nodatacow);
 }
+
+/* See btrfs_raid56_scrub_trusts_rebuild() in volumes.h. */
+static bool scrub_trusts_rebuild;
+module_param_named(raid56_scrub_trusts_rebuild, scrub_trusts_rebuild, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_trusts_rebuild,
+		 "Let scrub write back a parity rebuild of unchecksummed data without being able to verify it, as it did before (testing only: restores a known defect)");
+
+bool btrfs_raid56_scrub_trusts_rebuild(void)
+{
+	return READ_ONCE(scrub_trusts_rebuild);
+}
 #endif
 
 static void rmw_update_stale_parity(struct btrfs_raid_bio *rbio,

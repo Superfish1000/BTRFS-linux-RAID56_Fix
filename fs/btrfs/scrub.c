@@ -1349,7 +1349,8 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 						BTRFS_STRIPE_LEN, false);
 		wait_scrub_stripe_io(stripe);
 		scrub_verify_one_stripe(stripe, old_error_bitmap);
-		if (reconstructs && mirror > 1 && !stripe->wib_rebuild)
+		if (reconstructs && mirror > 1 && !stripe->wib_rebuild &&
+		    !btrfs_raid56_scrub_trusts_rebuild())
 			scrub_note_unprovable(stripe, &unprovable,
 					      old_error_bitmap);
 		if (scrub_bitmap_empty_error(stripe))
@@ -1376,7 +1377,8 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 						fs_info->sectorsize, true);
 		wait_scrub_stripe_io(stripe);
 		scrub_verify_one_stripe(stripe, old_error_bitmap);
-		if (reconstructs && mirror > 1 && !stripe->wib_rebuild)
+		if (reconstructs && mirror > 1 && !stripe->wib_rebuild &&
+		    !btrfs_raid56_scrub_trusts_rebuild())
 			scrub_note_unprovable(stripe, &unprovable,
 					      old_error_bitmap);
 		if (scrub_bitmap_empty_error(stripe))

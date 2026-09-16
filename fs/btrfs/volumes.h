@@ -823,9 +823,17 @@ bool btrfs_logical_is_raid56(struct btrfs_fs_info *fs_info, u64 logical);
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_raid56_allow_nodatacow(void);
 bool btrfs_raid56_stale_read_legacy(void);
+/*
+ * Restore the behaviour scrub had before it learned to distrust a rebuild it
+ * cannot check: write back a parity reconstruction of an unchecksummed sector
+ * on the strength of nothing.  The negative control for that fix -- see
+ * scrub_note_unprovable().
+ */
+bool btrfs_raid56_scrub_trusts_rebuild(void);
 #else
 static inline bool btrfs_raid56_allow_nodatacow(void) { return false; }
 static inline bool btrfs_raid56_stale_read_legacy(void) { return false; }
+static inline bool btrfs_raid56_scrub_trusts_rebuild(void) { return false; }
 #endif
 
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,
