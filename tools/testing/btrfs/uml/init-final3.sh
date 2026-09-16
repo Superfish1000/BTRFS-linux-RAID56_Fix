@@ -125,6 +125,14 @@ verify_manifest() {
 					[ "$m1" = "$zmd" ] && zsec="$zsec $k"
 				done
 				log "$1_BADZERO $f sectors=$nsec all_zero_sectors=[${zsec:- none}]"
+				# Does an extent still COVER the zeroed sector?
+				# A sector that reads as zeros with no error is
+				# what a hole reads as -- legitimately, with no
+				# checksum consulted.  Dump the whole extent map
+				# rather than just the first extent, and the
+				# csum map, so the two can be lined up.
+				filefrag -v "$f" 2>/dev/null | sed -n '3,12p' |
+					while read -r l; do log "$1_BADMAP $f $l"; done
 				# The decisive one: is this range checksummed
 				# at all?
 				[ -x $T/umltest/csummap ] &&

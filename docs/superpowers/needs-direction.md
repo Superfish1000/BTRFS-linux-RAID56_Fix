@@ -817,6 +817,26 @@ with no checksum consulted. That is the thread to pull: whether the affected
 range still has an extent covering it in the degraded mount, not whether the
 RAID5/6 code reconstructed it correctly.
 
+### The two facts that bound it
+
+**It is extent-backed and checksummed, and still reads as zeros.** For
+`bg2-6`: `filefrag` shows ONE extent covering blocks 0..14 with no hole, and
+`BTRFS_IOC_GET_CSUMS` shows `off=0 len=61440 HAS_CSUMS`. Sector 5 of that file
+reads back entirely zero, with no error. So it is not a hole, and a checksum
+exists that nothing rejected it against.
+
+**It is RAID5/6-specific.** The same scenario with a RAID1 data profile
+(`dmfail34.sh <kernel> tag flakey raid1:raid1 rw 4 2`) produces 7 honest read
+failures and ZERO silent corruption across four degraded boots. RAID5/6
+produces silent corruption; RAID1 does not.
+
+Together with the clean delivery audit, that places the defect in RAID5/6 read
+handling OUTSIDE reconstruction -- the recovery delivers nothing unverified,
+yet only RAID5/6 corrupts. Worth looking at the sector/step/folio arithmetic
+that is specific to raid56 (`sector_nsteps`, `btrfs_bio_for_each_block_all`,
+the partial-folio copies), where a sector could be left zero-filled after
+verification rather than before it.
+
 ### Eliminated, each with evidence
 
 Manifest duplicates; wrong expectation (source digest recorded alongside the
