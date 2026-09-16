@@ -1255,6 +1255,48 @@ static void scrub_mark_wib_stale_sectors(struct scrub_stripe *stripe)
 			      nr_marked, stripe->logical);
 }
 
+/*
+ * Note the sectors this mirror "repaired" that nothing can vouch for.
+ *
+ * On RAID5/6 any mirror above the first is a reconstruction from the parity,
+ * not another copy.  scrub_verify_one_sector() clears the error bit of a
+ * sector with no checksum unconditionally -- "we have no other choice but to
+ * trust it" -- so a reconstruction of unchecksummed data is declared good
+ * without anything having checked it, lands in @repaired, and is written back
+ * over the sector it was meant to fix.
+ *
+ * If the parity was stale, or a sibling column of the same vertical stripe
+ * was, that reconstruction is a value nothing ever committed, and persisting
+ * it destroys the last copy of what was acknowledged.  The read path already
+ * refuses exactly this (see repair_read_is_reconstruction() and the warning
+ * beside it); scrub did the opposite.
+ *
+ * Metadata is exempt because a tree block carries its own header and
+ * generation, which is proof of the same kind as a checksum.  The caller
+ * exempts a stripe the write-intent log authorised (@wib_rebuild): there the
+ * log names the member and the budget was checked, so the rebuild is proved
+ * rather than guessed, and writing it back is the repair.
+ */
+static void scrub_note_unprovable(struct scrub_stripe *stripe,
+				  unsigned long *unprovable,
+				  const unsigned long old_error_bitmap)
+{
+	const unsigned long now_error = scrub_bitmap_read_error(stripe);
+	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+	int sector_nr;
+
+	for_each_set_bit(sector_nr, &old_error_bitmap, stripe->nr_sectors) {
+		/* Still bad, so this mirror did not claim to have fixed it. */
+		if (test_bit(sector_nr, &now_error))
+			continue;
+		if (stripe->sectors[sector_nr].csum)
+			continue;
+		if (test_bit(sector_nr, &is_metadata))
+			continue;
+		set_bit(sector_nr, unprovable);
+	}
+}
+
 static void scrub_stripe_read_repair_worker(struct work_struct *work)
 {
 	struct scrub_stripe *stripe = container_of(work, struct scrub_stripe, work);
@@ -1265,11 +1307,19 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 					  stripe->bg->length);
 	unsigned long repaired;
 	unsigned long error;
+	unsigned long unprovable;
+	/*
+	 * On RAID5/6 every mirror above the first is a reconstruction from the
+	 * parity rather than another copy of the bytes.
+	 */
+	const bool reconstructs = stripe->bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK;
+	int sector_nr;
 	int mirror;
 	int i;
 
 	ASSERT(stripe->mirror_num >= 1, "stripe->mirror_num=%d", stripe->mirror_num);
 
+	bitmap_zero(&unprovable, stripe->nr_sectors);
 	wait_scrub_stripe_io(stripe);
 	scrub_verify_one_stripe(stripe, scrub_bitmap_read_has_extent(stripe));
 	if (unlikely(stripe->wib_rebuild))
@@ -1299,6 +1349,9 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 						BTRFS_STRIPE_LEN, false);
 		wait_scrub_stripe_io(stripe);
 		scrub_verify_one_stripe(stripe, old_error_bitmap);
+		if (reconstructs && mirror > 1 && !stripe->wib_rebuild)
+			scrub_note_unprovable(stripe, &unprovable,
+					      old_error_bitmap);
 		if (scrub_bitmap_empty_error(stripe))
 			goto out;
 	}
@@ -1323,10 +1376,28 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 						fs_info->sectorsize, true);
 		wait_scrub_stripe_io(stripe);
 		scrub_verify_one_stripe(stripe, old_error_bitmap);
+		if (reconstructs && mirror > 1 && !stripe->wib_rebuild)
+			scrub_note_unprovable(stripe, &unprovable,
+					      old_error_bitmap);
 		if (scrub_bitmap_empty_error(stripe))
 			goto out;
 	}
 out:
+	/*
+	 * Put back the error bits of every sector that was only ever "repaired"
+	 * by a reconstruction nothing could check.  They are excluded from
+	 * @repaired below, so the guess is not written to the disk, and they
+	 * are reported as still in error, which is what they are: the sector on
+	 * disk is unreadable and the replacement is unproven.
+	 */
+	if (!bitmap_empty(&unprovable, stripe->nr_sectors)) {
+		for_each_set_bit(sector_nr, &unprovable, stripe->nr_sectors)
+			scrub_bitmap_set_bit_error(stripe, sector_nr);
+		btrfs_warn_rl(fs_info,
+"scrub: %d sector(s) at %llu were rebuilt from the parity but not written back: they have no checksum and the write-intent log does not name the member to blame, so nothing can tell a correct rebuild from a guess",
+			      bitmap_weight(&unprovable, stripe->nr_sectors),
+			      stripe->logical);
+	}
 	error = scrub_bitmap_read_error(stripe);
 	/*
 	 * Submit the repaired sectors.  For zoned case, we cannot do repair

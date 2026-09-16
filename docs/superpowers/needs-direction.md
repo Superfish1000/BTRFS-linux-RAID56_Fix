@@ -656,3 +656,49 @@ the allocator is incomplete whether or not this particular path is dangerous.
 Not "which design", but whether to re-run the missing adversarial passes at all.
 Three of the four angles the user's own answers pointed at were never reviewed.
 
+
+
+---
+
+## 16. The scrub write-back guard has no positive control
+
+`scrub_stripe_read_repair_worker()` now refuses to write back a RAID5/6
+reconstruction of a sector that has no checksum, is not metadata, and is not on
+a stripe the write-intent log authorised (`stripe->wib_rebuild`).
+
+Why it is needed: `scrub_verify_one_sector()` clears the error bit of an
+unchecksummed sector unconditionally -- "we have no other choice but to trust
+it" -- so a reconstruction from a stale parity is declared good, enters
+`repaired`, and is written over the sector it was meant to fix. The read path
+already refuses exactly this (`repair_read_is_reconstruction()`, bio.c:274);
+scrub did the opposite. The guard that existed, `scrub_mark_wib_stale_sectors()`,
+is gated on `wib_rebuild`, which is set only in the PROVEN branch of the parity
+pass -- so the data pass, where RAID5/6 columns are scrubbed by
+`scrub_simple_mirror()` during a different (often another device's) iteration,
+had no protection at all.
+
+**What is verified:** no regression. In-kernel self tests clean, and
+`nocow_persist.sh` PASSes all three arms -- control destroys 8 of 32, the
+persisted arm destroys 0 with every record retired, the ambiguous arm loses
+nothing and keeps its records. The PROVEN repair path still repairs, which was
+the risk.
+
+**What is NOT verified:** that the guard catches anything. Grepping every
+scenario log shows its warning never fires, so no existing test reaches the
+path. The fix is conservative -- it only ever declines a write -- so shipping it
+unproven is safe in the sense that the worst case is a repair not attempted.
+But it is the second claim in this series argued rather than measured.
+
+**The scenario that would close it** needs three things at once, and no current
+harness produces them together:
+- a data extent with no checksum (pre-existing NODATACOW, since `chattr +C` is
+  now refused on RAID5/6),
+- a genuinely divergent parity, which `nocow_persist.sh`'s prep arm already
+  builds via failed writes -- note `raid56_stale_fake_bad_parity=1` only
+  *records* the parity as bad, it does not make it arithmetically wrong,
+- a READ error on that sector during an ordinary scrub's data pass, so the
+  mirror loop reconstructs it. dm-error or dm-flakey on the right device at the
+  right offset.
+
+Then: without the guard the block must come back wrong after the scrub, and
+with it the block must be reported unrepaired and left alone.
