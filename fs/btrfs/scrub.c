@@ -2613,6 +2613,34 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	ASSERT(!btrfs_is_zoned(sctx->fs_info));
 
 	/*
+	 * Genuinely ambiguous: the log names members it cannot vouch for and
+	 * there is not enough good parity left to rebuild them.  Recomputing
+	 * the parity here would destroy the only surviving copy of what was
+	 * acknowledged, and rebuilding the data would invent a value nothing
+	 * ever committed.  Do neither.  Leave every byte as it is, keep the
+	 * record, and say so loudly enough that a recovery tool -- and a human
+	 * -- can pick it up; btrfs_wib_stripe_state() still describes exactly
+	 * which members are named and which are merely suspect.
+	 *
+	 * Ahead of the unrepaired-sector check below, because that check now
+	 * fires on the very sectors this condition explains.
+	 * scrub_note_unprovable() restores the error bit of a reconstruction
+	 * nothing could verify, and those sectors have extents, so the generic
+	 * "unrepaired sectors detected" would win the race to report and would
+	 * be true but useless: it names no member, and it increments no counter
+	 * a recovery helper can enumerate.  Both paths leave every byte of the
+	 * stripe alone and keep the record -- only the diagnosis differs, and
+	 * this one is the specific one.
+	 */
+	if (regen_parity && plan == SCRUB_WIB_AMBIGUOUS) {
+		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",
+			      full_stripe_start, (unsigned int)hweight64(wib_holes));
+		return 0;
+	}
+
+	/*
 	 * Now all data stripes are properly verified. Check if we have any
 	 * unrepaired, if so abort immediately or we could further corrupt the
 	 * P/Q stripes.
@@ -2646,24 +2674,6 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 
 	if (!regen_parity)
 		return 0;
-
-	/*
-	 * Genuinely ambiguous: the log names members it cannot vouch for and
-	 * there is not enough good parity left to rebuild them.  Recomputing
-	 * the parity here would destroy the only surviving copy of what was
-	 * acknowledged, and rebuilding the data would invent a value nothing
-	 * ever committed.  Do neither.  Leave every byte as it is, keep the
-	 * record, and say so loudly enough that a recovery tool -- and a human
-	 * -- can pick it up; btrfs_wib_stripe_state() still describes exactly
-	 * which members are named and which are merely suspect.
-	 */
-	if (plan == SCRUB_WIB_AMBIGUOUS) {
-		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
-		btrfs_warn_rl(fs_info,
-"scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",
-			      full_stripe_start, (unsigned int)hweight64(wib_holes));
-		return 0;
-	}
 
 	/* Now we can check and regenerate the P/Q stripe. */
 	ret = scrub_raid56_cached_parity(sctx, scrub_dev, map, full_stripe_start,
