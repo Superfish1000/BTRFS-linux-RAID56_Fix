@@ -683,7 +683,22 @@ persisted arm destroys 0 with every record retired, the ambiguous arm loses
 nothing and keeps its records. The PROVEN repair path still repairs, which was
 the risk.
 
-**What is NOT verified:** that the guard catches anything. Grepping every
+**RESOLVED.** tools/testing/btrfs/uml/unprovable.sh measures it, with a working
+negative control and a separately asserted precondition:
+
+    precondition (device 2 omitted, forced through the parity)  16 wrong
+    unchecksummed victim, guard in place                         0 destroyed
+    unchecksummed victim, raid56_scrub_trusts_rebuild=1         16 destroyed
+    checksummed victim, guard off                                0 destroyed
+
+The third arm also settles the disagreement recorded in item 15 about whether
+CHECKSUMMED sectors reconstructed from a divergent parity are written back.
+They are not: that arm's precondition reports UNPROV_DIAG_UNREAD=144, i.e. when
+those sectors are forced through the divergent parity the reconstruction fails
+its stored checksum and the read ERRORS rather than returning a wrong value, so
+nothing ever considers persisting it. Measured, not argued.
+
+**Superseded, kept for the record:** that the guard catches anything. Grepping every
 scenario log shows its warning never fires, so no existing test reaches the
 path. The fix is conservative -- it only ever declines a write -- so shipping it
 unproven is safe in the sense that the worst case is a repair not attempted.

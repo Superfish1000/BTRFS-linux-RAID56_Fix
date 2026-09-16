@@ -227,7 +227,12 @@ nocow_bad() {
 UNPROV_BLOCKS=256
 UNPROV_RUN=16            # 64 KiB: one column
 UNPROV_PERIOD=48         # (NDEV-1) x 16: one full stripe on a 4-device array
-unprov_overwritten() { [ $(( $1 % UNPROV_PERIOD )) -lt $UNPROV_RUN ]; }
+# In the checksummed arm the victim is a separate file that the test never
+# writes twice, so no block of it is ever "deliberately overwritten".
+unprov_overwritten() {
+	[ "${CSUMVICTIM:-0}" = 1 ] && return 1
+	[ $(( $1 % UNPROV_PERIOD )) -lt $UNPROV_RUN ]
+}
 unprov_scan() {	# echoes "<garbage> <unreadable>"
 	local garbage=0 unread=0 i n na
 	for i in $(seq 0 $((UNPROV_BLOCKS-1))); do
@@ -1142,23 +1147,58 @@ unprovable_prep)
 	# nothing.  With the log off there is no record and no recovery, which
 	# is also the configuration where this guard matters most: unchecksummed
 	# data, a parity that does not describe it, and nothing that knows.
-	touch $MNT/victim; chattr +C $MNT/victim || { log "CHATTR_FAIL"; finish; }
-	lsattr $MNT/victim 2>/dev/null | grep -q C || log "NOT_NODATACOW"
-	dd if=/dev/zero bs=4096 count=$UNPROV_BLOCKS status=none | tr '\000' 'A' > $MNT/victim
-	sync
-	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0; tried=0
-	# One column-wide run per full stripe, so every vertical of that column
-	# is overwritten while the other columns of the same rows are left as
-	# written.  Whichever of those runs lands on device $FAIL becomes a
-	# stale column, and the untouched columns beside it become the victims.
-	for i in $(seq 0 $((UNPROV_BLOCKS-1))); do
-		unprov_overwritten $i || continue
-		tried=$((tried+1))
-		dd if=/dev/urandom bs=4096 count=1 status=none |
-		dd of=$MNT/victim bs=4096 seek=$i count=1 \
-		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
-	done
+	if [ "${CSUMVICTIM:-0}" = 1 ]; then
+		# The victim is CHECKSUMMED, so it cannot be the file that gets
+		# overwritten in place -- an overwrite of it would be copy-on-
+		# write and would create no divergence at all.  Use a separate
+		# nodatacow "bait" for that, and interleave the two a column at
+		# a time so they land in DIFFERENT COLUMNS OF THE SAME full
+		# stripes.  Sync between chunks so the allocator lays them down
+		# in the order written rather than batching delalloc.
+		touch $MNT/bait; chattr +C $MNT/bait || { log "CHATTR_FAIL"; finish; }
+		lsattr $MNT/bait 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+		for c in $(seq 0 $((UNPROV_BLOCKS / UNPROV_RUN - 1))); do
+			dd if=/dev/zero bs=4096 count=$UNPROV_RUN status=none |
+			tr '\000' 'A' |
+			dd of=$MNT/victim bs=4096 seek=$((c * UNPROV_RUN)) \
+			   conv=notrunc status=none 2>/dev/null
+			sync
+			dd if=/dev/zero bs=4096 count=$UNPROV_RUN status=none |
+			tr '\000' 'C' |
+			dd of=$MNT/bait bs=4096 seek=$((c * UNPROV_RUN)) \
+			   conv=notrunc status=none 2>/dev/null
+			sync
+		done
+		lsattr $MNT/victim 2>/dev/null | grep -q C && log "VICTIM_IS_NODATACOW"
+		dm_error_writes $FAIL; log "write errors on device $FAIL"
+		acked=0; tried=0
+		for i in $(seq 0 $((UNPROV_BLOCKS-1))); do
+			tried=$((tried+1))
+			dd if=/dev/urandom bs=4096 count=1 status=none |
+			dd of=$MNT/bait bs=4096 seek=$i count=1 \
+			   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		done
+	else
+		touch $MNT/victim; chattr +C $MNT/victim || { log "CHATTR_FAIL"; finish; }
+		lsattr $MNT/victim 2>/dev/null | grep -q C || log "NOT_NODATACOW"
+		dd if=/dev/zero bs=4096 count=$UNPROV_BLOCKS status=none |
+			tr '\000' 'A' > $MNT/victim
+		sync
+		dm_error_writes $FAIL; log "write errors on device $FAIL"
+		acked=0; tried=0
+		# One column-wide run per full stripe, so every vertical of that
+		# column is overwritten while the other columns of the same rows
+		# are left as written.  Whichever run lands on device $FAIL
+		# becomes a stale column, and the untouched columns beside it
+		# become the victims.
+		for i in $(seq 0 $((UNPROV_BLOCKS-1))); do
+			unprov_overwritten $i || continue
+			tried=$((tried+1))
+			dd if=/dev/urandom bs=4096 count=1 status=none |
+			dd of=$MNT/victim bs=4096 seek=$i count=1 \
+			   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		done
+	fi
 	sync
 	log "overwrites acknowledged: $acked of $tried"
 	dm_heal $FAIL

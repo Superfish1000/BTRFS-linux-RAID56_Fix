@@ -43,8 +43,9 @@ ulimit -c 0
 
 [ "$FAIL" = "$VICTIM" ] && { echo "FAIL and VICTIM must differ"; exit 2; }
 
-arm() {	# trustrebuild -> echoes "<garbage>"
-	local tag=unprovable-$1 trust=$1 d ubds=""
+arm() {	# trustrebuild [csumvictim] -> echoes "<garbage>"
+	local trust=$1 csum=${2:-0}
+	local tag=unprovable-$1-${2:-0} d ubds=""
 	local D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D
 	rm -f $T/umltest/results.$tag $T/umltest/unprov.garbage.$tag
@@ -66,28 +67,42 @@ arm() {	# trustrebuild -> echoes "<garbage>"
 		echo "boot $mode rc=$?" >> $T/umltest/results.$tag
 	}
 
-	boot unprovable_prep
-	boot unprovable_diag "" "$VICTIM"
-	boot unprovable_scrub "TRUSTREBUILD=$trust"
-	boot unprovable_probe
+	boot unprovable_prep "CSUMVICTIM=$csum"
+	boot unprovable_diag "CSUMVICTIM=$csum" "$VICTIM"
+	boot unprovable_scrub "TRUSTREBUILD=$trust CSUMVICTIM=$csum"
+	boot unprovable_probe "CSUMVICTIM=$csum"
 	cat $T/umltest/unprov.garbage.$tag 2>/dev/null || echo "?"
 }
 
-echo "== with the guard (scrub declines a rebuild it cannot check) =="
-fixed=$(arm 0)
-grep -hE 'overwrites acknowledged|read errors|UNPROV_|not written back' \
-	$T/umltest/unprovable-0/log.* 2>/dev/null | sed 's/^/  /' | head -10
+echo "== unchecksummed victim, guard in place =="
+fixed=$(arm 0 0)
+grep -hE 'UNPROV_|not written back' \
+	$T/umltest/unprovable-0-0/log.* 2>/dev/null | sed 's/^/  /' | head -6
 
-echo "== control: raid56_scrub_trusts_rebuild=1 =="
-ctrl=$(arm 1)
-grep -hE 'overwrites acknowledged|read errors|UNPROV_' \
-	$T/umltest/unprovable-1/log.* 2>/dev/null | sed 's/^/  /' | head -8
+echo "== unchecksummed victim, control: raid56_scrub_trusts_rebuild=1 =="
+ctrl=$(arm 1 0)
+grep -hE 'UNPROV_' $T/umltest/unprovable-1-0/log.* 2>/dev/null | sed 's/^/  /' | head -4
+
+# The victim is CHECKSUMMED here, so the guard never applies to it: a
+# reconstruction that consumed a stale column does not match the stored
+# checksum.  The claim under test is that it is written back regardless.  Run
+# it with the guard OFF, so nothing but the checksum stands between the guess
+# and the platter.
+echo "== CHECKSUMMED victim, guard off (tests the claim, not the guard) =="
+csumbad=$(arm 1 1)
+grep -hE 'UNPROV_|unrepaired|csum mismatch' \
+	$T/umltest/unprovable-1-1/log.* 2>/dev/null | sed 's/^/  /' | head -6
 
 echo
 echo "4K blocks never overwritten by the test that no longer read back as 'A',"
 echo "read from healthy devices after the scrub:"
-echo "  guard in place : $fixed"
-echo "  control (off)  : $ctrl"
+echo "  unchecksummed, guard in place : $fixed"
+echo "  unchecksummed, control (off)  : $ctrl"
+echo "  checksummed,   guard off      : $csumbad"
+case "$csumbad" in
+	0) echo "     -> the checksum rejected every wrong rebuild; none reached the disk." ;;
+	*) echo "     -> WITH A CHECKSUM PRESENT, $csumbad block(s) were still destroyed." ;;
+esac
 
 for f in $T/umltest/unprovable-*/log.*; do
 	grep -q KERNEL_SPLAT "$f" 2>/dev/null && { echo "RESULT: FAIL -- kernel splat in $f"; exit 1; }
