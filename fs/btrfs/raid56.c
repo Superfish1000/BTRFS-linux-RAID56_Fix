@@ -189,6 +189,9 @@ static void fill_data_csums(struct btrfs_raid_bio *rbio);
 static phys_addr_t *sector_paddrs_in_rbio(struct btrfs_raid_bio *rbio,
 					  int stripe_nr, int sector_nr,
 					  bool bio_list_only);
+static phys_addr_t sector_paddr_in_rbio(struct btrfs_raid_bio *rbio, int stripe_nr,
+					int sector_nr, int step_nr, bool bio_list_only);
+void *kmap_local_paddr(phys_addr_t paddr);
 static void scrub_rbio_work_locked(struct work_struct *work);
 
 static void free_raid_bio_pointers(struct btrfs_raid_bio *rbio)
@@ -1006,6 +1009,7 @@ static void audit_delivered_sectors(struct btrfs_raid_bio *rbio, blk_status_t st
 {
 	unsigned int unchecked = 0;
 	unsigned int nocsum = 0;
+	unsigned int zeros = 0;
 
 	if (rbio->operation != BTRFS_RBIO_READ_REBUILD || status != BLK_STS_OK)
 		return;
@@ -1044,11 +1048,52 @@ static void audit_delivered_sectors(struct btrfs_raid_bio *rbio, blk_status_t st
 				nocsum++;
 				continue;
 			}
-			if (test_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
-				     rbio->verified_bitmap))
-				continue;
-			unchecked++;
+			if (!test_bit(rbio_sector_index(rbio, stripe_nr, sector_nr),
+				      rbio->verified_bitmap))
+				unchecked++;
 		}
+	}
+	/*
+	 * Is any sector being handed back entirely zero?
+	 *
+	 * An affected file has exactly one 4KiB sector of zeros in the middle
+	 * of otherwise correct content, on a range that filefrag says is
+	 * covered by a single extent with no hole and that GET_CSUMS says is
+	 * checksummed.  So this is not a hole being read.  If the zeros are
+	 * already here, they came out of the rbio -- a rebuild whose inputs
+	 * were all zero, or a sector nothing ever populated.  If they are NOT
+	 * here, the rbio handed back good bytes and something above zeroed
+	 * them, which is a different search.
+	 *
+	 * Observation, not a guess: it says which half of the read path to
+	 * look in, and costs one scan of the sectors already being audited.
+	 */
+	for (int stripe_nr = 0; stripe_nr < rbio->nr_data; stripe_nr++) {
+		for (int sector_nr = 0; sector_nr < rbio->stripe_nsectors; sector_nr++) {
+			const u32 step = min(rbio->bioc->fs_info->sectorsize, PAGE_SIZE);
+			bool all_zero = true;
+
+			if (!sector_paddrs_in_rbio(rbio, stripe_nr, sector_nr, true))
+				continue;
+			for (int i = 0; i < rbio->sector_nsteps && all_zero; i++) {
+				phys_addr_t paddr =
+					sector_paddr_in_rbio(rbio, stripe_nr, sector_nr, i, 0);
+				void *p = kmap_local_paddr(paddr);
+
+				if (memchr_inv(p, 0, step))
+					all_zero = false;
+				kunmap_local(p);
+			}
+			if (all_zero)
+				zeros++;
+		}
+	}
+	if (unlikely(zeros)) {
+		atomic64_add(zeros,
+			     &rbio->bioc->fs_info->raid56_write_stats.delivered_zero);
+		btrfs_warn_rl(rbio->bioc->fs_info,
+"raid56: DELIVERED_ZERO %u sector(s) of full stripe %llu handed back entirely zero",
+			      zeros, rbio->bioc->full_stripe_logical);
 	}
 	if (unlikely(nocsum))
 		atomic64_add(nocsum,
@@ -1541,7 +1586,7 @@ static void assert_rbio(struct btrfs_raid_bio *rbio)
 	ASSERT_RBIO(rbio->nr_data < rbio->real_stripes, rbio);
 }
 
-static inline void *kmap_local_paddr(phys_addr_t paddr)
+void *kmap_local_paddr(phys_addr_t paddr)
 {
 	/* The sector pointer must have a page mapped to it. */
 	ASSERT(paddr != INVALID_PADDR);

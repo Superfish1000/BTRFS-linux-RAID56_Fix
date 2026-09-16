@@ -607,6 +607,8 @@ struct btrfs_raid56_write_stats {
 	 * no csum bit, and so did the audit.
 	 */
 	atomic64_t delivered_nocsum;
+	/* Data sectors handed back by a degraded read that are entirely zero. */
+	atomic64_t delivered_zero;
 };
 
 struct btrfs_fs_info {

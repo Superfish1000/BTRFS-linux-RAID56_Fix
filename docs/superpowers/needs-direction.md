@@ -817,6 +817,43 @@ with no checksum consulted. That is the thread to pull: whether the affected
 range still has an extent covering it in the degraded mount, not whether the
 RAID5/6 code reconstructed it correctly.
 
+### The zeros do not come from raid56
+
+`delivered_zero` counts data sectors a degraded read hands back that are
+entirely zero, measured in the rbio at delivery. It is **0** on runs that
+produce files with contiguous runs of zero sectors:
+
+    dz1  delivered_zero 0    bg1-6 all_zero_sectors=[1 2 3 4]
+                             bg3-7 all_zero_sectors=[3 4 5]
+    dz2  delivered_zero 0    bg2-5 all_zero_sectors=[7 8 9]
+
+So raid56 delivers correct bytes and something ABOVE it replaces them with
+zeros. The runs are 3-4 sectors, i.e. 12-16 KiB, not single sectors and not
+whole files.
+
+That, plus the RAID1 control below, is the whole shape of the remaining defect:
+a btrfs read path above raid56 zero-fills a 12-16 KiB run of an extent-backed,
+checksummed file on a degraded RAID5/6 mount, without an error and without the
+checksum being consulted.
+
+btrfs zero-fills a data range when the extent map says hole
+(`btrfs_do_readpage()`), and a hole is not checksum-verified because there is
+nothing there to verify. A range that is BOTH covered by an extent with a
+checksum item AND served as a hole is a contradiction, and that is the
+invariant worth enforcing: if a checksum item exists for a range, that range
+must never be served as zeros. That check is cheap to state and expensive to
+place -- it belongs in the generic read path, not in raid56, and it must not
+break genuinely sparse files.
+
+**Why this was not patched here.** The remaining fix is in the generic btrfs
+read path, which every profile and every workload uses. This series has been
+wrong by reasoning eleven times on this one bug; shipping a speculative change
+to that path on the strength of a twelfth hypothesis would risk a worse defect
+than the one being fixed, in code far outside the RAID5/6 subsystem this work
+was scoped to. The scoping above is the deliverable: a reproducer, a control
+that excludes every other profile, a counter that excludes raid56 as the
+source, and a named invariant to enforce.
+
 ### The two facts that bound it
 
 **It is extent-backed and checksummed, and still reads as zeros.** For
