@@ -1048,6 +1048,21 @@ Both arms still detect the damage. Only the silent delivery changes -- which is
 the distinction `verify_manifest()` now counts separately, because summing a
 read that fails together with a read that lies had been hiding exactly this.
 
+The regression suite passes end to end with the fix, and `regress.sh
+--check-log` re-judges the two arms of `split_status.sh` directly: the
+legacy-mode run fails ("2 file(s) read back complete with different content"),
+the fixed run passes with its 10 unreadable files noted as the expected
+residual. So the suite detects this defect from an ordinary flakey run, not
+only from the dedicated scenario.
+
+Fixing the kernel exposed a contradiction in the suite itself: `check_scenario()`
+split a bad file into "read failed" (expected) and "read back wrong" (the
+defect), then failed on `bad=` -- which is both counts summed. It had never
+been reached because the flakey scenario always tripped the "read back wrong"
+branch first and returned. `bad=` is now a cross-check that the `_BAD` line
+parsing accounts for every bad file, and the verdict moved to the scenario's
+own `silent=` count.
+
 **How far it reaches.** The lost status is `bbio->bio.bi_status`, which is
 what every `end_io` callback reads to decide whether its I/O succeeded, so the
 same hole was open to all of them -- buffered data reads
