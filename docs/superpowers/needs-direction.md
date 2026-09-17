@@ -1091,3 +1091,53 @@ with no measured cost, but it was never this bug. The open question at the end
 of section 19 -- whether the extent still covers the zeroed sector -- is moot:
 it does, and the sector was reconstructed, checked, rejected, and returned
 anyway.
+
+---
+
+## 21. A device that comes back restores nothing until a mount or a scrub
+
+**What.** `btrfs_wib_recover()` is called from `disk-io.c` at mount and nowhere
+else. Three things retire a record and restore a stripe's redundancy: the next
+mount, a device replace (which drives `btrfs_scrub_dev()` over the source
+device's stripes, so the record's plan applies there), and any `btrfs scrub`.
+
+A device that was missing and then reappears is not one of them. On a
+long-lived mount the exposure window is unbounded: the data still reads
+correctly -- the record is what makes a degraded read rebuild those sectors
+rather than believe them -- but the redundancy of every stripe recorded against
+that device stays gone until somebody mounts or scrubs.
+
+This is the same window item 1 is about, reached from the other direction.
+
+**Preliminary, needs confirming.** There may be nothing to hook. The two places
+that clear `BTRFS_DEV_STATE_MISSING` are `device_list_add()` (the scan path,
+which operates on the *unmounted* device list) and `btrfs_close_one_device()`
+(teardown). Neither is "this disk is back and usable while the filesystem is
+mounted", and a missing device's `btrfs_device` has `bdev == NULL` with nothing
+re-opening it. If that survives an exhaustive check, then "hook the reconnect"
+is not implementable as stated and the question becomes what to do instead.
+
+**Options, none chosen.**
+
+(a) *A background retire pass* -- scrub recorded stripes on a timer or at idle,
+    without waiting for a mount or a device event. **Proposed and declined**
+    pending research: it spends IO nobody asked for, its interaction with a
+    still-degraded array is unexamined, and it answers a question adjacent to
+    the one actually asked rather than the one asked. Recorded here so it is
+    not re-proposed as obvious.
+(b) *Make a reconnect path exist*, then hook it: allow a missing device to be
+    re-opened on a mounted filesystem and trigger recovery for the stripes
+    recorded against it. Much larger: touches device lifetime, the device list
+    mutex, and every assumption that `bdev == NULL` means gone for this mount.
+(c) *Surface and require an explicit scrub.* The exposure is already
+    enumerable through `BTRFS_IOC_RAID56_STALE_STRIPES` and the sysfs counters.
+    Document that a returning device needs `btrfs scrub` and make the state
+    visible enough that a monitoring system can see it.
+(d) *Rely on the paths that exist.* A replace already covers it. Argue that a
+    device which genuinely left should be replaced, not re-admitted.
+
+**What research would settle it.** Whether a missing device can rejoin a
+mounted btrfs at all, exhaustively rather than by reading two call sites; what
+MD does when a member rejoins an array and whether that maps; and how long the
+window actually is in practice, which needs the exposure measured on a mount
+that survives a device going and coming back rather than modelled.
