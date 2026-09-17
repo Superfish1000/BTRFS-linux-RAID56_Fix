@@ -233,13 +233,31 @@ widetot=$(sed -n '/### wider arrays/,/### de-rate/p' $LOG/sweep | grep -cE "^--d
 # The de-rate proposals are the measurement item 5 rests on: the flat variant
 # must close the wider-array loss, and must still cost availability.  If either
 # stops being true the entry needs rewriting.
-derate=$(sed -n '/### de-rate/,/### each accounting/p' $LOG/sweep)
+derate=$(sed -n '/### de-rate/,/### flat de-rate limits/p' $LOG/sweep)
 [ "$(echo "$derate" | grep -cE '^--data.*OK:')" = "$(echo "$derate" | grep -cE '^--data')" ] \
-	&& pass "both de-rate proposals still close the wider-array loss" \
+	&& pass "the de-rate proposals still close the wider-array loss where they claim to" \
 	|| fail "a de-rate proposal no longer closes the wider-array loss -- update needs-direction.md"
-echo "$derate" | grep -q -- "--availability.*VIOLATION (spurious" \
+# The flat variant's limits are a claim in their own right: it does NOT close
+# the RAID6 loss, because that counterexample starts with a device loss and the
+# flat de-rate suppresses itself while a device is missing.  If these rows stop
+# violating, the suppression or the model has changed and item 5 is wrong again.
+flatlim=$(sed -n '/### flat de-rate limits/,/### recorded de-rate/p' $LOG/sweep)
+[ "$(echo "$flatlim" | grep -cE '^--data.*VIOLATION')" = "$(echo "$flatlim" | grep -cE '^--data')" ] \
+	&& note "the flat de-rate still fails to close the RAID6 wider-array loss" \
+	|| fail "the flat de-rate now closes RAID6 -- needs-direction item 5 needs rewriting"
+echo "$flatlim" | grep -q -- "--parity 1 --depth 3 --availability --flat-sticky-derate.*VIOLATION (spurious" \
 	&& note "the flat de-rate still costs availability (why it is not applied)" \
 	|| fail "the flat de-rate no longer costs availability -- reconsider needs-direction item 5"
+echo "$flatlim" | grep -q -- "--flat-sticky-derate-degraded.*VIOLATION" \
+	&& note "the flat de-rate without its suppression still refuses writes a degraded array could serve" \
+	|| fail "the unsuppressed flat de-rate no longer costs a degraded array writes -- item 5 needs rewriting"
+# The recorded variant is the third formulation.  It must stay spurious-free at
+# the default width, which is where the flat variant is not: that difference is
+# the whole reason to prefer it.
+recav=$(sed -n '/### recorded de-rate/,/### each accounting/p' $LOG/sweep)
+echo "$recav" | grep -qE '^--parity . --depth 3 --availability --recorded-derate +OK:' \
+	&& pass "the recorded de-rate costs no availability at the default width" \
+	|| fail "the recorded de-rate now refuses writes the array could serve at the default width"
 # The residual exposures are compared against a recorded baseline rather than
 # asserted to all violate.  Requiring every row to violate is not a check: a
 # row that cannot violate in the configuration the sweep runs it in satisfies

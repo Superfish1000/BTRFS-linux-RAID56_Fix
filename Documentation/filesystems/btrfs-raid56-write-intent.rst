@@ -370,11 +370,15 @@ What retires a record
 =====================
 
 Nothing retires a record on its own, and a device reappearing does not trigger
-anything: ``btrfs_wib_recover()`` runs at mount and nowhere else.  A stripe
+anything.  Recovery itself runs from three places -- ``btrfs_wib_rw_mount()``
+at mount and again on a remount from read-only to read-write, and
+``btrfs_wib_recover_after_replay()`` after a tree log replay -- and a device
+coming back is none of them.  A stripe
 that stayed recorded is scrubbed again by one of three things, and until one of
 them happens its redundancy is not restored:
 
-* the next mount, which runs the recovery over every recorded stripe;
+* the next mount, or a ``mount -o remount,rw`` from read-only, either of which
+  runs the recovery over every recorded stripe;
 * a device replace, which drives the ordinary scrub machinery
   (``btrfs_scrub_dev()``) over the source device's stripes, so the plan the
   record implies applies there too;

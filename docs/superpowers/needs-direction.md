@@ -242,9 +242,11 @@ saying which side of the stripe is wrong. Until it is persisted, the scrub
 protection is per-mount only: the first `btrfs scrub` after a reboot can still
 destroy the parity copy.
 
-**The change.** `struct btrfs_wib_disk_entry` grows from 24 to 32 bytes: one
-more `__le64` carrying `stale`, with parity staleness packed into the same
-bitmap (the block at the full stripe's start encodes parity 0, the next block
+**The change.** `struct btrfs_wib_disk_entry` grows from 24 bytes. It was 32
+when this entry was written and is **48** now
+(`static_assert(sizeof(struct btrfs_wib_disk_entry) == 48)`,
+`raid56-wib.c:141`): `stale`, `stale_par` and `gen`, with parity staleness
+packed into the same bitmap (the block at the full stripe's start encodes parity 0, the next block
 parity 1 -- `nr_data` is at least 2, so those bits always belong to the stripe
 they describe).
 
@@ -269,7 +271,15 @@ on the write path:
 |---|---|---|---|
 | 24B, today (no stale) | 165 | 660 MiB | 1.00x |
 | 32B (+stale) | 124 | 496 MiB | 1.33x |
-| 40B (+stale, +stale_par) -- **what is implemented** | 99 | 396 MiB | 1.67x |
+| 40B (+stale, +stale_par) | 99 | 396 MiB | 1.67x |
+| 48B (+stale, +stale_par, +gen) -- **what is implemented** | 82 | 328 MiB | 2.01x |
+
+The last row is computed, not estimated: the header is 128 bytes, so a 4KiB
+slot holds `(4096 - 128) / 48 = 82` wide entries against `/ 24 = 165` narrow
+ones, and the flush rate is that ratio. The row above it was the state of the
+tree when this entry was written and is kept to show the direction of travel --
+every field added to the record costs log reach, and the cost is now 2x rather
+than the 1.67x this entry was decided on.
 
 The in-memory table is a fixed array sized by the same constant
 (`entries[BTRFS_WIB_MAX_ENTRIES]`), so it cannot be tuned independently. More
@@ -414,8 +424,12 @@ in the code, not inferred:
   `if (ret == 0) btrfs_wib_clear_sticky()` is dead code for any stripe whose
   chunk still exists. The only reachable clears there are "the chunk is gone"
   and one corner case.
-- `scrub_raid56_parity_stripe()` reads the record and returns without touching
-  the log, so a user scrub does not retire it either.
+- ~~`scrub_raid56_parity_stripe()` reads the record and returns without touching
+  the log, so a user scrub does not retire it either.~~ **No longer true.** It
+  now ends in `btrfs_wib_clear_sticky()` (`scrub.c:2811`), correctly gated on
+  the repair write-back having landed -- a stripe repaired in memory whose
+  write-back failed keeps its record. So a user scrub *is* a live clearer, and
+  the item's "never retires" headline holds only for recovery, not for scrub.
 
 The only live clearer is `rmw_update_stale_data()`, and it is triple-gated: the
 RMW must be *logged* (sub-stripe, or in-place -- and in-place on RAID5/6 is now
@@ -1096,10 +1110,18 @@ anyway.
 
 ## 21. A device that comes back restores nothing until a mount or a scrub
 
-**What.** `btrfs_wib_recover()` is called from `disk-io.c` at mount and nowhere
-else. Three things retire a record and restore a stripe's redundancy: the next
-mount, a device replace (which drives `btrfs_scrub_dev()` over the source
-device's stripes, so the record's plan applies there), and any `btrfs scrub`.
+**What.** Recovery runs from **three** places, not one -- this entry said "at
+mount and nowhere else" when it was written and that was wrong:
+`btrfs_wib_rw_mount()` at mount (`disk-io.c:3740`), the same function on a
+**remount ro->rw** (`super.c:1334`), and `btrfs_wib_recover_after_replay()`
+after a tree log replay (`disk-io.c:3788`). So a `mount -o remount,rw` closes
+the window too, which is a materially cheaper answer than a full mount cycle
+and should be said in any advice given to an operator.
+
+Three things retire a record and restore a stripe's redundancy: recovery at
+any of those three entry points, a device replace (which drives
+`btrfs_scrub_dev()` over the source device's stripes, so the record's plan
+applies there), and any `btrfs scrub` (`scrub.c:2811`).
 
 A device that was missing and then reappears is not one of them. On a
 long-lived mount the exposure window is unbounded: the data still reads

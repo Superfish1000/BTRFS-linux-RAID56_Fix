@@ -426,7 +426,33 @@ class Stripe:
                 faults.add(st.nr_data + p)
 
         budget = st.tolerated()
-        if policy["sticky_derate"] == "count":
+        if policy["sticky_derate"] == "recorded":
+            # The margin the LOG ALREADY RECORDS, which is neither the sticky
+            # bit nor a comparison of parity against disk.  Everything used
+            # here is what btrfs_wib_stripe_state() hands back from memory:
+            #   st.stale_cols  <->  struct btrfs_wib_stripe_state.stale_cols
+            #   st.stale_par   <->  struct btrfs_wib_stripe_state.bad_parity
+            # both as rmw_update_stale_data() and rmw_update_stale_parity()
+            # will have left them after THIS write.  No device is read.
+            #
+            # One count, not "profile tolerance minus prior damage" weighed
+            # against "this write's faults".  That split is what charged a
+            # missing device twice in the flat variant and took a degraded
+            # array read-only; here a missing parity simply is not a usable
+            # parity, and is not also a fault subtracted from a budget.
+            #
+            # Accept iff the data columns that cannot be believed afterwards
+            # are no more numerous than the parities that can still replace
+            # them -- the same test mark_stale_sectors() and
+            # scrub_raid56_plan_wib() already apply on the way out.
+            bad_data = set(st.stale_cols)
+            for d in range(st.nr_data):
+                if st.missing[d]:
+                    bad_data.add(d)
+            good_par = sum(1 for p in range(st.nr_parity)
+                           if p not in st.stale_par)
+            acked_override = len(bad_data) <= good_par
+        elif policy["sticky_derate"] == "count":
             # NOT what rmw_rbio() does; see --counted-sticky-derate.
             # How much redundancy this stripe has already spent: every
             # committed data sector whose on-disk content is stale (its value
@@ -453,7 +479,8 @@ class Stripe:
                                 for d in range(st.nr_data) if d not in stale))
             budget = min(budget, usable - len(stale))
         elif (policy["sticky_derate"] and st.recorded and
-              not any(st.missing)):
+              (policy["sticky_derate"] == "flat-nosuppress"
+               or not any(st.missing))):
             # What rmw_rbio() does: btrfs_wib_has_sticky() before the writes,
             # then rbio_max_errors(rbio) - degraded after them.
             #
@@ -499,6 +526,8 @@ class Stripe:
                     faults.add(d)
 
         acked = len(faults) <= budget
+        if policy["sticky_derate"] == "recorded":
+            acked = acked_override
 
         # Real faults, as opposed to what the accounting believes: the replace
         # target is not part of the redundancy, so its failure is not one.
@@ -683,6 +712,19 @@ def main():
                          "write.  It is the variant the kernel could "
                          "implement, needing only the sticky bit.  See "
                          "docs/superpowers/needs-direction.md.")
+    ap.add_argument("--flat-sticky-derate-degraded", action="store_true",
+                    help="the flat de-rate WITHOUT the suppression that keeps "
+                         "it off while a device is missing, which is the "
+                         "variant that takes a degraded array read-only one "
+                         "stripe at a time.  Here so that claim rests on a "
+                         "run; see docs/superpowers/needs-direction.md item 5.")
+    ap.add_argument("--recorded-derate", action="store_true",
+                    help="accept a write iff the data columns the LOG cannot "
+                         "believe after it are no more numerous than the "
+                         "parities it can still use.  Needs only "
+                         "btrfs_wib_stripe_state(), which answers from "
+                         "memory, so unlike --counted-sticky-derate it is "
+                         "implementable on the write path.")
     ap.add_argument("--counted-sticky-derate", action="store_true",
                     help="de-rate a stripe that already carries an error "
                          "record by its computed remaining margin rather than "
@@ -736,6 +778,10 @@ def main():
         policy["sticky_derate"] = True
     if args.counted_sticky_derate:
         policy["sticky_derate"] = "count"
+    if args.flat_sticky_derate_degraded:
+        policy["sticky_derate"] = "flat-nosuppress"
+    if args.recorded_derate:
+        policy["sticky_derate"] = "recorded"
     if args.no_drop_cache_on_fault:
         policy["drop_cache_on_fault"] = False
 
