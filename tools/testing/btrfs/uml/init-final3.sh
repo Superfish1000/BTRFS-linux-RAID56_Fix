@@ -1775,10 +1775,13 @@ repair_pin)
 	rm -f $MNT/nocow; sync
 	btrfs balance start --full-balance -d $MNT > /tmp/bal.out 2>&1
 	log "balance rc=$? after $(( $(date +%s) - t0 ))s: $(tail -1 /tmp/bal.out)"
-	# Enough to spill past the chunk the balance just made and into new
-	# chunks, which take the lowest free device space: the space the
-	# relocated chunk just gave up.
-	dd if=/dev/urandom of=$MNT/new bs=1M count=${REFILL_MB:-1500} conv=fsync status=none
+	# Fill the filesystem.  The device space the relocated chunk gave up is
+	# reused by whichever new chunk the allocator happens to place there --
+	# measured, only the last one, on one device -- so partial refills miss
+	# it.  Full, every freed byte holds new, checksummed data.
+	dd if=/dev/urandom of=$MNT/new bs=1M ${REFILL_MB:+count=$REFILL_MB} conv=fsync \
+		status=none 2>/dev/null
+	log "refill size $(du -m $MNT/new | cut -f1) MiB"
 	sync
 	want=$(md5sum $MNT/new | awk '{print $1}')
 	log "refilled after $(( $(date +%s) - t0 ))s"
