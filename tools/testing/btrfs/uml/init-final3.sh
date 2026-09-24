@@ -33,11 +33,15 @@ watchdog() {
 	  echo w > /proc/sysrq-trigger; sleep 2
 	  # UML's sysrq-w often prints an empty call trace; say where each
 	  # blocked task is waiting from /proc as well.
+	  # Every task that is not simply sleeping, not only D: a hang with
+	  # nothing blocked is something spinning.
 	  for d in /proc/[0-9]*; do
-		grep -q '^State:.*D' $d/status 2>/dev/null || continue
-		echo "WATCHDOG: D $(cat $d/comm 2>/dev/null) pid ${d#/proc/} wchan $(cat $d/wchan 2>/dev/null)"
+		st=$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' $d/status 2>/dev/null)
+		case "$st" in S|I|"") continue;; esac
+		echo "WATCHDOG: $st $(cat $d/comm 2>/dev/null) pid ${d#/proc/} wchan $(cat $d/wchan 2>/dev/null) cmd $(tr '\0' ' ' < $d/cmdline 2>/dev/null | cut -c1-80)"
 		sed 's/^/WATCHDOG:   /' $d/stack 2>/dev/null | head -20
 	  done
+	  echo l > /proc/sysrq-trigger; sleep 1
 	  echo "WATCHDOG: done" ) &
 }
 OPTS=${OPTS:-rw}
