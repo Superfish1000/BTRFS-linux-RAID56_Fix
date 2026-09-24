@@ -19,10 +19,10 @@ arm() {	# name control
 	local D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D; rm -f $T/umltest/repair.pin.$tag
 	for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; ubds="$ubds ubd$i=$D/disk$i.img"; done
-	timeout 1200 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+	timeout 2400 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 		init=$T/umltest/init-pin.sh $ubds quiet con=null con0=fd:0,fd:1 \
 		BTRFS_TEST_DIR=$T MODE=repair_pin OPTS=rw PROFILE=raid5:raid1 TAG=$tag \
-		NDEV=$NDEV FAIL=1 CONTROL=$2 > $D/log 2>&1
+		NDEV=$NDEV FAIL=1 CONTROL=$2 HOLD=${HOLD:-150000} > $D/log 2>&1
 	cat $T/umltest/repair.pin.$tag 2>/dev/null || echo "? ? ?"
 }
 read -r fh fok fe <<<"$(arm fixed 0)"

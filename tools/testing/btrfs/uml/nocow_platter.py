@@ -19,6 +19,14 @@ import sys
 
 path, blocks, stride, dev = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 BS = 4096
+# Optional: the overwrites that were acknowledged.  Only those have to be 'B';
+# a refused one may be the old 'A' or the new 'B', nothing else.
+acked = None
+if len(sys.argv) > 5:
+    try:
+        acked = {int(x) for x in open(sys.argv[5]).read().split()}
+    except OSError:
+        acked = None
 
 ext = []
 for line in subprocess.run(['filefrag', '-v', '-b%d' % BS, path],
@@ -67,7 +75,8 @@ for i in range(blocks):
     with open(pdev, 'rb') as f:
         f.seek(phys)
         data = f.read(BS)
-    if data != b'B' * BS:
+    if data != b'B' * BS and not (acked is not None and i not in acked and
+                                  data == b'A' * BS):
         print('STALE block %d logical %d on %s at %d (%d of %d bytes are B)'
               % (i, loc, pdev, phys, data.count(b'B'), BS))
         missing += 1

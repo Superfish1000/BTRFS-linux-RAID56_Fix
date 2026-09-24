@@ -345,12 +345,28 @@ nocow_bad() {
 	#
 	# Count what IS 'B', not what is not: a read that fails returns no bytes
 	# at all, and "nothing that isn't B" used to score that as intact.
-	local bad=0 i off got
+	#
+	# Only an ACKNOWLEDGED overwrite has to read back as 'B'.  A refused one
+	# (the kernel refuses a write it cannot make safe, see rmw_repair_first())
+	# promised nothing, so either the old 'A' or the new 'B' is right -- but
+	# not anything else.  nocow.acked.$TAG lists the acknowledged ones; with
+	# no list every overwrite counts as acknowledged, as before.
+	local bad=0 i off got list=""
+	[ -f $T/umltest/nocow.acked.$TAG ] &&
+		list=" $(tr '\n' ' ' < $T/umltest/nocow.acked.$TAG) "
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		off=$((i * NOCOW_STRIDE))
 		got=$(dd if=$MNT/nocow bs=4096 skip=$off count=1 status=none 2>/dev/null |
 		      tr -cd 'B' | wc -c)
-		[ "$got" = 4096 ] || bad=$((bad+1))
+		[ "$got" = 4096 ] && continue
+		if [ -n "$list" ]; then
+			case "$list" in *" $i "*) ;; *)
+				got=$(dd if=$MNT/nocow bs=4096 skip=$off count=1 status=none 2>/dev/null |
+				      tr -cd 'A' | wc -c)
+				[ "$got" = 4096 ] && continue;;
+			esac
+		fi
+		bad=$((bad+1))
 	done
 	echo $bad
 }
@@ -931,11 +947,12 @@ nocow_cow)
 	log "first extent: $(filefrag -v $MNT/nocow 2>/dev/null | sed -n 4p | tr -s ' ')"
 	stats "after create"
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0
+	acked=0; rm -f $T/umltest/nocow.acked.$TAG
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
 		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
-		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		   conv=notrunc,fsync status=none 2>/dev/null &&
+			{ acked=$((acked+1)); echo $i >> $T/umltest/nocow.acked.$TAG; }
 	done
 	sync
 	log "overwrites: $acked of $NOCOW_BLOCKS acknowledged"
@@ -1057,11 +1074,12 @@ nocow_replay_prep)
 	dd if=/dev/zero bs=1M count=$NOCOW_SIZE_MB status=none | tr '\000' 'A' > $MNT/nocow
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0
+	acked=0; rm -f $T/umltest/nocow.acked.$TAG
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
 		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
-		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		   conv=notrunc,fsync status=none 2>/dev/null &&
+			{ acked=$((acked+1)); echo $i >> $T/umltest/nocow.acked.$TAG; }
 	done
 	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
 	dm_heal $FAIL; log "healed device $FAIL"
@@ -1238,11 +1256,12 @@ nocow_persist_prep)
 	dd if=/dev/zero bs=1M count=${PREP_SIZE_MB:-2} status=none | tr '\000' 'A' > $MNT/nocow
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0
+	acked=0; rm -f $T/umltest/nocow.acked.$TAG
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
 		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
-		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		   conv=notrunc,fsync status=none 2>/dev/null &&
+			{ acked=$((acked+1)); echo $i >> $T/umltest/nocow.acked.$TAG; }
 	done
 	sync
 	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
@@ -1845,7 +1864,7 @@ nocow_platter)
 	# through a filesystem that reconstructs whatever the record names?
 	do_mount ro $MNTDEV
 	python3 $T/umltest/nocow_platter.py $MNT/nocow $NOCOW_BLOCKS $NOCOW_STRIDE \
-		$MNTDEV > /tmp/platter.out 2>&1
+		$MNTDEV $T/umltest/nocow.acked.$TAG > /tmp/platter.out 2>&1
 	umount $MNT || log "UMOUNT_FAIL"
 	head -8 /tmp/platter.out | while read -r l; do log "platter: $l"; done
 	n=$(sed -n 's/^PLATTER_MISSING \([0-9]*\) .*/\1/p' /tmp/platter.out)
@@ -2004,13 +2023,22 @@ stale_parity)
 	sync
 	md5sum $MNT/nc/f | awk '{print $1}' > $T/umltest/old.md5.$TAG
 	log "nocow file md5 $(cat $T/umltest/old.md5.$TAG)"
+	# What each 4K block may read back as afterwards: the original, and for
+	# a rewritten block the rewrite -- required if it was acknowledged,
+	# allowed if it was refused (the kernel refuses a write it cannot make
+	# safe, and a refused write promised nothing).
+	cp $MNT/nc/f $T/umltest/sp.orig.$TAG
+	rm -f $T/umltest/sp.new.*.$TAG $T/umltest/sp.acked.$TAG
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
 	# Sub-stripe rewrites: data and Q land, P on the bad device does not.
 	for off in 0 2 4 6 8 10 12 14 16 18 20 22; do
-		dd if=/dev/urandom of=$MNT/nc/f bs=4K count=1 seek=$((off * 16)) \
-			conv=notrunc,fsync status=none 2>/dev/null
+		dd if=/dev/urandom of=$T/umltest/sp.new.$((off * 16)).$TAG bs=4K count=1 status=none
+		dd if=$T/umltest/sp.new.$((off * 16)).$TAG of=$MNT/nc/f bs=4K count=1 seek=$((off * 16)) \
+			conv=notrunc,fsync status=none 2>/dev/null &&
+			echo $((off * 16)) >> $T/umltest/sp.acked.$TAG
 	done
 	sync
+	log "rewrites acknowledged: $(wc -l < $T/umltest/sp.acked.$TAG 2>/dev/null) of 12"
 	md5sum $MNT/nc/f | awk '{print $1}' > $T/umltest/new.md5.$TAG
 	log "after rewrites md5 $(cat $T/umltest/new.md5.$TAG)"
 	dm_heal $FAIL; log "healed device $FAIL"
@@ -2026,16 +2054,42 @@ stale_parity_verify)
 	dm_scan
 	do_mount "$OPTS${OMITTED:+,degraded}" /dev/mapper/d0
 	echo 3 > /proc/sys/vm/drop_caches
-	M=$(md5sum $MNT/nc/f 2>/dev/null | awk '{print $1}')
-	RC=$?
-	WANT=$(cat $T/umltest/new.md5.$TAG)
-	if [ -z "$M" ]; then
-		log "STALE_SECTOR_READ_REFUSED (detected)"
-	elif [ "$M" = "$WANT" ]; then
-		log "STALE_SECTOR_READ_CORRECT"
-	else
-		log "STALE_SECTOR_SILENT_CORRUPTION md5=$M want=$WANT (known exposure)"
-	fi
+	V=$(python3 - "$MNT/nc/f" "$T/umltest" "$TAG" <<'PY'
+import os, sys
+path, d, tag = sys.argv[1:4]
+BS = 4096
+orig = open(f'{d}/sp.orig.{tag}', 'rb').read()
+try:
+    acked = {int(x) for x in open(f'{d}/sp.acked.{tag}').read().split()}
+except OSError:
+    acked = set()
+try:
+    got = open(path, 'rb').read()
+except OSError:
+    print('REFUSED'); sys.exit()
+if len(got) != len(orig):
+    print('SILENT short'); sys.exit()
+bad = []
+for b in range(len(orig) // BS):
+    blk, old = got[b*BS:(b+1)*BS], orig[b*BS:(b+1)*BS]
+    f = f'{d}/sp.new.{b}.{tag}'
+    new = open(f, 'rb').read() if os.path.exists(f) else None
+    if new is None:
+        ok = blk == old
+    elif b in acked:
+        ok = blk == new
+    else:
+        ok = blk in (old, new)
+    if not ok:
+        bad.append(b)
+print('CORRECT' if not bad else 'SILENT blocks ' + ' '.join(map(str, bad[:8])))
+PY
+)
+	case "$V" in
+	REFUSED*) log "STALE_SECTOR_READ_REFUSED (detected)";;
+	CORRECT) log "STALE_SECTOR_READ_CORRECT";;
+	*) log "STALE_SECTOR_SILENT_CORRUPTION $V (known exposure)";;
+	esac
 	kmsg "does not match the Q syndrome|csum|error" 6
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all
