@@ -29,11 +29,16 @@ read -r fh fok fe <<<"$(arm fixed 0)"
 read -r ch cok ce <<<"$(arm control 1)"
 spl=$(grep -l KERNEL_SPLAT $T/umltest/repair-pin-fixed/log 2>/dev/null | wc -l)
 for a in fixed control; do grep -ah "holding:\|balance rc\|refilled\|REPAIR_PIN\|still recorded" $T/umltest/repair-pin-$a/log | sed "s/^/  [$a] /"; done
-echo "  held / new data intact / scrub csum errors: fixed $fh/$fok/$fe, control $ch/$cok/$ce, splats (fixed) $spl"
+echo "  held / new data intact / parity mismatches the scrub found: fixed $fh/$fok/$fe, control $ch/$cok/$ce, splats (fixed) $spl"
 case "$fh$fok$ch$cok" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 [ "$fh" = yes ] && [ "$ch" = yes ] || { echo "RESULT: INCONCLUSIVE -- no repair was held, so nothing was in flight"; exit 2; }
 [ "$spl" -eq 0 ] || { echo "RESULT: FAIL -- kernel splat"; exit 1; }
-[ "$cok" = 0 ] || { echo "RESULT: INCONCLUSIVE -- the unpinned control did not damage the new data"; exit 2; }
-[ "$fok" = 1 ] || { echo "RESULT: FAIL -- the new data was damaged with the repair pinned"; exit 1; }
+# Damage is the new data reading back wrong, or its parity no longer
+# matching it -- where a stray write lands decides which.
+if [ "$cok" = 1 ] && [ "${ce:-0}" -eq 0 ] 2>/dev/null; then
+	echo "RESULT: INCONCLUSIVE -- the unpinned control did not damage the new data"; exit 2
+fi
+[ "$fok" = 1 ] && [ "${fe:-1}" -eq 0 ] 2>/dev/null ||
+	{ echo "RESULT: FAIL -- the new data or its parity was damaged with the repair pinned"; exit 1; }
 echo "RESULT: PASS -- pinned, the repair finished before its space was given away;"
 echo "        unpinned, it wrote into the new data"

@@ -1791,12 +1791,16 @@ repair_pin)
 	echo 3 > /proc/sys/vm/drop_caches
 	got=$(md5sum $MNT/new 2>/dev/null | awk '{print $1}')
 	[ "$got" = "$want" ] && ok=1 || ok=0
+	pm0=$(sed -n 's/.*parity_mismatch_vertical_stripes \([0-9]*\).*/\1/p' /sys/fs/btrfs/*/raid56_write_profile | head -1)
 	btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1
-	errs=$(sed -n 's/.*csum=\([0-9]*\).*/\1/p; s/.*csum_errors: *\([0-9]*\).*/\1/p' /tmp/scrub.out | head -1)
 	grep -iE "error|csum" /tmp/scrub.out | head -3 | while read -r l; do log "scrub: $l"; done
+	# A stray write that lands on the new chunk's PARITY leaves the file
+	# reading back fine; the scrub finds the parity not matching its data.
+	pm1=$(sed -n 's/.*parity_mismatch_vertical_stripes \([0-9]*\).*/\1/p' /sys/fs/btrfs/*/raid56_write_profile | head -1)
+	pm=$(( ${pm1:-0} - ${pm0:-0} ))
 	kmsg "still recorded in flight|holding|raid56:" 6
-	log "REPAIR_PIN held=$held new_intact=$ok scrub_csum_errors=${errs:-?}"
-	echo "$held $ok ${errs:-?}" > $T/umltest/repair.pin.$TAG
+	log "REPAIR_PIN held=$held new_intact=$ok parity_mismatch=$pm"
+	echo "$held $ok $pm" > $T/umltest/repair.pin.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
 	finish
