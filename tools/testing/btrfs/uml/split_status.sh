@@ -43,7 +43,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 arm() {	# tag legacy -> echoes "<silent> <bad>"
 	local tag=$1 legacy=$2 r silent=0 bad=0 s b
 	for r in $(seq 1 $ROUNDS); do
-		EXTRA_CMDLINE=$([ "$legacy" = 1 ] && echo "btrfs.split_bio_status_legacy=1") \
+		# The mount's recovery now repairs from the write-intent record
+		# what a scrub would, which rebuilds much of the damage this
+		# test needs a degraded read to walk into.  Keep it to verifying,
+		# as it was, so the premise does not depend on crash timing.
+		EXTRA_CMDLINE="btrfs.raid56_recover_legacy=1$([ "$legacy" = 1 ] && echo " btrfs.split_bio_status_legacy=1")" \
 		BTRFS_TEST_DIR=$T $HERE/dmfail34.sh "$KERNEL" "$tag-$r" flakey \
 			raid5:raid1 rw "$NDEV" "$FAIL" > $T/umltest/out.$tag-$r 2>&1
 		s=$(grep -haoE 'DEGRADED_MANIFEST total=[0-9]+ bad=[0-9]+ silent=[0-9]+' \

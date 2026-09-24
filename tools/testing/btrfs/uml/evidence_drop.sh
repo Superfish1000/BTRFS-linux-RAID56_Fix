@@ -25,6 +25,10 @@
 #               draining.  Those stripes are gone and nothing can get them
 #               back, so the kernel has to say so rather than free them
 #               quietly.
+#   collect     one bound process arms, drains the whole scrub, and lets go
+#               with DISARM_IF_EMPTY: the helper as it is meant to be used.
+#   killed      a bound reader killed with evidence queued: the kernel must
+#               disarm when its file closes and say what that discarded.
 #   disarmed    a helper arming and disarming while captures are in flight.
 #               The channel's lock used to live inside the object the disarm
 #               frees, so a capture could take a lock in freed memory; and a
@@ -145,7 +149,27 @@ echo "== armed and disarmed INSIDE every capture =="
 arm race 4 "btrfs.raid56_evidence_capture_delay_ms=2000"
 echo "  scrub boot rc=$(rc_of race)  rounds=$(sed -n 's/.*EVIDENCE_RACE_ROUNDS \([0-9]*\).*/\1/p' \
 	$T/umltest/results.evdrop-race 2>/dev/null | tail -1)"
+
+# The helper as shipped: one process arms bound to itself (ARM_BIND), drains
+# while the scrub runs, and lets go with DISARM_IF_EMPTY, reading again on
+# every -EBUSY -- so nothing can land between its last read and the disarm.
+echo "== one bound process collects the whole scrub (evidence collect) =="
+arm collect 6
+read -r c_cap c_full c_wide c_wait <<<"$(stats_of collect)"
+echo "  captured=$c_cap dropped_full=$c_full dropped_wide=$c_wide waited=$c_wait"
+
+# A bound reader that dies.  Before ARM_BIND the channel outlived whoever armed
+# it, holding stripes nobody would read, and the scrub waited out a grace
+# period per capture against a reader that was gone.  The unbound arms above
+# are that behaviour: their helper exits right after arming, and the channel
+# is still there to be read afterwards.
+echo "== a bound reader is killed with evidence queued =="
+arm killed 7
 echo
+
+# Every line an arm logged, from both places it may have landed.
+logs_of() { cat $T/umltest/results.evdrop-$1 $T/umltest/evdrop-$1/log.* 2>/dev/null; }
+count_of() { logs_of $1 | grep -ac -- "$2"; }
 
 fails=0
 say() { echo "  $1"; }
@@ -216,12 +240,49 @@ discarded() {
 # lets go -- which is worth knowing, and was worth finding out by asserting the
 # wrong thing once.
 [ "$(discarded abandon)" -gt 0 ] 2>/dev/null || bad "disarming with entries queued discarded them without saying so"
-for a in drain nowait full wide race; do
+for a in drain nowait full wide race collect; do
 	[ "$(discarded $a)" -eq 0 ] 2>/dev/null || bad "$a arm read before disarming and still discarded queued evidence"
 done
 [ "${a_cap:-0}" -gt 0 ] 2>/dev/null || bad "the abandon arm captured nothing, so it abandoned nothing"
+# With entries queued, "disarm only if empty" must refuse, not discard.
+[ "$(count_of abandon 'EVIDENCE_DISARM_IF_EMPTY busy')" -gt 0 ] ||
+	bad "DISARM_IF_EMPTY did not refuse with $a_cap stripe(s) queued"
+[ "$(count_of abandon 'EVIDENCE_DISARM_IF_EMPTY ok')" -eq 0 ] ||
+	bad "DISARM_IF_EMPTY disarmed a channel with stripes queued"
 
-for a in drain nowait full wide abandon race; do
+# collect: bound, kept every declined stripe, wrote each one out, exited clean.
+c_rc=$(logs_of collect | sed -n 's/.*collect exited rc=\([0-9]*\).*/\1/p' | tail -1)
+c_col=$(logs_of collect | sed -n 's/.*EVIDENCE_COLLECTED \([0-9]*\).*/\1/p' | tail -1)
+c_files=$(logs_of collect | sed -n 's/.*EVIDENCE_FILES=\([0-9]*\).*/\1/p' | tail -1)
+echo "  collect: rc=${c_rc:-?} collected=${c_col:-?} files=${c_files:-?} of $total declined"
+[ "${c_rc:-x}" = 0 ] || bad "evidence collect exited rc=${c_rc:-?}"
+[ "$(count_of collect 'EVIDENCE_COLLECTING bound=1')" -gt 0 ] ||
+	bad "evidence collect did not bind the channel to itself"
+[ "${c_col:-0}" -eq "$total" ] 2>/dev/null ||
+	bad "evidence collect kept ${c_col:-?} of $total declined stripe(s)"
+[ "${c_files:-0}" -eq "${c_col:-x}" ] 2>/dev/null ||
+	bad "evidence collect reported ${c_col:-?} stripe(s) but wrote ${c_files:-?}"
+[ "${c_full:-1}" -eq 0 ] 2>/dev/null || bad "evidence collect lost ${c_full:-?} stripe(s) to a full ring"
+
+# killed: the kernel notices, disarms, says what it threw away, and the scrub
+# still finishes.
+k_q=$(logs_of killed | sed -n 's/.*queued before kill: \([0-9]*\).*/\1/p' | tail -1)
+echo "  killed: queued at the kill=${k_q:-?} scrub rc=$(rc_of killed)"
+[ "${k_q:-0}" -ge 1 ] 2>/dev/null ||
+	bad "nothing was queued when the reader was killed, so the kill had nothing to lose and this arm proves nothing"
+[ "$(count_of killed "evidence channel's reader closed it")" -gt 0 ] ||
+	bad "the kernel never noticed its bound reader die"
+[ "$(discarded killed)" -gt 0 ] 2>/dev/null ||
+	bad "the reader died with ${k_q:-?} stripe(s) queued and the kernel discarded them without saying so"
+[ "$(count_of killed 'after kill: STATS: No such device')" -gt 0 ] ||
+	bad "the channel is still armed after its bound reader died"
+[ "$(count_of killed 'evidence: scrub finished')" -gt 0 ] && [ "$(rc_of killed)" = "0" ] ||
+	bad "the scrub did not finish after its evidence reader was killed"
+# The contrast: an unbound channel outlives the process that armed it.
+[ "$(count_of full 'EVIDENCE_STATS')" -gt 0 ] ||
+	bad "the unbound control's channel did not outlive its arming process, so the killed arm's disarm is not shown to be ARM_BIND's doing"
+
+for a in drain nowait full wide abandon race collect killed; do
 	[ "$(splat_of $a)" = "0" ] || bad "$a arm produced a kernel splat"
 done
 
@@ -236,4 +297,7 @@ echo "        $f_full dropped rather than overwriting, and waits out the grace"
 echo "        period $f_wait time(s) -- one per scrub context, not per stripe.  A stripe too wide"
 echo "        to copy is refused and counted ($w_wide), not half-copied.  Arming and"
 echo "        disarming under live captures neither hangs the scrub nor trips a"
-echo "        lock check, with a disarm landing inside every capture."
+echo "        lock check, with a disarm landing inside every capture.  One bound"
+echo "        collector keeps all $c_col; DISARM_IF_EMPTY refuses a non-empty ring;"
+echo "        killing a bound reader with $k_q queued disarms, says so, and the scrub"
+echo "        finishes."
