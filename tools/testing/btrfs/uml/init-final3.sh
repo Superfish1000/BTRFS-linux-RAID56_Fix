@@ -30,7 +30,15 @@ finish() {
 # Dump blocked tasks to the console if the scenario takes too long.
 watchdog() {
 	( sleep ${1:-120}; echo 8 > /proc/sys/kernel/printk; echo "WATCHDOG: dumping blocked tasks";
-	  echo w > /proc/sysrq-trigger; sleep 2; echo "WATCHDOG: done" ) &
+	  echo w > /proc/sysrq-trigger; sleep 2
+	  # UML's sysrq-w often prints an empty call trace; say where each
+	  # blocked task is waiting from /proc as well.
+	  for d in /proc/[0-9]*; do
+		grep -q '^State:.*D' $d/status 2>/dev/null || continue
+		echo "WATCHDOG: D $(cat $d/comm 2>/dev/null) pid ${d#/proc/} wchan $(cat $d/wchan 2>/dev/null)"
+		sed 's/^/WATCHDOG:   /' $d/stack 2>/dev/null | head -20
+	  done
+	  echo "WATCHDOG: done" ) &
 }
 OPTS=${OPTS:-rw}
 MNTDEV=${MNTDEV:-/dev/ubda}
