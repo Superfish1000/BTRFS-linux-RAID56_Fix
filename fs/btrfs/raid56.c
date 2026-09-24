@@ -3556,11 +3556,15 @@ static void rmw_prepare_repair(struct btrfs_raid_bio *rbio)
 			}
 			proven = test_bit(index, rbio->repair_bitmap);
 			if (stripe < rbio->nr_data) {
-				/* Being written anyway. */
-				if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1)) {
-					clear_bit(index, rbio->repair_bitmap);
-					continue;
-				}
+				/*
+				 * A sector this write supplies is kept too: the
+				 * repair goes out first, ahead of the new data
+				 * (rmw_repair_first()), and has to restore the
+				 * whole column to what the parity still
+				 * describes before anything changes the parity.
+				 * rmw_assemble_write_bios() writes the new data
+				 * over it, from the bio, either way.
+				 */
 				if (!proven && rbio->verified_bitmap &&
 				    test_bit(index, rbio->verified_bitmap))
 					proven = true;
@@ -3615,8 +3619,18 @@ static bool no_repair_on_fault;
 module_param_named(raid56_no_repair_on_fault, no_repair_on_fault, bool, 0644);
 MODULE_PARM_DESC(raid56_no_repair_on_fault,
 		 "Do not queue a repair of a full stripe a write damaged (testing only: restores the old behaviour)");
+static bool repair_keeps_record;
+module_param_named(raid56_repair_keeps_record, repair_keeps_record, bool, 0644);
+MODULE_PARM_DESC(raid56_repair_keeps_record,
+		 "Leave the record of a full stripe after repairing it (testing only: restores the old behaviour)");
+static bool repair_ignores_freeze;
+module_param_named(raid56_repair_ignores_freeze, repair_ignores_freeze, bool, 0644);
+MODULE_PARM_DESC(raid56_repair_ignores_freeze,
+		 "Keep repairing while the filesystem is frozen (testing only: restores a known defect)");
 #else
 #define no_repair_on_fault	false
+#define repair_keeps_record	false
+#define repair_ignores_freeze	false
 #endif
 
 /* Caller holds wib->repair_lock. */
@@ -3625,7 +3639,7 @@ static void raid56_repair_schedule(struct btrfs_wib *wib)
 	unsigned long first = 0;
 
 	lockdep_assert_held(&wib->repair_lock);
-	if (!wib->repair_nr || wib->repair_stopped)
+	if (!wib->repair_nr || wib->repair_stopped || wib->repair_paused)
 		return;
 	for (unsigned int i = 0; i < wib->repair_nr; i++)
 		if (i == 0 || time_before(wib->repair_queue[i].due, first))
@@ -3680,18 +3694,34 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	    unlikely(BTRFS_FS_ERROR(fs_info)))
 		return;
 	/*
+	 * In flight from here, BEFORE the block group is looked at: a
+	 * relocation marks the group read-only and then drains
+	 * (btrfs_raid56_drain_repairs()), and a repair counted only after
+	 * passing the read-only test could slip between the two.
+	 */
+	atomic_inc(&wib->repairs_inflight);
+	/*
 	 * A block group that is read-only belongs to a scrub, a balance or a
 	 * replace, each of which rewrites this stripe its own way; leave it to
-	 * them.  Gone altogether means nothing is left to repair.
+	 * them.  Gone altogether, or being removed, means nothing is left to
+	 * repair.  Otherwise freeze it for the repair's lifetime, as scrub
+	 * does: the cleaner may still remove an emptied group, but its chunk
+	 * map -- and so its device space -- stays until the unfreeze, so the
+	 * repair can never write into space already handed to someone else.
 	 */
 	bg = btrfs_lookup_block_group(fs_info, logical);
 	if (!bg)
-		return;
-	busy = bg->ro || !(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK);
-	btrfs_put_block_group(bg);
+		goto out_inflight;
+	spin_lock(&bg->lock);
+	busy = bg->ro || !(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) ||
+	       test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags);
+	if (!busy)
+		btrfs_freeze_block_group(bg);
+	spin_unlock(&bg->lock);
 	if (busy) {
+		btrfs_put_block_group(bg);
 		atomic64_inc(&wib->stat_repair_skipped);
-		return;
+		goto out_inflight;
 	}
 
 	btrfs_bio_counter_inc_blocked(fs_info);
@@ -3710,14 +3740,22 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 		goto out_counter;
 	rbio->operation = BTRFS_RBIO_WRITE;
 	rbio->repair_tries = tries;
+	rbio->repair_bg = bg;
 	set_bit(RBIO_REPAIR_BIT, &rbio->flags);
-	/* Dropped, with the bio counter, in raid56_repair_finished(). */
-	atomic_inc(&wib->repairs_inflight);
+	/*
+	 * The in-flight count, the bio counter and the frozen block group are
+	 * all dropped in raid56_repair_finished().
+	 */
 	start_async_work(rbio, rmw_rbio_work);
 	return;
 
 out_counter:
 	btrfs_bio_counter_dec(fs_info);
+	btrfs_unfreeze_block_group(bg);
+	btrfs_put_block_group(bg);
+out_inflight:
+	if (atomic_dec_and_test(&wib->repairs_inflight))
+		wake_up_all(&wib->wait);
 }
 
 void btrfs_raid56_repair_work(struct work_struct *work)
@@ -3730,7 +3768,7 @@ void btrfs_raid56_repair_work(struct work_struct *work)
 		unsigned int i;
 
 		spin_lock(&wib->repair_lock);
-		if (wib->repair_stopped) {
+		if (wib->repair_stopped || wib->repair_paused) {
 			spin_unlock(&wib->repair_lock);
 			return;
 		}
@@ -3769,10 +3807,74 @@ static void raid56_repair_finished(struct btrfs_raid_bio *rbio, int ret, bool fa
 				      logical, RAID56_REPAIR_MAX_TRIES);
 	} else {
 		atomic64_inc(&wib->stat_repair_ok);
+		/*
+		 * Retire the record once nothing it names is left.  Every
+		 * member it named stale has been written back or verified, and
+		 * the parity rewritten wherever it was not trusted, so it no
+		 * longer describes anything -- and left in place it would hold
+		 * a slot until the next scrub or mount.  The log holds 165
+		 * regions (82 while anything is stale); once full, every
+		 * recorded write waits 60 seconds and fails.  Still under the
+		 * stripe lock, so no write can land between the check and the
+		 * retirement.
+		 */
+		if (!READ_ONCE(repair_keeps_record) && !rbio_stripe_recorded(rbio))
+			btrfs_wib_clear_sticky(fs_info, logical,
+					       (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT);
 	}
 	btrfs_bio_counter_dec(fs_info);
+	if (rbio->repair_bg) {
+		btrfs_unfreeze_block_group(rbio->repair_bg);
+		btrfs_put_block_group(rbio->repair_bg);
+		rbio->repair_bg = NULL;
+	}
 	if (atomic_dec_and_test(&wib->repairs_inflight))
 		wake_up_all(&wib->wait);
+}
+
+/*
+ * Wait until no repair is in flight.  For relocation, after its block group
+ * is read-only: a repair counts itself in flight before it looks at the
+ * group, so every repair either saw the group read-only and skipped it, or is
+ * waited for here.
+ */
+void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+
+	if (wib)
+		wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
+}
+
+/*
+ * Freeze: keep the queue, submit nothing more, and let what is in flight
+ * finish, so nothing is written to a frozen filesystem.  A repair in flight
+ * never waits on anything freeze holds -- it takes no transaction and no
+ * sb_start_write() -- so waiting for it here cannot deadlock.
+ */
+void btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+
+	if (!wib || READ_ONCE(repair_ignores_freeze))
+		return;
+	spin_lock(&wib->repair_lock);
+	wib->repair_paused = true;
+	spin_unlock(&wib->repair_lock);
+	cancel_delayed_work_sync(&wib->repair_work);
+	wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
+}
+
+void btrfs_raid56_resume_repairs(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+
+	if (!wib)
+		return;
+	spin_lock(&wib->repair_lock);
+	wib->repair_paused = false;
+	raid56_repair_schedule(wib);
+	spin_unlock(&wib->repair_lock);
 }
 
 /*
@@ -3803,6 +3905,99 @@ void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info)
 	spin_lock(&wib->repair_lock);
 	wib->repair_stopped = false;
 	spin_unlock(&wib->repair_lock);
+}
+
+/*
+ * Put the rebuilt sectors back BEFORE this write changes anything else, and
+ * make that durable, record included.
+ *
+ * Written in the same batch as the new data and parity, a crash between them
+ * could land the parity and not the write-back: the column is still stale on
+ * disk, the record still names it, and the parity it is named against has
+ * just changed -- mount recovery would rebuild it from a torn stripe and write
+ * the result back, silently for a sector with no checksum.  So:
+ *
+ *   A: the rebuilt sectors (the whole named column, including sectors this
+ *      write supplies, at the value the parity still describes), with FUA;
+ *   then the column's mark cleared and the log made durable, flushed;
+ *   B: the new data and parity, as any read-modify-write.
+ *
+ * If A does not land, or the log cannot be made durable, the write fails
+ * before B: the parity is untouched and still holds the acknowledged value,
+ * and the record still says where.
+ */
+static bool rmw_single_phase;
+#ifdef CONFIG_BTRFS_DEBUG
+module_param_named(raid56_rmw_single_phase, rmw_single_phase, bool, 0644);
+MODULE_PARM_DESC(raid56_rmw_single_phase,
+		 "Write repaired sectors in the same batch as the new parity (testing only: restores a known defect)");
+#endif
+
+static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	const int data_sectors = rbio->nr_data * rbio->stripe_nsectors;
+	struct bio_list bio_list;
+	struct bio *bio;
+	u64 cols = 0;
+	int bit;
+	int ret;
+
+	bio_list_init(&bio_list);
+	for_each_set_bit(bit, rbio->repair_bitmap, data_sectors) {
+		const int stripe = bit / rbio->stripe_nsectors;
+		const int sectornr = bit % rbio->stripe_nsectors;
+
+		ret = rbio_add_io_paddrs(rbio, &bio_list,
+					 rbio_stripe_paddrs(rbio, stripe, sectornr),
+					 stripe, sectornr, REQ_OP_WRITE);
+		if (ret) {
+			bio_list_put(&bio_list);
+			return ret;
+		}
+		cols |= BIT_ULL(stripe);
+	}
+	if (bio_list_empty(&bio_list))
+		return 0;
+	bio_list_for_each(bio, &bio_list)
+		bio->bi_opf |= REQ_FUA;
+	submit_write_bios(rbio, &bio_list);
+	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
+
+	if (find_first_bit(rbio->error_bitmap, data_sectors) < data_sectors) {
+		btrfs_warn_rl(fs_info,
+"raid56: could not write back the rebuilt sectors of full stripe %llu; refusing the write rather than change a parity they still depend on",
+			      full_stripe_start);
+		return -EIO;
+	}
+
+	/* Each such column matches the parity again; say so, durably. */
+	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
+		const int first = stripe * rbio->stripe_nsectors;
+		bool all = true;
+
+		if (!(cols & BIT_ULL(stripe)))
+			continue;
+		for (int nr = 0; nr < rbio->stripe_nsectors; nr++)
+			if (!test_bit(first + nr, rbio->repair_bitmap) &&
+			    !(rbio->verified_bitmap &&
+			      test_bit(first + nr, rbio->verified_bitmap)))
+				all = false;
+		if (all)
+			btrfs_wib_clear_stale(fs_info,
+					      full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
+					      BTRFS_STRIPE_LEN);
+	}
+	ret = btrfs_wib_persist_now(fs_info);
+	if (ret < 0) {
+		btrfs_warn_rl(fs_info,
+"raid56: could not make the repair of full stripe %llu durable (%d); refusing the write",
+			      full_stripe_start, ret);
+		return -EIO;
+	}
+	/* On disk now; phase B writes only the new data and the parity. */
+	bitmap_clear(rbio->repair_bitmap, 0, data_sectors);
+	return 0;
 }
 
 static void rmw_rbio(struct btrfs_raid_bio *rbio)
@@ -3929,6 +4124,12 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	}
 
 	bitmap_clear(rbio->error_bitmap, 0, rbio->nr_sectors);
+
+	if (!READ_ONCE(rmw_single_phase)) {
+		ret = rmw_repair_first(rbio, full_stripe_start);
+		if (ret < 0)
+			goto out;
+	}
 
 	index_rbio_pages(rbio);
 

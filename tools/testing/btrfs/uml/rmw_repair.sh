@@ -115,6 +115,9 @@ arm refuse-ctl  1 btrfs.raid56_rmw_no_refuse=1    $NOTRIG "$REFUSE_ENV"
 # stale columns back by itself.
 arm trigger     0 "" "SETTLE=20"                  "" nowrite
 arm trigger-ctl 0 "" "SETTLE=20 $NOTRIG"          "" nowrite
+# A repair that landed must also retire the record, or the log fills with
+# stripes that are fine.  The control repairs and keeps it.
+arm trigger-keep 0 "" "SETTLE=20 btrfs.raid56_repair_keeps_record=1" "" nowrite
 
 echo "== results =="
 report repair;     R_ACK=$ACK R_DISK=$DISK R_PAR=$PAR R_REP=$REP R_SPLAT=$SPLAT
@@ -125,7 +128,13 @@ report trigger;    T_DISK=$DISK T_PAR=$PAR T_SPLAT=$SPLAT
 report trigger-ctl; TC_DISK=$DISK TC_PAR=$PAR TC_SPLAT=$SPLAT
 T_OK=$(grep -ho 'after write errors: .*repair_ok [0-9]*' $T/umltest/rmw-repair-trigger/log.nocow_persist_prep 2>/dev/null |
 	sed 's/.*repair_ok \([0-9]*\).*/\1/' | tail -1)
-echo "  trigger: repairs that succeeded on their own: ${T_OK:-?}"
+sticky_of() {
+	grep -ho 'after write errors: .*sticky_blocks [0-9]*' $T/umltest/rmw-repair-$1/log.nocow_persist_prep 2>/dev/null |
+		sed 's/.*sticky_blocks \([0-9]*\).*/\1/' | tail -1
+}
+T_ST=$(sticky_of trigger); K_ST=$(sticky_of trigger-keep)
+report trigger-keep; K_DISK=$DISK
+echo "  trigger: repairs that succeeded on their own: ${T_OK:-?}; records left: ${T_ST:-?} (kept by the control: ${K_ST:-?})"
 echo
 
 case "$R_DISK$R_PAR$RC_DISK$F_PAR$F_ACK$FC_PAR$FC_ACK$T_DISK$T_PAR$TC_DISK" in *'?'*)
@@ -150,9 +159,13 @@ done
 [ "$T_DISK" -eq 0 ] || bad "the triggered repair left $T_DISK stale block(s) (control: $TC_DISK)"
 [ "$T_PAR" -eq 0 ] || bad "the triggered repair lost $T_PAR block(s) from the parity"
 [ "${T_OK:-0}" -gt 0 ] 2>/dev/null || bad "no triggered repair reported success"
+[ "${K_ST:-0}" -gt 0 ] 2>/dev/null || bad "the keep-record control retired its records too, so it proves nothing"
+[ "${K_DISK:-1}" -eq 0 ] 2>/dev/null || bad "the keep-record control did not repair, so it is not the control it claims"
+[ "${T_ST:-1}" -eq 0 ] 2>/dev/null || bad "${T_ST:-?} record block(s) outlived the repairs that fixed them"
 if [ $fails -ne 0 ]; then echo "RESULT: FAIL -- $fails check(s) failed"; exit 1; fi
 echo "RESULT: PASS -- the next write repaired the stripe (control left $RC_DISK"
 echo "        stale); into an undecidable stripe it was refused and the parity"
 echo "        kept everything (control lost $FC_PAR; $FC_ACK accepted against"
 echo "        $F_ACK); with nothing writing, the repair queued on the fault put"
-echo "        the stripe back by itself (control left $TC_DISK stale)"
+echo "        the stripe back by itself (control left $TC_DISK stale) and retired"
+echo "        its record (kept: $K_ST)"

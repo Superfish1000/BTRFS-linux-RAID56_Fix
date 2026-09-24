@@ -174,6 +174,13 @@ struct btrfs_raid_bio {
 	u8 repair_tries;
 
 	/*
+	 * For a repair rbio: its block group, frozen (btrfs_freeze_block_group())
+	 * for the repair's lifetime so the chunk's device space cannot be freed
+	 * and reused under it.
+	 */
+	struct btrfs_block_group *repair_bg;
+
+	/*
 	 * Size of all the bios in the bio_list.  This helps us decide if the
 	 * rbio maps to a full stripe or not.
 	 */
@@ -321,5 +328,8 @@ void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 void btrfs_raid56_repair_work(struct work_struct *work);
 void btrfs_raid56_stop_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_resume_repairs(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info);
 
 #endif

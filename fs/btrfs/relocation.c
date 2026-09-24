@@ -34,6 +34,7 @@
 #include "root-tree.h"
 #include "file-item.h"
 #include "relocation.h"
+#include "raid56.h"
 #include "super.h"
 #include "tree-checker.h"
 #include "raid-stripe-tree.h"
@@ -5534,6 +5535,8 @@ int btrfs_relocate_block_group(struct btrfs_fs_info *fs_info, u64 group_start,
 
 	btrfs_wait_block_group_reservations(rc->block_group);
 	btrfs_wait_nocow_writers(rc->block_group);
+	/* And any RAID5/6 repair that got in before the group went read-only. */
+	btrfs_raid56_drain_repairs(fs_info);
 	btrfs_wait_ordered_roots(fs_info, U64_MAX, rc->block_group);
 
 	ret = btrfs_zone_finish(rc->block_group);

@@ -1595,6 +1595,107 @@ nocow_probe)
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
+repair_freeze)
+	# The repair queued on a failed write must not write to a frozen
+	# filesystem.  Fault some writes, heal the device, freeze at once, and
+	# count the writes the block layer completed on every device while
+	# frozen -- then thaw and see the repair happen.  CONTROL=1 restores a
+	# repair that ignores the freeze.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_repair_ignores_freeze ||
+			log "CONTROL_ARM_FAIL"
+		log "repair ignores freeze (control)"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	dm_error_writes $FAIL
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null
+	done
+	dm_heal $FAIL
+	fsfreeze -f $MNT || log "FREEZE_FAIL"
+	dm_writes() { local n=0 d; for d in /sys/block/dm-*/stat; do
+		n=$((n + $(awk '{print $5}' $d))); done; echo $n; }
+	rok() { sed -n 's/.*repair_ok \([0-9]*\).*/\1/p' /sys/fs/btrfs/*/raid56_write_intent | head -1; }
+	w0=$(dm_writes); ok0=$(rok)
+	sleep ${FROZEN_FOR:-20}
+	w1=$(dm_writes); ok1=$(rok)
+	fsfreeze -u $MNT || log "THAW_FAIL"
+	sleep ${FROZEN_FOR:-20}
+	ok2=$(rok)
+	stats "after thaw"
+	log "REPAIR_FREEZE writes_frozen=$((w1 - w0)) repairs_frozen=$((ok1 - ok0)) repairs_after=$((ok2 - ok1))"
+	echo "$((w1 - w0)) $((ok1 - ok0)) $((ok2 - ok1))" > $T/umltest/repair.freeze.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
+rmw_torn)
+	# A crash in the write that repairs a stale column.  'B' is written
+	# while its column's device fails writes (stale, named); then 'C' goes
+	# into the next column of the same row with raid56_crash_point=2 armed:
+	# that write's data does not land, its parity does, and the kernel
+	# panics.  If the write-back of 'B' went out in the same batch, it is
+	# dropped with the data, and the record still names the column against
+	# a parity that has just changed.  CONTROL=1 restores that single batch.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	echo 600000 > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_rmw_single_phase ||
+			log "CONTROL_ARM_FAIL"
+		log "single-phase repair (control)"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	echo "$L" > $T/umltest/layout.$TAG
+	eval "$L"
+	[ -n "${FO_B:-}" ] || { log "LAYOUT_FAIL"; finish; }
+	dm_error_writes $IDX_B
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_B / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
+	dm_heal $IDX_B
+	sync
+	echo 2 > /sys/module/btrfs/parameters/raid56_crash_point
+	log "crash armed"
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_C / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null
+	log "NO_CRASH"
+	finish
+	;;
+rmw_torn_verify)
+	# After the crash: a normal read-write mount (the recovery runs), then
+	# is 'B' still what reads back, and what is on its platter?
+	eval "$(cat $T/umltest/layout.$TAG)"
+	do_mount $OPTS /dev/ubda
+	kmsg "write-intent|scrub:" 6
+	echo 3 > /proc/sys/vm/drop_caches
+	got=$(dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none 2>/dev/null |
+	      tr -cd 'B' | wc -c)
+	umount $MNT || log "UMOUNT_FAIL"
+	dev=/dev/ubd$(echo abcdefgh | cut -c$((IDX_B + 1)))
+	plat=$(dd if=$dev bs=4096 skip=$((PHYS_B / 4096)) count=1 status=none 2>/dev/null |
+	       tr -cd 'B' | wc -c)
+	log "RMW_TORN b_read=$got b_platter=$plat"
+	echo "$got $plat" > $T/umltest/rmw.torn.$TAG
+	finish
+	;;
 rmw_cache)
 	# The stripe-cache path of a read-modify-write.  'B' is written while
 	# its column's device fails writes: accepted within the tolerance, the

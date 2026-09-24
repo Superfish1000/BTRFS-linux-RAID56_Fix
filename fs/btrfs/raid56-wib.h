@@ -254,6 +254,8 @@ struct btrfs_wib {
 	spinlock_t repair_lock;
 	struct delayed_work repair_work;
 	bool repair_stopped;
+	/* Frozen filesystem: keep the queue, submit nothing. */
+	bool repair_paused;
 	unsigned int repair_nr;
 	struct btrfs_wib_repair_slot repair_queue[BTRFS_WIB_REPAIR_SLOTS];
 	atomic_t repairs_inflight;
@@ -424,6 +426,7 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info);
 int btrfs_wib_load(struct btrfs_fs_info *fs_info);
 int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending);
 int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info);
+int btrfs_wib_persist_now(struct btrfs_fs_info *fs_info);
 int btrfs_wib_rw_mount(struct btrfs_fs_info *fs_info, bool log_replay_pending,
 		       bool rdonly);
 

@@ -2448,6 +2448,47 @@ void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info)
  * that a later mount could pick as the newest one; writing a single slot is
  * enough when only the newest block matters.
  */
+/*
+ * Make the in-memory record durable now, dropping what has finished: every
+ * device is flushed first, then the current set is written.  For a
+ * read-modify-write that has just put a stale column back (with FUA) and
+ * cleared its mark, and must not change the parity until the log on disk has
+ * stopped naming the column -- see rmw_repair_first() in raid56.c.
+ *
+ * -EIO if a device did not confirm the flush: nothing is written then, and the
+ * block on disk, a superset of the truth, stays as it was.
+ */
+int btrfs_wib_persist_now(struct btrfs_fs_info *fs_info)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	bool enabled;
+	u64 seq;
+	int ret;
+
+	if (!wib)
+		return 0;
+	spin_lock_irqsave(&wib->lock, flags);
+	enabled = wib->enabled;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (!enabled)
+		return 0;
+
+	mutex_lock(&wib->commit_mutex);
+	spin_lock_irqsave(&wib->lock, flags);
+	seq = ++wib->snap_seq;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
+	if (ret == 0) {
+		if (wib_flush_all_devices(wib))
+			ret = wib_drop_locked(wib, seq, wib->flushsnap, true, true);
+		else
+			ret = -EIO;
+	}
+	mutex_unlock(&wib->commit_mutex);
+	return ret;
+}
+
 static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
 {
 	unsigned long flags;

@@ -2335,6 +2335,8 @@ static int btrfs_freeze(struct super_block *sb)
 	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
 
 	set_bit(BTRFS_FS_FROZEN, &fs_info->flags);
+	/* A RAID5/6 repair writes to the devices; not while frozen. */
+	btrfs_raid56_pause_repairs(fs_info);
 	/*
 	 * We don't need a barrier here, we'll wait for any transaction that
 	 * could be in progress on other threads (and do delayed iputs that
@@ -2420,6 +2422,7 @@ static int btrfs_unfreeze(struct super_block *sb)
 		}
 	}
 	clear_bit(BTRFS_FS_FROZEN, &fs_info->flags);
+	btrfs_raid56_resume_repairs(fs_info);
 
 	/*
 	 * We still return 0, to allow VFS layer to unfreeze the fs even the
