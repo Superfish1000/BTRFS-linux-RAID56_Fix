@@ -117,6 +117,37 @@ stripe it is about to write is already one fault down -- at the cost of failing
 writes that today succeed. Or whether this is inherent to a one-fault-tolerant
 profile taking two faults, and belongs in the documented exposures instead.
 
+### DECIDED: de-rate with auto-repair (implemented)
+
+The decision taken: refuse what cannot be proven safe, and repair so that the
+refusal almost never has to happen.  Three pieces, all in `raid56.c`, each
+tested against a control that restores the old behaviour
+(`uml/rmw_repair.sh`):
+
+1. **Repair on write.** An RMW writes back every sector it rebuilt because the
+   record or a checksum proved it wrong, with the parity of every vertical
+   stripe that touched. The stale column is back on disk by the time the write
+   completes, so the second fault in the scenario above has nothing left to
+   destroy. (0 stale blocks after the writes, control 8.)
+2. **Repair on fault.** A write that hits a device error queues a repair of its
+   stripe -- a data-less RMW on the same stripe lock -- retried with a doubling
+   delay while the device keeps refusing. With nothing else writing to the
+   stripe, it comes back by itself. (0 stale, control 8.)
+3. **Refuse the undecidable.** An RMW into a stripe the record names more of
+   than the remaining parity can rebuild is refused before it writes anything.
+   (0 blocks lost from the parity, control 8.)
+
+With (1), the fault accounting of the next write already *is* the recorded
+de-rate: the stale column's rewrite is part of that write's IO, so its failure
+counts against `rbio_max_errors()` in the same vertical stripes. No separate
+post-write de-rate was added.
+
+The cost that remains is the one the model predicted for degraded arrays: a
+stripe with a recorded stale column *and* a missing device is undecidable, and
+writes into it are refused until the device is back (or replaced). Reads are
+unaffected. Whether that can be narrowed is what the model workflow's
+degraded-refinements branch is examining.
+
 ### Both de-rate variants were built and measured
 
 Written, run, and then backed out. `sweep.sh` runs both so the numbers stay

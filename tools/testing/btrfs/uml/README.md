@@ -69,6 +69,7 @@ the next recorded write:
 | `split_status.sh` | two arms: does a degraded read return a reconstruction its checksum already rejected? |
 | `unprovable.sh` | two arms: does scrub write a rebuild it cannot verify over good data? |
 | `evidence_drop.sh` | eight arms: what the evidence channel does when it cannot keep a stripe -- ring full, stripe too wide, disarmed under a live capture -- plus the bound helper: one `evidence collect` keeps everything, `DISARM_IF_EMPTY` refuses a non-empty ring, a killed reader disarms the channel |
+| `rmw_repair.sh` | six arms: does the next write into a damaged stripe repair it, is a write into an undecidable stripe refused, does the repair queued on the fault put the stripe back with nothing else writing? Each against a control that restores the old behaviour |
 | `recover_scrub.sh` | three arms: does the mount's recovery repair what the record proves, keep what it cannot decide? Checks the platters directly (`nocow_platter.py`) |
 | `nocow_persist.sh` | three arms: does the stale record survive a mount, and is an ambiguous stripe declined? |
 | `age.sh` | ages a RAID5/6 filesystem and measures its stranded free space |

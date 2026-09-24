@@ -381,26 +381,61 @@ Degraded before the crash                 Documented limit: detected, not silent
 What retires a record
 =====================
 
-Nothing retires a record on its own, and a device reappearing does not trigger
-anything.  Recovery itself runs from three places -- ``btrfs_wib_rw_mount()``
-at mount and again on a remount from read-only to read-write, and
-``btrfs_wib_recover_after_replay()`` after a tree log replay -- and a device
-coming back is none of them.  A stripe
-that stayed recorded is scrubbed again by one of three things, and until one of
-them happens its redundancy is not restored:
+A write that a device did not take leaves a data column stale and names it in
+the record.  Four things put that column back and restore the stripe's
+redundancy:
 
-* the next mount, or a ``mount -o remount,rw`` from read-only, either of which
-  runs the recovery over every recorded stripe;
-* a device replace, which drives the ordinary scrub machinery
-  (``btrfs_scrub_dev()``) over the source device's stripes, so the plan the
-  record implies applies there too;
-* any ``btrfs scrub``, which consults the record for every full stripe it
-  reaches.
+* **the repair queued by the failed write itself.**  ``rmw_rbio()`` hands the
+  full stripe to ``btrfs_raid56_queue_repair()``, and after a short delay
+  (1s, doubling per attempt, six attempts) a *repair rbio* is submitted for it:
+  a read-modify-write with no data of its own, which reads the stripe, rebuilds
+  what the record proves stale and writes that and the parity back.  It queues
+  on the same stripe lock as every write, so no write can use the stripe
+  between the repair reading it and the repair landing.  A block group that is
+  read-only belongs to a scrub, balance or replace and is left to it.  The
+  queue is stopped and drained before the filesystem stops being writable
+  (``btrfs_raid56_stop_repairs()`` at unmount and remount read-only).
+  Bounded: 64 stripes waiting; what does not fit, or does not succeed, stays
+  recorded for the next item on this list.
+* **the next write to the stripe.**  A read-modify-write has always read the
+  whole stripe and rebuilt what it could not believe, then dropped the rebuilt
+  sectors after folding them into the new parity.  It now writes back every
+  sector something *proved* wrong -- named by the record (and already checked
+  by ``mark_stale_sectors()`` to fit the parity that is left), or rebuilt to a
+  match against a checksum the on-disk copy failed -- along with the parity of
+  every vertical stripe it touched that way (``rmw_prepare_repair()``).  A
+  sector that was merely unreadable and has no checksum is *not* written back:
+  its rebuild is a guess, and writing a guess over a sector whose read failed
+  transiently is how good data gets destroyed (``uml/unprovable.sh``).  Once
+  every sector of a named column is written or verified, its mark is cleared.
+* **recovery**, at mount, on a ``remount,rw`` from read-only, and after a tree
+  log replay, which repairs from the record exactly as a scrub does (see
+  Recovery above);
+* **any** ``btrfs scrub``, or a device replace, which drives the scrub
+  machinery over the source device's stripes.
 
-So a filesystem that stays mounted after a write error keeps the record, keeps
-reading those sectors correctly -- the record is what makes a degraded read
-rebuild them rather than believe them -- and regains the redundancy at the next
-scrub or mount, not before.  Plugging the device back in is not enough.
+A write into a stripe the record *cannot* decide -- it names more members than
+the parity that is left can rebuild -- is **refused** with ``-EIO``
+(``rmw_refused`` in ``raid56_write_profile``).  Any parity it computed would
+have to take the stale column as it is on disk, destroying the only copy of
+what was acknowledged there, silently where there is no checksum.  Refusing
+costs availability for that one stripe and nothing else: reads are unchanged,
+and a stripe that became undecidable because a device is missing becomes
+decidable again when the device returns.  The stale mark on a *parity* is now
+also only cleared when the whole parity column was rewritten; a sub-stripe
+write that landed used to clear the mark of a parity write that failed in a
+different vertical stripe.
+
+A device reappearing still triggers nothing by itself (it has no hook on a
+mounted filesystem); what brings the stripe back is whichever of the above
+comes first.
+
+``tools/testing/btrfs/uml/rmw_repair.sh`` tests the three new paths, each
+against a negative control that restores the old behaviour
+(``raid56_rmw_no_repair``, ``raid56_rmw_no_refuse``,
+``raid56_no_repair_on_fault``): the next write leaves 0 blocks stale on the
+platters against 8; the refused writes lose 0 blocks from the parity against
+8; with nothing writing at all, the queued repair leaves 0 stale against 8.
 
 Verification
 ============

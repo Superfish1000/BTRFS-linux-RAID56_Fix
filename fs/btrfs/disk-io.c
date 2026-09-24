@@ -4437,6 +4437,7 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	btrfs_dev_replace_suspend_for_unmount(fs_info);
 
 	btrfs_scrub_cancel(fs_info);
+	btrfs_raid56_stop_repairs(fs_info);
 
 	/* wait for any defraggers to finish */
 	wait_event(fs_info->transaction_wait,

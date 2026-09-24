@@ -20,6 +20,7 @@ boot() {
 	timeout 1800 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 		init=$T/umltest/init-final3.sh $ubds quiet con=null con0=fd:0,fd:1 BTRFS_TEST_DIR=$T \
 		MODE=$mode OPTS=rw PROFILE=raid6:raid6 CRASH=0 TAG=$TAG \
+		OMITTED=$([ "$omit" = none ] || echo "$omit") \
 		MNTDEV=/dev/ubda NDEV=$NDEV FAIL=$FAIL > $D/log.$mode.omit${omit// /-} 2>&1
 	echo "boot $mode omit=$omit rc=$?" >> $T/umltest/results.$TAG
 }

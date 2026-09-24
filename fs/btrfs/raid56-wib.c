@@ -2669,6 +2669,9 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	init_waitqueue_head(&wib->wait);
 	init_waitqueue_head(&wib->io_wait);
 	atomic_set(&wib->io_pending, 0);
+	spin_lock_init(&wib->repair_lock);
+	INIT_DELAYED_WORK(&wib->repair_work, btrfs_raid56_repair_work);
+	atomic_set(&wib->repairs_inflight, 0);
 	fs_info->wib = wib;
 	return 0;
 }
@@ -2680,6 +2683,8 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 	btrfs_raid56_evidence_disarm(fs_info);
 	if (!wib)
 		return;
+	/* Normally done already by close_ctree(); a failed mount may not have. */
+	btrfs_raid56_stop_repairs(fs_info);
 	fs_info->wib = NULL;
 	free_page((unsigned long)wib->block);
 	free_page((unsigned long)wib->last);

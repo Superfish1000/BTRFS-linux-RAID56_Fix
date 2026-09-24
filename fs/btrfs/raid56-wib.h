@@ -233,8 +233,35 @@ struct btrfs_wib_entry {
 	u64 gen;
 };
 
+/* Full stripes that can wait for a repair at once; see btrfs_raid56_queue_repair(). */
+#define BTRFS_WIB_REPAIR_SLOTS		64
+
+struct btrfs_wib_repair_slot {
+	u64 logical;
+	unsigned long due;
+	u8 tries;
+};
+
 struct btrfs_wib {
 	struct btrfs_fs_info *fs_info;
+
+	/*
+	 * Full stripes a write that hit a device error asked to have repaired,
+	 * drained by btrfs_raid56_repair_work() (raid56.c).  Protected by
+	 * @repair_lock.  @repairs_inflight counts the repair rbios submitted
+	 * and not yet finished; teardown waits for it on @wait.
+	 */
+	spinlock_t repair_lock;
+	struct delayed_work repair_work;
+	bool repair_stopped;
+	unsigned int repair_nr;
+	struct btrfs_wib_repair_slot repair_queue[BTRFS_WIB_REPAIR_SLOTS];
+	atomic_t repairs_inflight;
+	atomic64_t stat_repair_queued;
+	atomic64_t stat_repair_ok;
+	atomic64_t stat_repair_failed;
+	atomic64_t stat_repair_dropped;
+	atomic64_t stat_repair_skipped;
 
 	/*
 	 * Protects entries[], snap_seq, seq, enabled and the enable/disable

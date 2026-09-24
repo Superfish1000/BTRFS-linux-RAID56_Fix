@@ -1215,7 +1215,7 @@ nocow_persist_prep)
 	}
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
-	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	dd if=/dev/zero bs=1M count=${PREP_SIZE_MB:-2} status=none | tr '\000' 'A' > $MNT/nocow
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
 	acked=0
@@ -1227,6 +1227,9 @@ nocow_persist_prep)
 	sync
 	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
 	dm_heal $FAIL; log "healed device $FAIL"
+	# Give a repair the kernel queued on the failed writes time to find the
+	# device healthy again (rmw_repair.sh, the trigger arms).
+	[ "${SETTLE:-0}" -gt 0 ] && sleep $SETTLE
 	stats "after write errors"
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
@@ -1569,6 +1572,36 @@ nocow_probe)
 	bad=$(nocow_bad)
 	log "NOCOW_PROBE_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
 	echo $bad > $T/umltest/nocow.bad.${PROBE:-x}.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+rmw_write)
+	# Sub-stripe writes into every full stripe the prep left recorded: a
+	# 4K block of 'C' at each of RMW_OFFSETS blocks from every acknowledged
+	# 'B' (default 2), never on a 'B' itself, so the blocks the probes check
+	# are not rewritten.  Each is an
+	# in-place read-modify-write of a stripe whose record names a stale
+	# column -- the write that either repairs it, refuses it, or (before
+	# either) folds the stale sector into the parity.
+	do_mount $OPTS $MNTDEV
+	allow_nodatacow
+	stats "before writes"
+	acked=0
+	nr=0
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		for o in $(echo ${RMW_OFFSETS:-2} | tr , " "); do
+			[ $((i * NOCOW_STRIDE + o)) -ge 0 ] || continue
+			nr=$((nr+1))
+			dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' |
+			dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE + o)) count=1 \
+			   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		done
+	done
+	sync
+	log "RMW_WRITES acked=$acked of $nr"
+	echo $acked > $T/umltest/rmw.acked.$TAG
+	stats "after writes"
+	kmsg "refusing a write|raid56:" 4
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;

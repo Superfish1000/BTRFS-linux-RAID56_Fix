@@ -170,6 +170,9 @@ struct btrfs_raid_bio {
 	/* Stripe number that we're scrubbing  */
 	u8 scrubp;
 
+	/* For a repair rbio (RBIO_REPAIR_BIT): how many attempts came before. */
+	u8 repair_tries;
+
 	/*
 	 * Size of all the bios in the bio_list.  This helps us decide if the
 	 * rbio maps to a full stripe or not.
@@ -229,6 +232,18 @@ struct btrfs_raid_bio {
 	 * only remaining way silent wrong data can be returned.
 	 */
 	unsigned long *verified_bitmap;
+
+	/*
+	 * Sectors a read-modify-write may write back after rebuilding them,
+	 * because something PROVED them wrong on disk: the write-intent record
+	 * names them stale (set by mark_stale_sectors(), which has already
+	 * checked the rebuild fits the parity that is left), or their rebuild
+	 * matched a data checksum the on-disk copy failed.  A sector that was
+	 * merely unreadable and has no checksum is not here: its rebuild is a
+	 * guess, and writing a guess over a sector whose read failed
+	 * transiently is how good data gets destroyed (uml/unprovable.sh).
+	 */
+	unsigned long *repair_bitmap;
 
 	/*
 	 * Checksum buffer if the rbio is for data.  The buffer should cover
@@ -300,5 +315,11 @@ void raid56_parity_cache_data_folios(struct btrfs_raid_bio *rbio,
 int btrfs_alloc_stripe_hash_table(struct btrfs_fs_info *info);
 void btrfs_free_stripe_hash_table(struct btrfs_fs_info *info);
 
+
+void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			       unsigned int tries);
+void btrfs_raid56_repair_work(struct work_struct *work);
+void btrfs_raid56_stop_repairs(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info);
 
 #endif

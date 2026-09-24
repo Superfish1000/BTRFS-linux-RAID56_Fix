@@ -1343,6 +1343,7 @@ static int btrfs_remount_rw(struct btrfs_fs_info *fs_info)
 		return ret;
 
 	btrfs_clear_sb_rdonly(fs_info->sb);
+	btrfs_raid56_start_repairs(fs_info);
 
 	set_bit(BTRFS_FS_OPEN, &fs_info->flags);
 
@@ -1404,6 +1405,7 @@ static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
 
 	btrfs_dev_replace_suspend_for_unmount(fs_info);
 	btrfs_scrub_cancel(fs_info);
+	btrfs_raid56_stop_repairs(fs_info);
 	btrfs_pause_balance(fs_info);
 
 	/*

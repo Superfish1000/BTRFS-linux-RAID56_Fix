@@ -1364,7 +1364,7 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 	spin_unlock_irqrestore(&wib->lock, flags);
 
 	return sysfs_emit(buf,
-		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\nstale_evicted %llu\nstale_query_fast %llu\nstale_query_slow %llu\nscrub_skipped_stale %llu\nread_ambiguous %llu\n",
+		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\nstale_evicted %llu\nstale_query_fast %llu\nstale_query_slow %llu\nscrub_skipped_stale %llu\nread_ambiguous %llu\nrepair_queued %llu\nrepair_ok %llu\nrepair_failed %llu\nrepair_dropped %llu\nrepair_skipped %llu\n",
 		enabled, nr_inflight, nr_sticky, wib->nr_pending,
 		(unsigned long long)atomic64_read(&wib->stat_marks),
 		(unsigned long long)atomic64_read(&wib->stat_commits),
@@ -1378,7 +1378,12 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&wib->stat_stale_fast),
 		(unsigned long long)atomic64_read(&wib->stat_stale_slow),
 		(unsigned long long)atomic64_read(&wib->stat_scrub_skipped_stale),
-		(unsigned long long)atomic64_read(&wib->stat_read_ambiguous));
+		(unsigned long long)atomic64_read(&wib->stat_read_ambiguous),
+		(unsigned long long)atomic64_read(&wib->stat_repair_queued),
+		(unsigned long long)atomic64_read(&wib->stat_repair_ok),
+		(unsigned long long)atomic64_read(&wib->stat_repair_failed),
+		(unsigned long long)atomic64_read(&wib->stat_repair_dropped),
+		(unsigned long long)atomic64_read(&wib->stat_repair_skipped));
 }
 BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
 
@@ -1396,7 +1401,7 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 	const struct btrfs_raid56_write_stats *st = &fs_info->raid56_write_stats;
 
 	return sysfs_emit(buf,
-		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\nraid56_forced_cow %llu\nparity_mismatch_vertical_stripes %llu\nparity_mismatch_full_stripes %llu\nrecover_verified_sectors %llu\nrecover_unverified_sectors %llu\nrecover_unverified_nobitmap %llu\nrecover_unverified_nobit %llu\ndelivered_unchecked %llu\ndelivered_audit_skipped %llu\ndelivered_nocsum %llu\ndelivered_zero %llu\nrepair_csum_ok %llu\nrepair_csum_none %llu\nrepair_csum_none_raid56 %llu\nrepair_csum_mismatch %llu\n",
+		"full_stripe_writes %llu\ninplace_full_stripe_writes %llu\nsub_stripe_writes %llu\nsub_stripe_vertical_stripes %llu\nsub_stripe_written_sectors %llu\nsub_stripe_resident_sectors %llu\nraid56_forced_cow %llu\nparity_mismatch_vertical_stripes %llu\nparity_mismatch_full_stripes %llu\nrecover_verified_sectors %llu\nrecover_unverified_sectors %llu\nrecover_unverified_nobitmap %llu\nrecover_unverified_nobit %llu\ndelivered_unchecked %llu\ndelivered_audit_skipped %llu\ndelivered_nocsum %llu\ndelivered_zero %llu\nrepair_csum_ok %llu\nrepair_csum_none %llu\nrepair_csum_none_raid56 %llu\nrepair_csum_mismatch %llu\nrmw_repaired_sectors %llu\nrmw_refused %llu\n",
 		(unsigned long long)atomic64_read(&st->full),
 		(unsigned long long)atomic64_read(&st->inplace),
 		(unsigned long long)atomic64_read(&st->partial),
@@ -1417,7 +1422,9 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&st->repair_csum_ok),
 		(unsigned long long)atomic64_read(&st->repair_csum_none),
 		(unsigned long long)atomic64_read(&st->repair_csum_none_raid56),
-		(unsigned long long)atomic64_read(&st->repair_csum_mismatch));
+		(unsigned long long)atomic64_read(&st->repair_csum_mismatch),
+		(unsigned long long)atomic64_read(&st->rmw_repaired_sectors),
+		(unsigned long long)atomic64_read(&st->rmw_refused));
 }
 BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
 

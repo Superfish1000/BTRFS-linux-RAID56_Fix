@@ -621,6 +621,20 @@ struct btrfs_raid56_write_stats {
 	atomic64_t repair_csum_mismatch;
 	/* The subset of repair_csum_none that was a RAID5/6 reconstruction. */
 	atomic64_t repair_csum_none_raid56;
+	/*
+	 * Sectors a read-modify-write rebuilt because the write-intent record
+	 * or a checksum proved them wrong on disk, and wrote back along with
+	 * its own data, so the stripe got its redundancy back without waiting
+	 * for a scrub.  See rmw_prepare_repair().
+	 */
+	atomic64_t rmw_repaired_sectors;
+	/*
+	 * Read-modify-writes refused because the record names more members of
+	 * the full stripe than its parity can rebuild: any parity computed
+	 * there would fold a stale sector in and destroy the only copy of what
+	 * was acknowledged.  See rmw_rbio().
+	 */
+	atomic64_t rmw_refused;
 };
 
 struct btrfs_fs_info {
