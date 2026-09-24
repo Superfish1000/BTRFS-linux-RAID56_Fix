@@ -992,7 +992,12 @@ nocow_rmw)
 	allow_nodatacow
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	lsattr $MNT/nocow 2>/dev/null | grep -q C || log "NOT_NODATACOW"
-	dd if=/dev/zero bs=1M count=4 status=none | tr '\000' 'A' > $MNT/nocow
+	# Big enough for every block the passes write: at NOCOW_FS_BLOCKS apart,
+	# 32 of them span 6 MiB, and a write past the end is not an in-place
+	# overwrite at all -- it allocates, packs the new extents into shared
+	# full stripes, and tests something else.
+	dd if=/dev/zero bs=1M count=$(( NOCOW_BLOCKS * NOCOW_FS_BLOCKS * 4096 / 1048576 + 2 )) \
+		status=none | tr '\000' 'A' > $MNT/nocow
 	# One pre-made block instead of a tr(1) pipeline per write: the loop
 	# below issues one write per data column per stripe, and under UML those
 	# pipelines cost more than the scenario does.
@@ -1766,7 +1771,10 @@ repair_pin)
 	rm -f $MNT/nocow; sync
 	btrfs balance start --full-balance -d $MNT > /tmp/bal.out 2>&1
 	log "balance rc=$? after $(( $(date +%s) - t0 ))s: $(tail -1 /tmp/bal.out)"
-	dd if=/dev/urandom of=$MNT/new bs=1M count=${REFILL_MB:-300} conv=fsync status=none
+	# Enough to spill past the chunk the balance just made and into new
+	# chunks, which take the lowest free device space: the space the
+	# relocated chunk just gave up.
+	dd if=/dev/urandom of=$MNT/new bs=1M count=${REFILL_MB:-1500} conv=fsync status=none
 	sync
 	want=$(md5sum $MNT/new | awk '{print $1}')
 	log "refilled after $(( $(date +%s) - t0 ))s"
