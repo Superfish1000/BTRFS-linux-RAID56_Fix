@@ -3490,10 +3490,31 @@ static bool rmw_no_refuse;
 module_param_named(raid56_rmw_no_refuse, rmw_no_refuse, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_no_refuse,
 		 "Let a read-modify-write into an undecidable stripe go ahead (testing only: restores a known defect)");
+static bool rmw_trust_cache;
+module_param_named(raid56_rmw_trust_cache, rmw_trust_cache, bool, 0644);
+MODULE_PARM_DESC(raid56_rmw_trust_cache,
+		 "Serve a read-modify-write into a recorded stripe from the stripe cache (testing only: restores a known defect)");
 #else
 #define rmw_no_repair	false
 #define rmw_no_refuse	false
+#define rmw_trust_cache	false
 #endif
+
+/*
+ * Does the write-intent record name any member of this full stripe as stale?
+ * Lock-free while nothing anywhere is recorded stale.
+ */
+static bool rbio_stripe_recorded(struct btrfs_raid_bio *rbio)
+{
+	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+	struct btrfs_wib_stripe_state st;
+
+	if (likely(!btrfs_wib_any_stale(fs_info)))
+		return false;
+	return btrfs_wib_stripe_state(fs_info, rbio->bioc->full_stripe_logical,
+				      rbio->nr_data, rbio->real_stripes - rbio->nr_data,
+				      &st);
+}
 
 /*
  * A read-modify-write has just read the whole full stripe and rebuilt what it
@@ -3812,9 +3833,21 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 * A repair has to look at the disks, not at a cached copy of what the
 	 * filesystem believes is there: what is different between the two is
 	 * the thing it is repairing.
+	 *
+	 * So does any sub-stripe write into a stripe the record names.  The
+	 * cached pages hold the believed content, which makes the parity this
+	 * write computes right -- but the write never reads, so it neither
+	 * writes the stale column back (rmw_prepare_repair()) nor refuses an
+	 * undecidable stripe, and if its own parity write then fails, the
+	 * stale column and the parity are both wrong in the same vertical
+	 * stripe: the acknowledged value is gone.  The model found this
+	 * (raid56_redundancy_model.py, the kernel's cache rule: 76 lost states
+	 * at nr_data 3 on a healthy RAID5).
 	 */
 	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags) ||
-	    (!rbio_is_full(rbio) && need_read_stripe_sectors(rbio))) {
+	    (!rbio_is_full(rbio) &&
+	     (need_read_stripe_sectors(rbio) ||
+	      (!READ_ONCE(rmw_trust_cache) && rbio_stripe_recorded(rbio))))) {
 		/*
 		 * Now we're doing sub-stripe write, also need all data stripes
 		 * to do the full RMW.
@@ -3954,8 +3987,9 @@ out:
 	 *
 	 * Only for a failed write.  Within the tolerance (ret == 0) the
 	 * cached content is what the filesystem was told is on disk and the
-	 * parity matches it; dropping it would make the next RMW trust the
-	 * stale sector of the device that did not take the write.
+	 * parity matches it.  Keeping it is safe because the next RMW into this
+	 * stripe does not use it while the record names the stripe: it reads
+	 * the disks, and so repairs or refuses (see the read decision above).
 	 */
 	if (ret < 0)
 		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);

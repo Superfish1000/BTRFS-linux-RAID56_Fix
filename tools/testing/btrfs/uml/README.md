@@ -70,6 +70,7 @@ the next recorded write:
 | `unprovable.sh` | two arms: does scrub write a rebuild it cannot verify over good data? |
 | `evidence_drop.sh` | eight arms: what the evidence channel does when it cannot keep a stripe -- ring full, stripe too wide, disarmed under a live capture -- plus the bound helper: one `evidence collect` keeps everything, `DISARM_IF_EMPTY` refuses a non-empty ring, a killed reader disarms the channel |
 | `rmw_repair.sh` | six arms: does the next write into a damaged stripe repair it, is a write into an undecidable stripe refused, does the repair queued on the fault put the stripe back with nothing else writing? Each against a control that restores the old behaviour |
+| `rmw_cache.sh` | two arms: does a write served from the stripe cache into a recorded stripe lose the stale column when its own parity write fails? |
 | `stale_read.sh` | two arms: does an ordinary read of an unchecksummed block the record names as stale return the old content? |
 | `early_record.sh` | four arms: RAID6 with one device missing and a column of another stale -- does the mount read its tree roots, and the file, with the record in hand? ro and rw, each against the old behaviour |
 | `recover_scrub.sh` | three arms: does the mount's recovery repair what the record proves, keep what it cannot decide? Checks the platters directly (`nocow_platter.py`) |

@@ -40,7 +40,8 @@ watchdog() {
 		case "$st" in I|"") continue;; esac
 		# A sleeping kernel thread is normal; a sleeping user process
 		# is what a hang with nothing running is made of.
-		[ "$st" = S ] && [ ! -s $d/cmdline ] && continue
+		# (procfs files report size 0, so test the content, not -s.)
+		[ "$st" = S ] && [ -z "$(tr -d '\0' < $d/cmdline 2>/dev/null)" ] && continue
 		echo "WATCHDOG: $st $(cat $d/comm 2>/dev/null) pid ${d#/proc/} wchan $(cat $d/wchan 2>/dev/null) cmd $(tr '\0' ' ' < $d/cmdline 2>/dev/null | cut -c1-80)"
 		sed 's/^/WATCHDOG:   /' $d/stack 2>/dev/null | head -20
 	  done
@@ -1592,6 +1593,57 @@ nocow_probe)
 	log "NOCOW_PROBE_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
 	echo $bad > $T/umltest/nocow.bad.${PROBE:-x}.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+rmw_cache)
+	# The stripe-cache path of a read-modify-write.  'B' is written while
+	# its column's device fails writes: accepted within the tolerance, the
+	# column left stale and named, and the full stripe cached with the
+	# believed content.  Then 'C' goes into the next column of the same
+	# vertical stripe while the PARITY device fails writes.  Served from
+	# the cache, that write never reads, so it neither puts 'B' back nor
+	# refuses -- and its parity write failing leaves 'B''s column and the
+	# parity both wrong in the same row.  CONTROL=1 restores that.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	# Keep the repair queued on the fault out of it.
+	echo 600000 > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_rmw_trust_cache ||
+			log "CONTROL_ARM_FAIL"
+		log "stripe cache trusted (control)"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	eval "$L"
+	[ -n "${FO_B:-}" ] || { log "LAYOUT_FAIL"; finish; }
+	dm_error_writes $IDX_B
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_B / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
+	dm_heal $IDX_B
+	dm_error_writes $IDX_P
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_C / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "C acknowledged" || log "C refused"
+	dm_heal $IDX_P
+	sync
+	stats "after writes"
+	echo 3 > /proc/sys/vm/drop_caches
+	got=$(dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none 2>/dev/null |
+	      tr -cd 'B' | wc -c)
+	umount $MNT || log "UMOUNT_FAIL"
+	plat=$(dd if=$DEV_B bs=4096 skip=$((PHYS_B / 4096)) count=1 status=none 2>/dev/null |
+	       tr -cd 'B' | wc -c)
+	log "RMW_CACHE b_read=$got b_platter=$plat"
+	echo "$got $plat" > $T/umltest/rmw.cache.$TAG
+	dmsetup remove_all 2>/dev/null
 	finish
 	;;
 rmw_write)
