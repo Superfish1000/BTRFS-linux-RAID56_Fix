@@ -1809,7 +1809,10 @@ repair_pin)
 	kmsg "still recorded in flight|holding|raid56:" 6
 	log "REPAIR_PIN held=$held new_intact=$ok csum_failed=$cf corruption_errs=$ce parity_mismatch=$pm"
 	echo "$held $ok $(( cf + ce + pm ))" > $T/umltest/repair.pin.$TAG
+	# The unpinned control has hung here: say where if it does again.
+	watchdog 120
 	umount $MNT || log "UMOUNT_FAIL"
+	log "unmounted"
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
