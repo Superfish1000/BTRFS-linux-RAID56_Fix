@@ -3603,6 +3603,19 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 		goto fail_tree_roots;
 	}
 
+	/*
+	 * Read the RAID56 write-intent log now, before the tree roots: it
+	 * lives at fixed device offsets and needs only the device list, and a
+	 * read of a tree block may need what it says about which columns are
+	 * stale (see consult_pending in raid56-wib.h).
+	 */
+	ret = btrfs_wib_load(fs_info);
+	if (ret) {
+		btrfs_err(fs_info, "failed to read raid56 write-intent log: %pe",
+			  ERR_PTR(ret));
+		goto fail_tree_roots;
+	}
+
 	ret = init_tree_roots(fs_info);
 	if (ret)
 		goto fail_tree_roots;
@@ -3721,19 +3734,12 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	}
 
 	/*
-	 * Read the RAID56 write-intent log and, if anything is going to be
-	 * written (a writable mount, or a tree log replay which writes even
-	 * on a read-only mount), recover the full stripes that had a write
-	 * in flight at the last unclean shutdown and start the log.  This
-	 * must happen before anything else writes to the filesystem (log
-	 * replay, orphan cleanup, relocation recovery, ...).
+	 * If anything is going to be written (a writable mount, or a tree log
+	 * replay which writes even on a read-only mount), recover the full
+	 * stripes the RAID56 write-intent log (read above) records and start
+	 * the log.  This must happen before anything else writes to the
+	 * filesystem (log replay, orphan cleanup, relocation recovery, ...).
 	 */
-	ret = btrfs_wib_load(fs_info);
-	if (ret) {
-		btrfs_err(fs_info, "failed to read raid56 write-intent log: %pe",
-			  ERR_PTR(ret));
-		goto fail_sysfs;
-	}
 	log_replay = btrfs_super_log_root(disk_super) != 0 &&
 		     !btrfs_test_opt(fs_info, NOLOGREPLAY);
 	if (!sb_rdonly(sb) || log_replay) {

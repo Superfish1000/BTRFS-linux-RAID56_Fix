@@ -104,6 +104,7 @@
 #include <linux/file.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
+#include <linux/bsearch.h>
 #include <linux/mm.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/mm.h>
@@ -118,6 +119,18 @@
 #include "disk-io.h"
 #include "accessors.h"
 #include "zoned.h"
+
+/*
+ * Do not consult the record read off the disk until a read-write recovery
+ * takes it over, as before it was consulted from the first read at mount.
+ * The negative control for tools/testing/btrfs/uml/early_record.sh.
+ */
+static bool btrfs_raid56_no_early_record;
+#ifdef CONFIG_BTRFS_DEBUG
+module_param_named(raid56_no_early_record, btrfs_raid56_no_early_record, bool, 0644);
+MODULE_PARM_DESC(raid56_no_early_record,
+		 "Ignore the write-intent record read at mount until recovery runs (testing only: restores the old behaviour)");
+#endif
 
 #ifdef CONFIG_BTRFS_DEBUG
 /*
@@ -178,6 +191,28 @@ u64 btrfs_wib_range_mask(u64 bytenr, u64 logical, u64 len)
 static bool wib_entry_used(const struct btrfs_wib_entry *e)
 {
 	return (e->bitmap | e->sticky) != 0;
+}
+
+/*
+ * Set @e->stale_par, keeping wib->nr_stale in step.  Caller holds wib->lock.
+ *
+ * nr_stale gates every staleness query on a lock-free "nothing is recorded"
+ * fast path, and it used to count only stale DATA.  A stripe whose only
+ * record was a parity that did not describe the data was then invisible to
+ * all of them: a degraded read rebuilt a missing column out of that parity,
+ * and for a sector with no checksum returned the result as the file's
+ * content.  Counting the parity marks too costs only the slow path while one
+ * exists, which is what that fast path was always meant to trade.
+ */
+static void wib_set_stale_par(struct btrfs_wib *wib, struct btrfs_wib_entry *e,
+			      u64 val)
+{
+	const int delta = hweight64(val) - hweight64(e->stale_par);
+
+	lockdep_assert_held(&wib->lock);
+	if (delta)
+		atomic_add(delta, &wib->nr_stale);
+	e->stale_par = val;
 }
 
 static struct btrfs_wib_entry *wib_find_entry(struct btrfs_wib *wib, u64 bytenr)
@@ -294,7 +329,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 				atomic_sub(hweight64(e->stale), &wib->nr_stale);
 				e->stale = 0;
 			}
-			e->stale_par = 0;
+			wib_set_stale_par(wib, e, 0);
 			e->gen = 0;
 			return e;
 		}
@@ -365,7 +400,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 			atomic_sub(hweight64(free->stale), &wib->nr_stale);
 			free->stale = 0;
 		}
-		free->stale_par = 0;
+		wib_set_stale_par(wib, free, 0);
 		free->gen = 0;
 	}
 	return free;
@@ -1140,7 +1175,7 @@ static void wib_readd_dropped(struct btrfs_wib *wib)
 			const u64 add = (old.stale & e->sticky) & ~e->stale;
 
 			e->stale |= add;
-			e->stale_par |= old.stale_par;
+			wib_set_stale_par(wib, e, e->stale_par | old.stale_par);
 			if (add)
 				atomic_add(hweight64(add), &wib->nr_stale);
 		}
@@ -1613,12 +1648,44 @@ void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
 	if (e) {
 		mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
 		if (stale)
-			e->stale_par |= mask;
+			wib_set_stale_par(wib, e, e->stale_par | mask);
 		else
-			e->stale_par &= ~mask;
+			wib_set_stale_par(wib, e, e->stale_par & ~mask);
 	}
 	if (stale)
 		wib_enforce_capacity_locked(wib);
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+static int wib_pending_cmp(const void *a, const void *b);
+
+/* The pending entry for @bytenr while it is being consulted, see consult_pending. */
+static const struct btrfs_wib_entry *wib_find_pending(struct btrfs_wib *wib, u64 bytenr)
+{
+	const struct btrfs_wib_entry key = { .bytenr = bytenr };
+
+	lockdep_assert_held(&wib->lock);
+	if (!wib->consult_pending)
+		return NULL;
+	return bsearch(&key, wib->pending, wib->nr_pending, sizeof(key),
+		       wib_pending_cmp);
+}
+
+/*
+ * Stop answering from @pending: the recovery is about to take the record over
+ * into the live table, stripe by stripe, deciding for each what it still
+ * means.  Idempotent.
+ */
+static void wib_stop_consulting_pending(struct btrfs_wib *wib)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	if (wib->consult_pending) {
+		wib->consult_pending = false;
+		atomic_sub(wib->nr_pending_stale, &wib->nr_stale);
+		wib->nr_pending_stale = 0;
+	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 }
 
@@ -1666,17 +1733,28 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 				    ((u64)i << BTRFS_WIB_BLOCK_SHIFT);
 		const u64 cur = wib_entry_bytenr(logical);
 		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
-		u64 mask;
+		const struct btrfs_wib_entry *pe = wib_find_pending(wib, cur);
+		const u64 mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
+		u64 stale = 0, stale_par = 0, any = 0, gen = 0;
 
-		if (!e)
-			continue;
-		mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
-		if (e->stale & mask)
+		if (e) {
+			stale |= e->stale;
+			stale_par |= e->stale_par;
+			any |= e->stale | e->stale_par | e->sticky;
+			gen = e->gen;
+		}
+		if (pe) {
+			stale |= pe->stale;
+			stale_par |= pe->stale_par;
+			any |= pe->stale | pe->stale_par | pe->sticky;
+			gen = max(gen, pe->gen);
+		}
+		if (stale & mask)
 			st->stale_cols |= BIT_ULL(i);
-		if (i < nr_parity && (e->stale_par & mask))
+		if (i < nr_parity && (stale_par & mask))
 			st->bad_parity |= BIT(i);
-		if ((e->stale | e->stale_par | e->sticky) & mask)
-			st->gen = max(st->gen, e->gen);
+		if (any & mask)
+			st->gen = max(st->gen, gen);
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return st->stale_cols || st->bad_parity;
@@ -1707,9 +1785,10 @@ enum btrfs_wib_stripe_error btrfs_wib_stripe_error(struct btrfs_fs_info *fs_info
 				    ((u64)i << BTRFS_WIB_BLOCK_SHIFT);
 		const u64 cur = wib_entry_bytenr(logical);
 		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const struct btrfs_wib_entry *pe = wib_find_pending(wib, cur);
+		const u64 sticky = (e ? e->sticky : 0) | (pe ? pe->sticky : 0);
 
-		if (e && (e->sticky &
-			  btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE)))
+		if (sticky & btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE))
 			nr++;
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
@@ -1724,7 +1803,9 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 cur = wib_entry_bytenr(logical);
 	struct btrfs_wib_entry *e;
+	const struct btrfs_wib_entry *pe;
 	bool stale = false;
+	u64 mask;
 
 	if (!wib)
 		return false;
@@ -1740,16 +1821,23 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	}
 	atomic64_inc(&wib->stat_stale_slow);
 
+	/*
+	 * The block containing @logical and no other: @logical need not be
+	 * block aligned (a read asks about each 4KiB sector), and a 64KiB
+	 * range starting mid-block would also take in the NEXT block's bit.
+	 */
+	mask = btrfs_wib_range_mask(cur, round_down(logical, BTRFS_WIB_BLOCK_SIZE),
+				    BTRFS_WIB_BLOCK_SIZE);
 	spin_lock_irqsave(&wib->lock, flags);
 	e = wib_find_entry(wib, cur);
 	if (e)
-		stale = e->stale &
-			btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
+		stale = e->stale & mask;
+	pe = wib_find_pending(wib, cur);
+	if (pe)
+		stale |= pe->stale & mask;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return stale;
 }
-
-static int wib_pending_cmp(const void *a, const void *b);
 
 /*
  * Copy the regions the log holds a fault record for into @out, lowest address
@@ -1819,7 +1907,8 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * conservative rather than dangerous, but wrong, and it does
 		 * not clear itself.
 		 */
-		e->stale_par &= ~btrfs_wib_range_mask(cur, logical, len);
+		wib_set_stale_par(wib, e, e->stale_par &
+				  ~btrfs_wib_range_mask(cur, logical, len));
 		if (!wib_entry_used(e))
 			freed = true;
 	}
@@ -2319,7 +2408,7 @@ void btrfs_wib_forget_range(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
 			e->stale &= ~mask;
 		}
-		e->stale_par &= ~mask;
+		wib_set_stale_par(wib, e, e->stale_par & ~mask);
 		if (!wib_entry_used(e)) {
 			e->gen = 0;
 			freed = true;
@@ -2804,7 +2893,8 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 
 	if (!wib)
 		return 0;
-	if (btrfs_is_zoned(fs_info))
+	/* Called before the zoned mode is set up, so ask the superblock too. */
+	if (btrfs_is_zoned(fs_info) || btrfs_fs_incompat(fs_info, ZONED))
 		return 0;
 
 	buf = (void *)get_zeroed_page(GFP_KERNEL);
@@ -2883,6 +2973,32 @@ out:
 	/* Continue the sequence. */
 	wib->seq = max_seq;
 	wib->snap_seq = max_seq;
+
+	/*
+	 * Answer reads from the record from here on, not only once a
+	 * read-write recovery has run.  The tree roots are read right after
+	 * this, and on a RAID6 with one device missing and a column of another
+	 * left stale, those reads are two erasures if the record is consulted
+	 * and an erasure plus an unlocated error -- beyond RAID6 -- if not: the
+	 * mount failed on a filesystem that had everything it needed.  A
+	 * read-only mount never runs the recovery at all, so without this it
+	 * never consulted the record for anything.
+	 */
+	if (!READ_ONCE(btrfs_raid56_no_early_record)) {
+		unsigned int nr = 0;
+		unsigned long flags;
+
+		for (unsigned int i = 0; i < wib->nr_pending; i++)
+			nr += hweight64(wib->pending[i].stale) +
+			      hweight64(wib->pending[i].stale_par);
+		if (nr) {
+			spin_lock_irqsave(&wib->lock, flags);
+			wib->consult_pending = true;
+			wib->nr_pending_stale = nr;
+			atomic_add(nr, &wib->nr_stale);
+			spin_unlock_irqrestore(&wib->lock, flags);
+		}
+	}
 
 	if (wib->nr_pending) {
 		unsigned int nr_blocks = 0;
@@ -3141,7 +3257,11 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	u64 last_len = 0;
 	int ret;
 
-	if (!wib || !wib->nr_pending)
+	if (!wib)
+		return 0;
+	/* From here the live table is the record; see consult_pending. */
+	wib_stop_consulting_pending(wib);
+	if (!wib->nr_pending)
 		return 0;
 
 	/* One scrub context and workqueue for the whole pass, not one each. */

@@ -838,11 +838,18 @@ bool btrfs_raid56_scrub_trusts_rebuild(void);
  * line was dropped".
  */
 bool btrfs_raid56_trace_reads(void);
+/*
+ * Return an unchecksummed block the write-intent record names as stale as it
+ * is on disk, as reads did before they consulted the record.  The negative
+ * control for that -- see btrfs_check_read_bio().
+ */
+bool btrfs_raid56_read_ignores_stale(void);
 #else
 static inline bool btrfs_raid56_allow_nodatacow(void) { return false; }
 static inline bool btrfs_raid56_stale_read_legacy(void) { return false; }
 static inline bool btrfs_raid56_scrub_trusts_rebuild(void) { return false; }
 static inline bool btrfs_raid56_trace_reads(void) { return false; }
+static inline bool btrfs_raid56_read_ignores_stale(void) { return false; }
 #endif
 
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,

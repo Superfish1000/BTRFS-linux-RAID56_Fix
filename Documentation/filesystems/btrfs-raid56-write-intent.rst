@@ -378,6 +378,42 @@ Older kernel                              Mounts read-only (compat_ro flag).
 Degraded before the crash                 Documented limit: detected, not silent (see above).
 ========================================  ========================================================
 
+Reading with the record
+=======================
+
+A column the record names stale holds the old content on its device while the
+parity holds what was acknowledged.  For a block with a checksum that is
+harmless -- the checksum fails and the read is repaired -- but a block with no
+checksum has nothing to fail, so every read path has to consult the record
+itself:
+
+* a read that goes through the RAID5/6 rebuild (a missing device, a failed
+  checksum, a read-modify-write) marks the named columns failed before
+  rebuilding, but only when the rebuild still fits the parity that is left
+  (``mark_stale_sectors()``).  Every sector of a named column is marked, even
+  when one of them had already failed for another reason: counting the column
+  as failed but marking only that one sector used to send the column's other
+  vertical stripes to a single-parity rebuild that folded the stale content
+  in;
+* an ordinary read of an unchecksummed block that the record names is treated
+  as a failed checksum (``btrfs_check_read_bio()``), so it is read again through
+  the rebuild above.  Before this, such a read returned the old content as the
+  file's, silently, with the record naming it on disk the whole time
+  (``tools/testing/btrfs/uml/stale_read.sh``);
+* the record read off the disk at mount is consulted from the first read on
+  (``consult_pending`` in ``raid56-wib.h``), not only once a read-write
+  recovery has taken it over.  It used to be read after the tree roots and
+  ignored until the recovery, so a RAID6 with one device missing and a column
+  of another left stale -- two erasures with the record, an erasure plus an
+  unlocated error without it -- failed to mount, and a read-only mount never
+  consulted it at all (``tools/testing/btrfs/uml/early_record.sh``).
+
+All of them sit behind one lock-free check that anything at all is recorded
+stale, and that check counts a parity recorded as not describing the data as
+well as a stale data column.  It used to count only the data, so a stripe whose
+only record was a bad parity was invisible to every reader, and a degraded read
+of an unchecksummed block rebuilt it out of that parity.
+
 What retires a record
 =====================
 

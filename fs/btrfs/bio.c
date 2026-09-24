@@ -15,6 +15,7 @@
 #include "zoned.h"
 #include "file-item.h"
 #include "raid-stripe-tree.h"
+#include "raid56-wib.h"
 
 static struct bio_set btrfs_bioset;
 static struct bio_set btrfs_clone_bioset;
@@ -520,8 +521,27 @@ static void btrfs_check_read_bio(struct btrfs_bio *bbio, struct btrfs_device *de
 		offset += step;
 
 		if (IS_ALIGNED(offset, sectorsize)) {
-			bool csum_ok = !status &&
-				btrfs_data_csum_ok(bbio, dev, offset - sectorsize, paddrs);
+			const enum btrfs_csum_result res = status ? BTRFS_CSUM_MISMATCH :
+				btrfs_data_csum_check(bbio, dev, offset - sectorsize, paddrs);
+			bool csum_ok = res != BTRFS_CSUM_MISMATCH;
+
+			/*
+			 * Nothing to check this block against, but the RAID5/6
+			 * write-intent record says its last write never reached
+			 * the disk: what was just read is the old content, and
+			 * the acknowledged value is in the parity.  Treat it as
+			 * a failed checksum, so the repair reads it back through
+			 * a rebuild -- which consults the same record and only
+			 * rebuilds when the parity left can (mark_stale_sectors()).
+			 * A block with a checksum is left to its checksum, which
+			 * is the stronger evidence.
+			 */
+			if (res == BTRFS_CSUM_NONE &&
+			    unlikely(btrfs_wib_any_stale(fs_info)) &&
+			    !btrfs_raid56_read_ignores_stale() &&
+			    btrfs_wib_stale(fs_info, round_down(iter->bi_sector << SECTOR_SHIFT,
+								 sectorsize)))
+				csum_ok = false;
 
 			if (unlikely(btrfs_raid56_trace_reads()))
 				btrfs_info(fs_info,

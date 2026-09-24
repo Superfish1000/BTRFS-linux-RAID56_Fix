@@ -1109,6 +1109,10 @@ nocow_two_stale)
 	# nor the new, are the defect.  Either value is acceptable -- which one
 	# depends on whether that stripe's write was refused or acknowledged,
 	# and the point is that neither is garbage.
+	#
+	# The legacy arm has hung twice with nothing on the console after
+	# mkfs; dump the blocked tasks well before the host gives up on it.
+	watchdog ${WATCH:-600}
 	dm_setup
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
@@ -1603,6 +1607,14 @@ rmw_write)
 	stats "after writes"
 	kmsg "refusing a write|raid56:" 4
 	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
+runscript)
+	# Diagnostics: run $T/umltest/guest-script.$TAG inside the guest, with
+	# the helpers above available, and log its output.
+	btrfs device scan >/dev/null 2>&1
+	[ -f $T/umltest/guest-script.$TAG ] && . $T/umltest/guest-script.$TAG 2>&1 |
+		while read -r l; do log "script: $l"; done
 	finish
 	;;
 nocow_platter)

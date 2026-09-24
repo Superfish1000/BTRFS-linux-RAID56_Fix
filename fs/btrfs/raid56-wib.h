@@ -359,6 +359,16 @@ struct btrfs_wib {
 	struct btrfs_wib_entry *pending;
 	unsigned int nr_pending;
 	unsigned int max_pending;
+	/*
+	 * Until the first read-write recovery takes the record over, the stale
+	 * marks read off the disk exist only in @pending, and every read before
+	 * that -- the tree roots at mount, everything on a read-only mount --
+	 * would be answered as if they did not exist.  While this is set the
+	 * staleness queries look in @pending as well, and @nr_pending_stale of
+	 * wib->nr_stale is theirs.  Protected by wib->lock.
+	 */
+	bool consult_pending;
+	unsigned int nr_pending_stale;
 
 	/* Statistics, exported through sysfs. */
 	/*

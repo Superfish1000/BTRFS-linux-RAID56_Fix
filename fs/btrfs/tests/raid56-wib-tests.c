@@ -981,6 +981,46 @@ static int test_evict_precedence(struct btrfs_fs_info *fs_info)
  * the NEW chunk is stale and rebuild it from a parity that was describing it
  * correctly -- the record meant to prevent a misrepair causes one.
  */
+/*
+ * A stripe whose only record is a parity that does not describe the data must
+ * still be visible to the staleness queries.  They all start with a lock-free
+ * "nothing is recorded stale" check, which used to count only stale data: a
+ * parity-only record left it at zero, so a degraded read rebuilt from that
+ * parity without knowing it was wrong.
+ */
+static int test_stale_parity_only(struct btrfs_fs_info *fs_info)
+{
+	const u64 stripe = 940ULL * BTRFS_WIB_ENTRY_SIZE;
+	struct btrfs_wib_stripe_state st;
+
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("something was already recorded stale before the parity test");
+		return -EINVAL;
+	}
+	btrfs_wib_add_sticky(fs_info, stripe, 3 * BTRFS_WIB_BLOCK_SIZE);
+	btrfs_wib_update_stale_parity(fs_info, stripe, 0, true);
+	if (!btrfs_wib_any_stale(fs_info)) {
+		test_err("a parity-only record is invisible to the lock-free check");
+		return -EINVAL;
+	}
+	if (!btrfs_wib_stripe_state(fs_info, stripe, 3, 1, &st) || st.bad_parity != 1) {
+		test_err("a parity-only record did not reach the stripe state");
+		return -EINVAL;
+	}
+	btrfs_wib_update_stale_parity(fs_info, stripe, 0, false);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("clearing the parity record left the stale count up");
+		return -EINVAL;
+	}
+	btrfs_wib_update_stale_parity(fs_info, stripe, 0, true);
+	btrfs_wib_clear_sticky(fs_info, stripe, 3 * BTRFS_WIB_BLOCK_SIZE);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("retiring the record left the parity counted stale");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int test_forget_range(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
@@ -1180,6 +1220,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_evict_precedence(fs_info);
+	if (ret)
+		goto out;
+	ret = test_stale_parity_only(fs_info);
 	if (ret)
 		goto out;
 	ret = test_forget_range(fs_info);

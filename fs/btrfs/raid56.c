@@ -1975,7 +1975,7 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 	const int nr_parity = rbio->real_stripes - rbio->nr_data;
 	struct btrfs_wib_stripe_state st;
-	u64 failed = 0, add = 0;
+	u64 failed = 0, add = 0, want = 0;
 	int nr_failed = 0;
 
 	/*
@@ -2037,13 +2037,30 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 		}
 	}
 
+	/*
+	 * @want is every member the record names; @add is the part of it not
+	 * already counted as failed, which is what the budget has to find room
+	 * for.  But mark all of @want, not just @add.  A column counts as failed
+	 * here as soon as ANY of its sectors has an error bit -- a read of one
+	 * of its sectors, a checksum mismatch -- and its other sectors are
+	 * exactly as stale as before.  Leaving them unmarked sent every other
+	 * vertical stripe of the column to a single-parity rebuild that folded
+	 * the stale sector in: on RAID6 the Q cross-check then failed the whole
+	 * read, on RAID5 it returned a value nothing committed.
+	 */
 	for (int i = 0; i < rbio->nr_data; i++)
-		if ((st.stale_cols & BIT_ULL(i)) && !(failed & BIT_ULL(i)))
-			add |= BIT_ULL(i);
+		if (st.stale_cols & BIT_ULL(i))
+			want |= BIT_ULL(i);
 	for (int p = 0; p < nr_parity; p++)
-		if ((st.bad_parity & BIT(p)) &&
-		    !(failed & BIT_ULL(rbio->nr_data + p)))
-			add |= BIT_ULL(rbio->nr_data + p);
+		if (st.bad_parity & BIT(p))
+			want |= BIT_ULL(rbio->nr_data + p);
+	add = want & ~failed;
+
+	if (unlikely(btrfs_raid56_trace_reads()))
+		btrfs_info(fs_info,
+"raid56: RTRACE stale full stripe %llu op %d failed 0x%llx stale 0x%llx bad_parity 0x%x add 0x%llx",
+			   rbio->bioc->full_stripe_logical, rbio->operation, failed,
+			   st.stale_cols, st.bad_parity, add);
 
 	/*
 	 * The log names more members than the surviving parity can rebuild.
@@ -2071,7 +2088,7 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 	for (int i = 0; i < rbio->real_stripes; i++) {
 		const int first = i * rbio->stripe_nsectors;
 
-		if (!(add & BIT_ULL(i)))
+		if (!(want & BIT_ULL(i)))
 			continue;
 		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
 			/*
@@ -3410,6 +3427,17 @@ static bool trace_reads;
 module_param_named(raid56_trace_reads, trace_reads, bool, 0644);
 MODULE_PARM_DESC(raid56_trace_reads,
 		 "Log every data sector a RAID5/6 read returns, and what checked it (testing only)");
+
+#ifdef CONFIG_BTRFS_DEBUG
+static bool read_ignores_stale;
+module_param_named(raid56_read_ignores_stale, read_ignores_stale, bool, 0644);
+MODULE_PARM_DESC(raid56_read_ignores_stale,
+		 "Return a block the write-intent record names as stale as it is on disk when it has no checksum (testing only: restores the old behaviour)");
+bool btrfs_raid56_read_ignores_stale(void)
+{
+	return READ_ONCE(read_ignores_stale);
+}
+#endif
 
 bool btrfs_raid56_trace_reads(void)
 {
