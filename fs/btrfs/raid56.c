@@ -3633,8 +3633,9 @@ module_param_named(raid56_repair_no_pin, repair_no_pin, bool, 0644);
 MODULE_PARM_DESC(raid56_repair_no_pin,
 		 "Neither freeze the block group under a repair nor drain repairs in relocation (testing only: restores a known defect)");
 /*
- * Hold a repair this long between its log mark and its writes, so a test can
- * relocate and reuse the space under it.  See uml/repair_pin.sh.
+ * Hold the next repair this long between deciding what to write and writing
+ * it, so a test can relocate and reuse the space under it.  One-shot.  See
+ * uml/repair_pin.sh.
  */
 static unsigned int repair_hold_ms;
 module_param_named(raid56_repair_hold_ms, repair_hold_ms, uint, 0644);
@@ -4147,12 +4148,24 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 #endif
 	}
 
+#ifdef CONFIG_BTRFS_DEBUG
+	/*
+	 * Testing: hold ONE repair here, after it has read the stripe, decided
+	 * what to write and marked the log, and before it writes.  One: every
+	 * held rbio keeps an rmw worker asleep, and holding them all would
+	 * stall every other write on the pool, which is a different test.
+	 */
 	if (unlikely(READ_ONCE(repair_hold_ms)) &&
 	    test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
-		btrfs_info(fs_info, "raid56: repair of full stripe %llu holding for %u ms",
-			   full_stripe_start, READ_ONCE(repair_hold_ms));
-		msleep(READ_ONCE(repair_hold_ms));
+		const unsigned int hold = xchg(&repair_hold_ms, 0);
+
+		if (hold) {
+			btrfs_info(fs_info, "raid56: repair of full stripe %llu holding for %u ms",
+				   full_stripe_start, hold);
+			msleep(hold);
+		}
 	}
+#endif
 
 	bitmap_clear(rbio->error_bitmap, 0, rbio->nr_sectors);
 

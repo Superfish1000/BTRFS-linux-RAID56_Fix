@@ -999,11 +999,12 @@ nocow_rmw)
 	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock
 	sync
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0
+	acked=0; rm -f $T/umltest/nocow.acked.$TAG
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
 		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_FS_BLOCKS)) count=1 \
-		   conv=notrunc,fsync status=none 2>/dev/null && acked=$((acked+1))
+		   conv=notrunc,fsync status=none 2>/dev/null &&
+			{ acked=$((acked+1)); echo $i >> $T/umltest/nocow.acked.$TAG; }
 	done
 	sync
 	log "pass1 (device failing): $acked of $NOCOW_BLOCKS acknowledged"
@@ -1047,11 +1048,21 @@ nocow_rmw_probe)
 	# Read pass 1's blocks with the failing device omitted, so every one of
 	# them must come from the parity.
 	do_mount ro,degraded $MNTDEV
+	# Same rules as nocow_bad(): an acknowledged block must read back as
+	# 'B' (all 4096 bytes -- a failed read has none), a refused one as its
+	# old 'A' or its new 'B'.
 	bad=0
+	list=" $(tr '\n' ' ' < $T/umltest/nocow.acked.$TAG 2>/dev/null) "
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		got=$(dd if=$MNT/nocow bs=4096 skip=$((i * NOCOW_FS_BLOCKS)) count=1 \
-		      status=none 2>/dev/null | tr -d 'B' | wc -c)
-		[ "$got" = 0 ] || bad=$((bad+1))
+		      status=none 2>/dev/null | tr -cd 'B' | wc -c)
+		[ "$got" = 4096 ] && continue
+		case "$list" in *" $i "*) ;; *)
+			got=$(dd if=$MNT/nocow bs=4096 skip=$((i * NOCOW_FS_BLOCKS)) count=1 \
+			      status=none 2>/dev/null | tr -cd 'A' | wc -c)
+			[ "$got" = 4096 ] && continue;;
+		esac
+		bad=$((bad+1))
 	done
 	log "NOCOW_RMW bad=$bad of $NOCOW_BLOCKS"
 	echo $bad > $T/umltest/nocow.rmw.$TAG
