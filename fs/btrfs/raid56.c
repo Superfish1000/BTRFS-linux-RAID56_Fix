@@ -3703,6 +3703,9 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	struct btrfs_block_group *bg;
 	struct btrfs_raid_bio *rbio;
 	u64 length = BTRFS_STRIPE_LEN;
+	/* Read once: the control below must count and uncount consistently. */
+	const bool unpinned = READ_ONCE(repair_no_pin);
+	bool counted = false;
 	bool busy;
 	int ret;
 
@@ -3715,8 +3718,10 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	 * (btrfs_raid56_drain_repairs()), and a repair counted only after
 	 * passing the read-only test could slip between the two.
 	 */
-	if (!READ_ONCE(repair_no_pin))
+	if (!unpinned) {
 		atomic_inc(&wib->repairs_inflight);
+		counted = true;
+	}
 	/*
 	 * A block group that is read-only belongs to a scrub, a balance or a
 	 * replace, each of which rewrites this stripe its own way; leave it to
@@ -3732,7 +3737,7 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	spin_lock(&bg->lock);
 	busy = bg->ro || !(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) ||
 	       test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags);
-	if (!busy && !READ_ONCE(repair_no_pin))
+	if (!busy && !unpinned)
 		btrfs_freeze_block_group(bg);
 	spin_unlock(&bg->lock);
 	if (busy) {
@@ -3740,11 +3745,12 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 		atomic64_inc(&wib->stat_repair_skipped);
 		goto out_inflight;
 	}
-	if (READ_ONCE(repair_no_pin)) {
+	if (unpinned) {
 		/* The control: counted late, nothing frozen. */
 		btrfs_put_block_group(bg);
 		bg = NULL;
 		atomic_inc(&wib->repairs_inflight);
+		counted = true;
 	}
 
 	btrfs_bio_counter_inc_blocked(fs_info);
@@ -3779,7 +3785,14 @@ out_counter:
 		btrfs_put_block_group(bg);
 	}
 out_inflight:
-	if (atomic_dec_and_test(&wib->repairs_inflight))
+	/*
+	 * Only a count this call took.  The control leaves through here
+	 * before it has counted itself -- for instance for every queued
+	 * stripe of a chunk that has just been removed -- and dropping a count
+	 * it never took would leave the total below zero, and unmount waiting
+	 * in btrfs_raid56_stop_repairs() for a zero it can never reach.
+	 */
+	if (counted && atomic_dec_and_test(&wib->repairs_inflight))
 		wake_up_all(&wib->wait);
 }
 
