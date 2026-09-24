@@ -420,6 +420,15 @@ struct btrfs_wib_stripe_state {
 	u64 gen;
 };
 
+enum btrfs_wib_stripe_error {
+	BTRFS_WIB_STRIPE_NO_ERROR,
+	/* Some data blocks of the full stripe carry an error record, not all. */
+	BTRFS_WIB_STRIPE_PARTIAL_ERROR,
+	BTRFS_WIB_STRIPE_ERROR,
+};
+
+enum btrfs_wib_stripe_error btrfs_wib_stripe_error(struct btrfs_fs_info *fs_info,
+						   u64 full_stripe_start, int nr_data);
 bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
 			    int nr_data, int nr_parity,
 			    struct btrfs_wib_stripe_state *st);

@@ -69,7 +69,12 @@ arm() {	# tag-suffix nopersist fakebadpar -> echoes "<bad>"
 
 	boot nocow_persist_prep  none /dev/mapper/d0 "NOPERSIST=$nopersist FAKEBADPAR=$fakebadpar"
 	# Only the ambiguous arm reaches the verdict that captures evidence.
-	boot nocow_persist_scrub none /dev/mapper/d0 "EVIDENCE=$fakebadpar"
+	#
+	# The mount's own recovery now repairs from the record exactly as the
+	# scrub would (recover_scrub.sh tests that), and would leave this scrub
+	# nothing to do.  Keep it to verifying, as it used to, so the record
+	# reaches the scrub this script is about.
+	boot nocow_persist_scrub none /dev/mapper/d0 "EVIDENCE=$fakebadpar btrfs.raid56_recover_legacy=1"
 	boot nocow_probe "$FAIL" $MNTPROBE PROBE=after
 	cat $T/umltest/nocow.bad.after.$tag 2>/dev/null || echo "?"
 }

@@ -113,17 +113,29 @@ data and the log tree blocks themselves): they are not in the extent tree
 until the log has been replayed, and a crash in the middle of a RMW to the
 same vertical stripe leaves them without valid parity otherwise.
 
-For an error record only verified sectors are trusted.  While a tree log is
-still to be replayed (so that extents may be hidden from the verification)
-the sectors holding extents are verified and repaired but no parity is
-written at all: the scrub recomputes the parity of a vertical stripe from
-every sector in it, including ones it cannot verify, which could destroy
-the parity an extent hidden in the log still needs.  After the tree log has
-been replayed the remaining error records are scrubbed again with every
-extent visible, their parity regenerated, and they are dropped when the
-stripe is fully consistent.  A stripe with a device missing, or with a
-sector that could not be repaired, stays recorded and is scrubbed again at
-the first mount with the device back or replaced.
+An error record is recovered exactly as a user scrub would repair it
+(``BTRFS_RAID56_RECOVER_SCRUB``): the record is loaded into the live table
+first, since that is what the scrub decides from, and a column it names as
+stale is rebuilt from the parity even where the content has no checksum; a
+stripe the record cannot decide (the columns it names outnumber the usable
+parities, or part of the record was dropped when the log filled up) is
+declined and stays recorded.  The record is retired only when the repair and
+the new parity reached the disk.  Earlier versions only verified error
+records at mount and kept every one of them, which left the stripe without
+redundancy until someone ran a scrub, even though the same record was enough
+to repair it (``tools/testing/btrfs/uml/recover_scrub.sh``; the old behaviour
+is ``btrfs.raid56_recover_legacy=1`` on debug kernels, its negative control).
+
+While a tree log is still to be replayed (so that extents may be hidden
+from the verification) error records are only verified: the sectors holding
+extents are verified and repaired but no parity is written at all, since the
+scrub recomputes the parity of a vertical stripe from every sector in it,
+including ones it cannot verify, which could destroy the parity an extent
+hidden in the log still needs.  After the tree log has been replayed the
+remaining error records are recovered as above, with every extent visible.
+A stripe with a device missing, or with a sector that could not be repaired,
+stays recorded and is scrubbed again at the first mount with the device back
+or replaced.
 
 Scrubbing a consistent stripe is a no-op, so stale entries (from an old
 device that re-joined the filesystem, or from the older of the two blocks)

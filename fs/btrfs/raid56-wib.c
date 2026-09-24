@@ -1682,6 +1682,42 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 	return st->stale_cols || st->bad_parity;
 }
 
+/*
+ * Does the log hold an error record for the full stripe at @full_stripe_start,
+ * over all of its @nr_data blocks or only some?
+ *
+ * The record is set over whole full stripes, so a partial answer means part
+ * of it was lost -- a stripe straddling two regions, one of which the log
+ * dropped when it filled up.  Whatever the lost part knew about which side is
+ * wrong is gone with it.
+ */
+enum btrfs_wib_stripe_error btrfs_wib_stripe_error(struct btrfs_fs_info *fs_info,
+						   u64 full_stripe_start, int nr_data)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	int nr = 0;
+
+	if (!wib)
+		return BTRFS_WIB_STRIPE_NO_ERROR;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < nr_data; i++) {
+		const u64 logical = full_stripe_start +
+				    ((u64)i << BTRFS_WIB_BLOCK_SHIFT);
+		const u64 cur = wib_entry_bytenr(logical);
+		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+
+		if (e && (e->sticky &
+			  btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE)))
+			nr++;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (nr == 0)
+		return BTRFS_WIB_STRIPE_NO_ERROR;
+	return nr == nr_data ? BTRFS_WIB_STRIPE_ERROR : BTRFS_WIB_STRIPE_PARTIAL_ERROR;
+}
+
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 {
 	unsigned long flags;
@@ -2907,6 +2943,21 @@ static void wib_readd_stale(struct btrfs_fs_info *fs_info, u64 start, u64 len)
 								BTRFS_WIB_BLOCK_SIZE))
 				btrfs_wib_update_stale_parity(fs_info, start, p, true);
 		}
+		/*
+		 * And when it was made: re-adding it stamped the live entry
+		 * with this mount's generation, which is not when the write
+		 * failed.
+		 */
+		if (e->sticky & mask) {
+			unsigned long flags;
+			struct btrfs_wib_entry *live;
+
+			spin_lock_irqsave(&wib->lock, flags);
+			live = wib_find_entry(wib, e->bytenr);
+			if (live && e->gen)
+				live->gen = e->gen;
+			spin_unlock_irqrestore(&wib->lock, flags);
+		}
 	}
 }
 
@@ -2918,16 +2969,16 @@ struct wib_recovery_stats {
 };
 
 /*
- * Scrub the full stripe containing @logical.
- *
- * @trusted: the sectors that cannot be verified are what was last written
- * to them, so the parity of every vertical stripe may be recomputed from
- * the data on disk.  Otherwise only verified data is used.
+ * Scrub the full stripe containing @logical, in @mode (see
+ * enum btrfs_raid56_recover_mode).
  *
  * Return 0 if the stripe is consistent again and its record can go, 1 if it
  * must stay recorded, a negative error on a fatal error.  @start and @len
  * receive the full stripe geometry (@len is 0 if there is no such stripe
  * anymore).
+ *
+ * In RECOVER_SCRUB mode the record must already be in the live table (the
+ * scrub decides from it); the caller retires it on 0.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 /*
@@ -2941,8 +2992,26 @@ MODULE_PARM_DESC(raid56_recovery_delay_ms,
 		 "Linger this many ms per recovered full stripe (testing only)");
 #endif
 
+/*
+ * Recover error records the way this code did before it could repair them:
+ * verify the data, write no parity, keep the record.  The negative control for
+ * tools/testing/btrfs/uml/recover_scrub.sh.
+ */
+static bool btrfs_raid56_recover_legacy;
+#ifdef CONFIG_BTRFS_DEBUG
+module_param_named(raid56_recover_legacy, btrfs_raid56_recover_legacy, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_legacy,
+		 "Only verify stripes with a write-failure record at mount, never repair them (testing only)");
+#endif
+
+static enum btrfs_raid56_recover_mode wib_error_mode(void)
+{
+	return READ_ONCE(btrfs_raid56_recover_legacy) ?
+	       BTRFS_RAID56_RECOVER_VERIFY : BTRFS_RAID56_RECOVER_SCRUB;
+}
+
 static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx,
-			   u64 logical, bool trusted,
+			   u64 logical, enum btrfs_raid56_recover_mode mode,
 			   bool log_replay_pending, u64 *start, u64 *len,
 			   struct wib_recovery_stats *st)
 {
@@ -2979,10 +3048,18 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 		}
 	}
 #endif
-	ret = btrfs_scrub_raid56_full_stripe(fs_info, sctx, *start, trusted);
+	ret = btrfs_scrub_raid56_full_stripe(fs_info, sctx, *start, mode);
 	if (ret == -ENOENT) {
 		st->skipped++;
 		return 0;
+	}
+	/* The scrub declined or could not finish; it said why. */
+	if (ret == 3) {
+		btrfs_warn(fs_info,
+	"raid56 write-intent log: full stripe at %llu has a write-failure record that could not be resolved safely now, keeping it recorded",
+			   *start);
+		st->kept++;
+		return 1;
 	}
 	if (ret == -EIO) {
 		btrfs_err(fs_info,
@@ -3034,7 +3111,7 @@ static int wib_recover_one(struct btrfs_fs_info *fs_info, struct scrub_ctx *sctx
 		return 0;
 	}
 	/* Verified what could be, the rest waits for the log replay. */
-	if (!trusted) {
+	if (mode == BTRFS_RAID56_RECOVER_VERIFY) {
 		st->kept++;
 		return 1;
 	}
@@ -3073,7 +3150,8 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 
 		for (unsigned int bit = 0; bit < 64; bit++) {
 			const u64 logical = e->bytenr + ((u64)bit << BTRFS_WIB_BLOCK_SHIFT);
-			bool trusted;
+			enum btrfs_raid56_recover_mode mode;
+			bool error;
 			u64 start;
 			u64 len;
 
@@ -3128,13 +3206,35 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 			 * parity from it is right.  The log keeps the two in
 			 * separate fields (bitmap and sticky) precisely so
 			 * they can be told apart.
+			 *
+			 * So an error record is recovered exactly as a user
+			 * scrub would repair it: from the record, which says
+			 * which side is stale, declining what it cannot
+			 * decide.  The scrub reads the record from the live
+			 * table, and at mount it is still only in the pending
+			 * set, so put it there first.  With a tree log still to
+			 * replay, extents only it knows are invisible to the
+			 * scrub, so only verify now and finish after the replay.
 			 */
-			trusted = !wib_pending_has_error(wib, start, len);
-			ret = wib_recover_one(fs_info, sctx, start, trusted, log_replay_pending,
+			error = wib_pending_has_error(wib, start, len);
+			if (!error)
+				mode = BTRFS_RAID56_RECOVER_TRUSTED;
+			else if (log_replay_pending)
+				mode = BTRFS_RAID56_RECOVER_VERIFY;
+			else
+				mode = wib_error_mode();
+			if (mode == BTRFS_RAID56_RECOVER_SCRUB) {
+				btrfs_wib_add_sticky(fs_info, start, len);
+				wib_readd_stale(fs_info, start, len);
+			}
+			ret = wib_recover_one(fs_info, sctx, start, mode, log_replay_pending,
 					      &start, &len, &st);
 			if (ret < 0)
 				goto out;
-			if (ret == 1) {
+			if (mode == BTRFS_RAID56_RECOVER_SCRUB) {
+				if (ret == 0)
+					btrfs_wib_clear_sticky(fs_info, last_start, last_len);
+			} else if (ret == 1) {
 				btrfs_wib_add_sticky(fs_info, start, len);
 				wib_readd_stale(fs_info, start, len);
 			}
@@ -3223,23 +3323,19 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 			}
 
 			/*
-			 * Never trusted.  Every stripe this loop visits is
+			 * Never TRUSTED.  Every stripe this loop visits is
 			 * here because it carries an ERROR record -- the loop
 			 * above selects on e->sticky -- so a data sector of it
 			 * may be stale while the parity holds what was
-			 * acknowledged.  Passing true regenerates the parity
-			 * from sectors the scrub cannot verify, which for
-			 * nodatacow data overwrites the only copy of the
-			 * acknowledged value: exactly what btrfs_wib_recover()
-			 * stopped doing, re-opened here.
-			 *
-			 * The extent tree being complete after the replay is
-			 * what @trusted was meant to convey, but it is the same
-			 * flag that governs regenerating parity over
-			 * unverifiable sectors, and for error records that is
-			 * not safe.
+			 * acknowledged.  Regenerating every vertical stripe's
+			 * parity from sectors the scrub cannot verify would,
+			 * for nodatacow data, overwrite the only copy of the
+			 * acknowledged value.  Decide as a scrub does instead:
+			 * the record is in the live table already.
 			 */
-			ret = wib_recover_one(fs_info, sctx, logical, false, false, &start, &len, &st);
+			ret = wib_recover_one(fs_info, sctx, logical,
+					      wib_error_mode(), false,
+					      &start, &len, &st);
 			if (ret < 0)
 				goto out_end;
 			if (!len) {

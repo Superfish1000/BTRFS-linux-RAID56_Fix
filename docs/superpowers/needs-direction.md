@@ -1123,6 +1123,16 @@ any of those three entry points, a device replace (which drives
 `btrfs_scrub_dev()` over the source device's stripes, so the record's plan
 applies there), and any `btrfs scrub` (`scrub.c:2811`).
 
+*Correction.* When this was written, recovery did **not** retire an error
+record at any of the three: it only verified the stripe and kept the record
+every time (`wib_recover_one()` returned "kept" whenever the stripe was not
+`trusted`, and an error record never was). Only a scrub or a replace retired
+one. Recovery now decides exactly as a scrub does -- rebuild the column the
+record names, decline what it cannot decide, retire on success
+(`BTRFS_RAID56_RECOVER_SCRUB`, tested by `uml/recover_scrub.sh` with the old
+behaviour as its negative control) -- so the sentence above is true now and was
+not before.
+
 A device that was missing and then reappears is not one of them. On a
 long-lived mount the exposure window is unbounded: the data still reads
 correctly -- the record is what makes a degraded read rebuild those sectors

@@ -326,12 +326,15 @@ nocow_bad() {
 	# How many of the overwritten blocks do NOT read back as the value the
 	# overwrite was acknowledged to have written.  Zero means the data is
 	# intact by whatever path this mount had to use to get it.
+	#
+	# Count what IS 'B', not what is not: a read that fails returns no bytes
+	# at all, and "nothing that isn't B" used to score that as intact.
 	local bad=0 i off got
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		off=$((i * NOCOW_STRIDE))
 		got=$(dd if=$MNT/nocow bs=4096 skip=$off count=1 status=none 2>/dev/null |
-		      tr -d 'B' | wc -c)
-		[ "$got" = 0 ] || bad=$((bad+1))
+		      tr -cd 'B' | wc -c)
+		[ "$got" = 4096 ] || bad=$((bad+1))
 	done
 	echo $bad
 }
@@ -1569,12 +1572,37 @@ nocow_probe)
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;
+nocow_platter)
+	# Are the acknowledged blocks on the platters, as opposed to readable
+	# through a filesystem that reconstructs whatever the record names?
+	do_mount ro $MNTDEV
+	python3 $T/umltest/nocow_platter.py $MNT/nocow $NOCOW_BLOCKS $NOCOW_STRIDE \
+		$MNTDEV > /tmp/platter.out 2>&1
+	umount $MNT || log "UMOUNT_FAIL"
+	head -8 /tmp/platter.out | while read -r l; do log "platter: $l"; done
+	n=$(sed -n 's/^PLATTER_MISSING \([0-9]*\) .*/\1/p' /tmp/platter.out)
+	log "NOCOW_PLATTER missing=${n:-?}"
+	echo "${n:-?}" > $T/umltest/nocow.bad.disk.$TAG
+	finish
+	;;
 nocow_recover)
 	# A normal read-write mount: this is what runs btrfs_wib_recover() and
 	# scrubs every stripe the log recorded.
+	[ "${RECOVER_LEGACY:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_recover_legacy \
+			2>/dev/null || log "RECOVER_LEGACY_ARM_FAIL"
+		log "error records will only be verified at mount (control)"
+	}
 	do_mount $OPTS $MNTDEV
 	stats "after recovery"
 	kmsg "write-intent" 8
+	kmsg "scrub:" 6
+	# How many records the recovery left.  One it retired is a stripe it
+	# repaired; one it kept is a stripe whose redundancy it did not restore.
+	sticky_rec=$(sed -n 's/.*sticky_blocks \([0-9]*\).*/\1/p' \
+		/sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | head -1)
+	log "NOCOW_STICKY_AFTER_RECOVERY $sticky_rec"
+	echo "${sticky_rec:-?}" > $T/umltest/nocow.sticky.recovery.$TAG
 	# Read with every device present too, which is the ordinary nodatasum
 	# exposure (the stale sector is returned as-is) rather than the
 	# question this scenario asks.

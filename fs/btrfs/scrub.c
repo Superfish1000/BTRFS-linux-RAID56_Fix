@@ -220,6 +220,15 @@ struct scrub_ctx {
 	 * parity write must fail the stripe (see btrfs_scrub_raid56_full_stripe()).
 	 */
 	bool			internal;
+	/*
+	 * Set by btrfs_scrub_raid56_full_stripe() in RECOVER_SCRUB mode.  The
+	 * decision is per full stripe, but scrub_raid56_parity_stripe() runs
+	 * once per parity device and would retire the record after the first
+	 * pass -- before a RAID6's second parity has been written.  So it
+	 * leaves retiring to the caller and says whether it would have.
+	 */
+	bool			raid56_defer_retire;
+	bool			raid56_keep_record;
 	u64			write_pointer;
 
 	struct mutex            wr_lock;
@@ -2503,7 +2512,6 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	u64 holes = 0, needs_help = 0;
 	int nr_good_par = 0;
 
-
 	*holes_out = 0;
 	if (likely(!btrfs_wib_any_stale(fs_info)))
 		return SCRUB_WIB_NONE;
@@ -2526,6 +2534,27 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	if (!btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
 				    nr_parity, &st))
 		return SCRUB_WIB_NONE;
+	/*
+	 * Some of the record, not all of it.  Records cover whole full
+	 * stripes, so the rest was dropped when the log filled up, and with it
+	 * whatever it named: a column missing from @st.stale_cols may be one
+	 * whose bit went with the dropped half.  For content with a checksum
+	 * the ordinary path finds out for itself; for the rest nothing can.
+	 */
+	if (btrfs_wib_stripe_error(fs_info, full_stripe_start, data_stripes) ==
+	    BTRFS_WIB_STRIPE_PARTIAL_ERROR) {
+		for (int i = 0; i < data_stripes; i++) {
+			struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
+
+			if (!stripe->dev || !stripe->dev->bdev ||
+			    !scrub_stripe_has_unverifiable(stripe))
+				continue;
+			btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu straddles a log region whose record was dropped, and some of it has no checksum; keeping the record rather than guessing",
+				      full_stripe_start);
+			return SCRUB_WIB_AMBIGUOUS;
+		}
+	}
 
 	/*
 	 * Two different questions, and conflating them is a hole.
@@ -2727,6 +2756,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	 * this one is the specific one.
 	 */
 	if (regen_parity && plan == SCRUB_WIB_AMBIGUOUS) {
+		sctx->raid56_keep_record = true;
 		scrub_capture_evidence(sctx, map, bg, full_stripe_start,
 				       data_stripes);
 		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
@@ -2762,6 +2792,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 "scrub: unrepaired sectors detected, full stripe %llu data stripe %u errors %*pbl",
 				  full_stripe_start, i, stripe->nr_sectors,
 				  &error);
+			sctx->raid56_keep_record = true;
 			return ret;
 		}
 		bitmap_or(&extent_bitmap, &extent_bitmap, &has_extent,
@@ -2798,17 +2829,21 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	 * so the sectors this claims to have repaired are still stale and the
 	 * record is the only thing that knows.
 	 */
-	if (sctx->readonly)
+	if (sctx->readonly) {
+		sctx->raid56_keep_record = true;
 		return 0;
+	}
 	for (int i = 0; i < data_stripes; i++) {
 		if (sctx->raid56_data_stripes[i].write_error_bitmap) {
 			btrfs_warn_rl(fs_info,
 "scrub: full stripe %llu was repaired in memory but a write-back failed; keeping its record",
 				      full_stripe_start);
+			sctx->raid56_keep_record = true;
 			return 0;
 		}
 	}
-	btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
+	if (!sctx->raid56_defer_retire)
+		btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
 	return 0;
 }
 
@@ -3745,18 +3780,20 @@ void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info,
  * the parity of the vertical stripes that hold extents from the verified
  * data.
  *
- * @trusted: the sectors that hold no extent are known to be what was last
- * written to them (see btrfs_wib_recover()): the parity of the vertical
- * stripes holding extents is recomputed by the scrub, and if the
- * verification passed and no device is missing, the parity of every
- * vertical stripe is additionally recomputed from the data on disk, which
- * covers extents the extent tree does not know yet (tree log).  Otherwise
- * only the data stripes are verified and repaired; no parity is written,
- * since the scrub would recompute it from sectors it cannot verify.
+ * @mode: see enum btrfs_raid56_recover_mode.  VERIFY writes no parity, since
+ * the scrub would recompute it from sectors it cannot verify.  SCRUB decides
+ * from the write-intent record, exactly as a user scrub does.  TRUSTED means
+ * the sectors that hold no extent are known to be what was last written to
+ * them (see btrfs_wib_recover()): if the verification passed and no device is
+ * missing, the parity of every vertical stripe is additionally recomputed from
+ * the data on disk, which covers extents the extent tree does not know yet
+ * (tree log).
  *
- * Return 0 if every extent found was verified or repaired (and, if
- * @trusted, the full stripe is consistent), 1 if a device of the chunk is
- * missing (its sectors were not repaired), 2 if every extent was verified
+ * Return 0 if every extent found was verified or repaired (and, unless
+ * VERIFY, the full stripe is consistent), 1 if a device of the chunk is
+ * missing (its sectors were not repaired), 3 in SCRUB mode if the scrub
+ * declined the stripe or could not get its repair onto the disk (the record
+ * must stay), 2 if every extent was verified
  * but the parity of a vertical stripe with an unreadable sector holding no
  * extent could not be recomputed, -EIO if a sector holding an extent could
  * not be repaired or a parity write failed (the parity is then left alone
@@ -3765,8 +3802,10 @@ void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info,
  */
 int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 				   struct scrub_ctx *sctx,
-				   u64 full_stripe_start, bool trusted)
+				   u64 full_stripe_start,
+				   enum btrfs_raid56_recover_mode mode)
 {
+	const bool regen = mode != BTRFS_RAID56_RECOVER_VERIFY;
 	struct btrfs_block_group *bg;
 	struct btrfs_chunk_map *map = NULL;
 	u64 fstripe_len;
@@ -3803,6 +3842,9 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 	if (ret < 0)
 		goto out_map;
 
+	sctx->raid56_defer_retire = mode == BTRFS_RAID56_RECOVER_SCRUB;
+	sctx->raid56_keep_record = false;
+
 	/*
 	 * Every parity stripe of the full stripe is regenerated by a separate
 	 * pass; each pass verifies and repairs the data stripes, which is
@@ -3815,7 +3857,7 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 		if (!pdev->bdev)
 			continue;
 		ret = scrub_raid56_parity_stripe(sctx, pdev, bg, map, full_stripe_start,
-						 trusted);
+						 regen);
 		if (ret < 0)
 			break;
 		ret = 0;
@@ -3847,7 +3889,15 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 	}
 	if (ret == 0 && missing)
 		ret = 1;
-	if (ret == 0 && trusted) {
+	/*
+	 * The scrub's own verdict, for the one mode that asked for it: some
+	 * pass declined the stripe, found it unrepairable, or could not get a
+	 * repair onto the disk.  Keep the record; the caller says why.
+	 */
+	if (ret == 0 && mode == BTRFS_RAID56_RECOVER_SCRUB && sctx->raid56_keep_record)
+		ret = 3;
+	sctx->raid56_defer_retire = false;
+	if (ret == 0 && mode == BTRFS_RAID56_RECOVER_TRUSTED) {
 		for (int p = data_stripes; p < map->num_stripes; p++) {
 			struct btrfs_device *pdev =
 				map->stripes[(p + rot) % map->num_stripes].dev;
