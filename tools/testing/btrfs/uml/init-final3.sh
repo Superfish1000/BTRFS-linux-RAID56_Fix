@@ -1767,6 +1767,10 @@ repair_pin)
 		sleep 1
 	done
 	log "repair holding: $held"
+	chunks() { btrfs inspect-internal dump-tree -t chunk /dev/mapper/d0 2>/dev/null |
+		awk '/CHUNK_ITEM/{k=$0} /type DATA/{d=1; print "chunk", k} d&&/stripe [0-9]/{print "   ", $0} /num_stripes/{} /^\titem/{d=0}' |
+		sed 's/.*CHUNK_ITEM \([0-9]*\).*/chunk \1/' | head -24; }
+	chunks | while read -r l; do log "before: $l"; done
 	t0=$(date +%s)
 	rm -f $MNT/nocow; sync
 	btrfs balance start --full-balance -d $MNT > /tmp/bal.out 2>&1
@@ -1778,6 +1782,8 @@ repair_pin)
 	sync
 	want=$(md5sum $MNT/new | awk '{print $1}')
 	log "refilled after $(( $(date +%s) - t0 ))s"
+	chunks | while read -r l; do log "after: $l"; done
+	dmesg | grep -E "holding|still recorded" | while read -r l; do log "dmesg: $l"; done
 	sleep $(( HOLD / 1000 + 15 ))
 	echo 3 > /proc/sys/vm/drop_caches
 	got=$(md5sum $MNT/new 2>/dev/null | awk '{print $1}')
