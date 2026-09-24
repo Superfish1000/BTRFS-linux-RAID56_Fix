@@ -449,6 +449,13 @@ struct btrfs_raid56_evidence_slot {
 
 /* Every field is protected by fs_info->raid56_evidence_lock. */
 struct btrfs_raid56_evidence {
+	/*
+	 * The file ARM_BIND tied the channel to, or NULL.  Only ever compared
+	 * against a file being released, never dereferenced.  Holding a
+	 * reference instead would keep open the very file whose closing is
+	 * supposed to disarm the channel.
+	 */
+	const struct file *owner;
 	u32 head;
 	u32 nr;
 	/*
@@ -465,8 +472,11 @@ struct btrfs_raid56_evidence {
 	struct btrfs_raid56_evidence_slot slots[BTRFS_RAID56_EVIDENCE_SLOTS];
 };
 
-int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info);
+int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info, const struct file *owner);
+int btrfs_raid56_evidence_disarm_request(struct btrfs_fs_info *fs_info, bool if_empty);
 void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info);
+void btrfs_raid56_evidence_file_released(struct btrfs_fs_info *fs_info,
+					 const struct file *file);
 bool btrfs_raid56_evidence_armed(const struct btrfs_fs_info *fs_info);
 struct btrfs_raid56_evidence_slot *
 btrfs_raid56_evidence_claim(struct btrfs_fs_info *fs_info, u32 nr_data, u32 nr_parity);

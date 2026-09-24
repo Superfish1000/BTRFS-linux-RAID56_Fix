@@ -36,6 +36,7 @@
 #include "file-item.h"
 #include "ioctl.h"
 #include "file.h"
+#include "raid56-wib.h"
 #include "super.h"
 #include "print-tree.h"
 
@@ -1450,6 +1451,9 @@ static ssize_t btrfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 int btrfs_release_file(struct inode *inode, struct file *filp)
 {
 	struct btrfs_file_private *private = filp->private_data;
+
+	/* Disarms the evidence channel if this file was its bound reader. */
+	btrfs_raid56_evidence_file_released(inode_to_fs_info(inode), filp);
 
 	if (private) {
 		kfree(private->filldir_buf);

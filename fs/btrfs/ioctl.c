@@ -5613,7 +5613,7 @@ out_unlock:
  * whatever files happen to live in that stripe, regardless of their ownership.
  */
 static int btrfs_ioctl_raid56_evidence(struct btrfs_fs_info *fs_info,
-				       void __user *argp)
+				       struct file *file, void __user *argp)
 {
 	struct btrfs_ioctl_raid56_evidence_args *args;
 	int ret;
@@ -5625,20 +5625,28 @@ static int btrfs_ioctl_raid56_evidence(struct btrfs_fs_info *fs_info,
 	if (IS_ERR(args))
 		return PTR_ERR(args);
 
-	if (args->flags) {
-		ret = -EINVAL;
-		goto out;
-	}
-
 	switch (args->op) {
 	case BTRFS_RAID56_EVIDENCE_ARM:
-		ret = btrfs_raid56_evidence_arm(fs_info);
+		if (args->flags & ~BTRFS_RAID56_EVIDENCE_ARM_BIND) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = btrfs_raid56_evidence_arm(fs_info,
+			(args->flags & BTRFS_RAID56_EVIDENCE_ARM_BIND) ? file : NULL);
 		break;
 	case BTRFS_RAID56_EVIDENCE_DISARM:
-		btrfs_raid56_evidence_disarm(fs_info);
-		ret = 0;
+		if (args->flags & ~BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = btrfs_raid56_evidence_disarm_request(fs_info,
+			args->flags & BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY);
 		break;
 	case BTRFS_RAID56_EVIDENCE_READ:
+		if (args->flags) {
+			ret = -EINVAL;
+			goto out;
+		}
 		ret = btrfs_raid56_evidence_take(fs_info, args,
 			(u8 __user *)argp + offsetof(
 				struct btrfs_ioctl_raid56_evidence_args, buf));
@@ -5893,7 +5901,7 @@ long btrfs_ioctl(struct file *file, unsigned int
 	case BTRFS_IOC_RAID56_STALE_STRIPES:
 		return btrfs_ioctl_raid56_stale_stripes(fs_info, argp);
 	case BTRFS_IOC_RAID56_EVIDENCE:
-		return btrfs_ioctl_raid56_evidence(fs_info, argp);
+		return btrfs_ioctl_raid56_evidence(fs_info, file, argp);
 	}
 
 	return -ENOTTY;

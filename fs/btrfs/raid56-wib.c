@@ -1915,15 +1915,44 @@ static void evidence_free(struct btrfs_raid56_evidence *ev)
 	kfree(ev);
 }
 
-int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info)
+/*
+ * Decide an ARM against a channel that is already armed.  Called with the lock
+ * held.  @owner is the file asking to bind, or NULL for an unbound ARM.
+ */
+static int evidence_rearm_locked(struct btrfs_raid56_evidence *ev,
+				 const struct file *owner)
+{
+	/* Bound to someone else: that helper owns the channel's lifetime. */
+	if (ev->owner && ev->owner != owner)
+		return -EBUSY;
+	/* Unbound and this ARM binds: claim it. */
+	if (!ev->owner && owner)
+		ev->owner = owner;
+	return 0;
+}
+
+int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info, const struct file *owner)
 {
 	struct btrfs_raid56_evidence *ev;
+	int ret;
 
 	/*
-	 * Allocate before taking the lock, and drop it again if someone else
-	 * armed in the meantime.  Testing the pointer first and allocating
-	 * after left two concurrent arms both allocating, with the loser's
-	 * four megabytes of slots unreachable for the life of the mount.
+	 * Already armed is the common repeat case; answer it without first
+	 * allocating four megabytes to throw away.
+	 */
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	if (fs_info->raid56_evidence) {
+		ret = evidence_rearm_locked(fs_info->raid56_evidence, owner);
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		return ret;
+	}
+	mutex_unlock(&fs_info->raid56_evidence_lock);
+
+	/*
+	 * Allocate outside the lock, and drop it again if someone else armed
+	 * in the meantime.  Testing the pointer and allocating after, with
+	 * nothing in between, left two concurrent arms both allocating and the
+	 * loser's slots unreachable for the life of the mount.
 	 */
 	ev = kzalloc(sizeof(*ev), GFP_KERNEL);
 	if (!ev)
@@ -1936,62 +1965,121 @@ int btrfs_raid56_evidence_arm(struct btrfs_fs_info *fs_info)
 			return -ENOMEM;
 		}
 	}
+	ev->owner = owner;
 
 	mutex_lock(&fs_info->raid56_evidence_lock);
 	if (fs_info->raid56_evidence) {
+		ret = evidence_rearm_locked(fs_info->raid56_evidence, owner);
 		mutex_unlock(&fs_info->raid56_evidence_lock);
 		evidence_free(ev);
-		return 0;
+		return ret;
 	}
 	fs_info->raid56_evidence = ev;
 	mutex_unlock(&fs_info->raid56_evidence_lock);
 	btrfs_info(fs_info,
-		   "raid56: evidence channel armed, %u slots of %u bytes",
+		   "raid56: evidence channel armed%s, %u slots of %u bytes",
+		   owner ? " and bound to its reader" : "",
 		   BTRFS_RAID56_EVIDENCE_SLOTS,
 		   (unsigned int)BTRFS_RAID56_EVIDENCE_MAX_BYTES);
 	return 0;
 }
 
+/*
+ * Free a channel that has already been unpublished, saying what it cost.
+ *
+ * Throwing away queued entries is the one loss here nothing can undo
+ * afterwards: the stripe is not read again, and the scrub that held its
+ * columns together has finished.  Refusing to disarm is not an option -- a
+ * helper that died has to be able to have its memory freed, and this is also
+ * the unmount path -- so say it instead of losing them quietly.
+ */
+static void evidence_retire(struct btrfs_fs_info *fs_info,
+			    struct btrfs_raid56_evidence *ev, const char *why)
+{
+	if (!ev)
+		return;
+	if (unlikely(ev->nr))
+		/*
+		 * Rate limited, not because it is unimportant but because
+		 * ARM/DISARM is a userspace loop, and an unratelimited warning
+		 * on it is a way to fill the kernel log from userspace.  The
+		 * first of a burst is what an operator needs.
+		 */
+		btrfs_warn_rl(fs_info,
+"raid56: evidence channel disarmed with %u captured stripe(s) still unread (%s); they are discarded",
+			      ev->nr, why);
+	evidence_free(ev);
+}
+
+/*
+ * Unpublish under the lock, free outside it.  Every capture and every read
+ * runs wholly under the same lock, so once it is released here none of them
+ * can be holding a reference: they either took the lock before this and
+ * finished, or take it after and find NULL.
+ *
+ * The lock being in fs_info rather than in the channel is what makes that
+ * true.  With the lock inside the object, a capture that had read the pointer
+ * but not yet taken the lock was invisible to any handshake done here, and
+ * locked freed memory a moment later.
+ */
+int btrfs_raid56_evidence_disarm_request(struct btrfs_fs_info *fs_info, bool if_empty)
+{
+	struct btrfs_raid56_evidence *ev;
+
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	ev = fs_info->raid56_evidence;
+	if (ev && if_empty && ev->nr) {
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		return -EBUSY;
+	}
+	fs_info->raid56_evidence = NULL;
+	mutex_unlock(&fs_info->raid56_evidence_lock);
+	evidence_retire(fs_info, ev, "by DISARM");
+	return 0;
+}
+
+/* Teardown: unconditional, from btrfs_wib_free() at unmount. */
 void btrfs_raid56_evidence_disarm(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_raid56_evidence *ev;
 
-	/*
-	 * Unpublish under the lock, free outside it.  Every capture and every
-	 * read runs wholly under the same lock, so once it is released here
-	 * none of them can be holding a reference: they either took the lock
-	 * before this and finished, or take it after and find NULL.
-	 *
-	 * The lock being in fs_info rather than in @ev is what makes that
-	 * true.  With the lock inside the object, a capture that had read the
-	 * pointer but not yet taken the lock was invisible to any handshake
-	 * done here, and locked freed memory a moment later.
-	 */
 	mutex_lock(&fs_info->raid56_evidence_lock);
 	ev = fs_info->raid56_evidence;
 	fs_info->raid56_evidence = NULL;
 	mutex_unlock(&fs_info->raid56_evidence_lock);
-	/*
-	 * Disarming with entries still queued throws them away, and they are
-	 * the one thing here that cannot be recovered afterwards: the stripe
-	 * they came from is not read again, and the scrub that held its
-	 * columns together has finished.  Refusing is not an option -- a
-	 * helper that died has to be able to have its memory freed, and this
-	 * is also the unmount path -- so say it instead of losing them
-	 * quietly.  A helper drains once more before disarming; one that does
-	 * not should be told it did.
-	 */
-	if (unlikely(ev && ev->nr))
-		/*
-		 * Rate limited, not because the message is unimportant but
-		 * because an unprivileged-of-nothing loop of ARM/DISARM would
-		 * otherwise be a way to fill the kernel log from userspace.
-		 * The first of a burst is what an operator needs.
-		 */
-		btrfs_warn_rl(fs_info,
-"raid56: evidence channel disarmed with %u captured stripe(s) still unread; they are discarded",
-			      ev->nr);
-	evidence_free(ev);
+	evidence_retire(fs_info, ev, "at unmount");
+}
+
+/*
+ * A btrfs file is being released for the last time.  If it is the one an
+ * ARM_BIND tied the channel to, its reader is gone -- closed it, exited, or
+ * was killed -- and nobody is left to drain.  Disarm now, and say how much
+ * that discarded, rather than leave the ring to fill and the captures after
+ * it to drop into a counter only the dead reader would have read.
+ *
+ * Called on every btrfs file release, so the unarmed case must cost nothing:
+ * the lockless hint first, the lock only when something is armed.  No ioctl
+ * can be in flight on @file while it is released -- the ioctl path holds a
+ * reference -- so an ARM_BIND on this same file cannot race this.
+ */
+void btrfs_raid56_evidence_file_released(struct btrfs_fs_info *fs_info,
+					 const struct file *file)
+{
+	struct btrfs_raid56_evidence *ev;
+
+	if (likely(!btrfs_raid56_evidence_armed(fs_info)))
+		return;
+
+	mutex_lock(&fs_info->raid56_evidence_lock);
+	ev = fs_info->raid56_evidence;
+	if (!ev || ev->owner != file) {
+		mutex_unlock(&fs_info->raid56_evidence_lock);
+		return;
+	}
+	fs_info->raid56_evidence = NULL;
+	mutex_unlock(&fs_info->raid56_evidence_lock);
+	btrfs_info(fs_info, "raid56: evidence channel's reader closed it; disarming");
+	evidence_retire(fs_info, ev, "its reader went away");
 }
 
 /*

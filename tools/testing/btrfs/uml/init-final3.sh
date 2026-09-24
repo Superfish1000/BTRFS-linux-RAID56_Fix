@@ -1267,13 +1267,64 @@ nocow_persist_scrub)
 		#      queued -- the one loss the kernel cannot undo, so it
 		#      has to say so.  Arm 4 cannot reach it: its helper
 		#      reads immediately before every disarm, so the ring is
-		#      empty by the time it lets go.
+		#      empty by the time it lets go.  Also asks for
+		#      DISARM_IF_EMPTY first, which must refuse.
+		#   6  the real workflow, in one process: "evidence collect"
+		#      arms bound to itself, drains while the scrub runs, and
+		#      disarms only once nothing is left
+		#   7  a bound helper that never reads is killed mid-scrub
+		#      with evidence queued: the kernel must disarm when its
+		#      file closes, say what that discarded, and the scrub
+		#      must still finish
 		EVDIR=$T/umltest/evdir.$TAG
 		rm -rf $EVDIR; mkdir -p $EVDIR
-		$T/umltest/evidence $MNT arm 2>&1 |
-			while read -r l; do log "evidence: $l"; done
+		# 6 and 7 arm bound to their own process; the others arm here
+		# with a short-lived one, which is exactly why they stay unbound.
+		case "${EVIDENCE}" in
+		6)
+			$T/umltest/evidence $MNT collect $EVDIR > /tmp/collect.out 2>&1 &
+			cpid=$!
+			for _ in $(seq 1 50); do
+				grep -q EVIDENCE_COLLECTING /tmp/collect.out 2>/dev/null && break
+				sleep 0.1
+			done
+			;;
+		7)
+			$T/umltest/evidence $MNT hold > /tmp/hold.out 2>&1 &
+			hpid=$!
+			for _ in $(seq 1 50); do
+				grep -q EVIDENCE_HOLDING /tmp/hold.out 2>/dev/null && break
+				sleep 0.1
+			done
+			log "evidence: $(cat /tmp/hold.out)"
+			;;
+		*)
+			$T/umltest/evidence $MNT arm 2>&1 |
+				while read -r l; do log "evidence: $l"; done
+			;;
+		esac
 		btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1 &
 		spid=$!
+		case "${EVIDENCE}" in
+		7)
+			# Kill it while the ring is full and captures are waiting
+			# on it, which is the harder moment: a capture asleep in
+			# its wait has to notice the channel vanished and give up,
+			# not sleep on.  Fall back to killing after the scrub if
+			# the ring never fills.
+			for _ in $(seq 1 300); do
+				q=$($T/umltest/evidence $MNT stats 2>/dev/null |
+					sed -n 's/.*queued=\([0-9]*\).*/\1/p')
+				[ "${q:-0}" -ge 4 ] && break
+				kill -0 $spid 2>/dev/null || break
+				sleep 0.1
+			done
+			log "evidence: queued before kill: ${q:-?}"
+			kill -9 $hpid 2>/dev/null
+			wait $hpid 2>/dev/null
+			log "evidence: killed the bound reader"
+			;;
+		esac
 		case "${EVIDENCE}" in
 		1)
 			# Stream the evidence out WHILE the scrub runs.
@@ -1305,24 +1356,51 @@ nocow_persist_scrub)
 			;;
 		esac
 		wait $spid
-		# Before draining anything: what did the kernel have to throw
-		# away?  Draining first would empty the ring and make a full
-		# ring indistinguishable from an idle one.
-		$T/umltest/evidence $MNT stats 2>&1 |
-			while read -r l; do log "evidence: $l"; done
-		# stats asks for zero bytes, so every queued entry comes back
-		# -ERANGE and stays queued: it reports without consuming.
-		[ "${EVIDENCE}" = 5 ] ||
-			$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
-			grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
-		$T/umltest/evidence $MNT disarm 2>&1 |
-			while read -r l; do log "evidence: $l"; done
-		# The kernel says when a disarm threw queued stripes away.  It
-		# is a KERN_WARNING, which "quiet" keeps off the console, and
-		# the dmesg dump further down filters for scrub messages, which
-		# this is not -- so take it out of the ring buffer here or it
-		# is invisible to the test that exists to check it.
-		dmesg | grep -o 'evidence channel disarmed with.*' |
+		log "evidence: scrub finished"
+		case "${EVIDENCE}" in
+		6)
+			# The scrub is over; tell collect to finish.  It does the
+			# last drain and DISARM_IF_EMPTY itself.
+			kill -TERM $cpid 2>/dev/null
+			wait $cpid
+			log "evidence: collect exited rc=$?"
+			grep -E 'EVIDENCE' /tmp/collect.out |
+				while read -r l; do log "evidence: $l"; done
+			;;
+		7)
+			# The channel should be gone.  A READ that still works
+			# means the kernel never noticed the reader die.
+			$T/umltest/evidence $MNT stats 2>&1 |
+				while read -r l; do log "evidence: after kill: $l"; done
+			;;
+		*)
+			# Before draining anything: what did the kernel have to
+			# throw away?  Draining first would empty the ring and
+			# make a full ring indistinguishable from an idle one.
+			$T/umltest/evidence $MNT stats 2>&1 |
+				while read -r l; do log "evidence: $l"; done
+			# stats asks for zero bytes, so every queued entry comes
+			# back -ERANGE and stays queued: it reports without
+			# consuming.
+			[ "${EVIDENCE}" = 5 ] ||
+				$T/umltest/evidence $MNT drain $EVDIR 2>&1 |
+				grep -E 'EVIDENCE' | while read -r l; do log "evidence: $l"; done
+			# With entries queued, DISARM_IF_EMPTY must refuse and
+			# leave everything readable.
+			[ "${EVIDENCE}" = 5 ] &&
+				$T/umltest/evidence $MNT disarm-if-empty 2>&1 |
+				while read -r l; do log "evidence: $l"; done
+			$T/umltest/evidence $MNT disarm 2>&1 |
+				while read -r l; do log "evidence: $l"; done
+			;;
+		esac
+		# The kernel says when a disarm threw queued stripes away, and
+		# when a bound reader went away.  KERN_WARNING/INFO, which
+		# "quiet" keeps off the console, and the dmesg dump further down
+		# filters for scrub messages, which these are not -- so take them
+		# out of the ring buffer here or they are invisible to the test
+		# that exists to check them.
+		dmesg | grep -oE "evidence channel disarmed with.*|evidence channel's reader closed it.*|evidence channel armed.*" |
 			while read -r l; do log "evidence: $l"; done
 		log "EVIDENCE_FILES=$(ls $EVDIR/*.data 2>/dev/null | wc -l) EVIDENCE_BYTES=$(cat $EVDIR/*.data 2>/dev/null | wc -c)"
 		while read -r l; do log "scrub: $l"; done < /tmp/scrub.out

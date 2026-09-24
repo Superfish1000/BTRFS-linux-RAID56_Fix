@@ -1221,6 +1221,39 @@ struct btrfs_ioctl_raid56_stale_entry {
 #define BTRFS_RAID56_EVIDENCE_READ	1
 #define BTRFS_RAID56_EVIDENCE_DISARM	2
 
+/*
+ * In-flags, for @flags.  Each is valid only with the op in its name; any other
+ * bit, or a valid bit with another op, is -EINVAL.  That is also what a kernel
+ * predating a flag returns, so a helper can probe for it and fall back.
+ */
+
+/*
+ * ARM: tie the channel to the file this ioctl was issued on.  When that file
+ * is closed for the last time -- including because the helper was killed --
+ * the channel is disarmed then and there, and the kernel logs how many
+ * captured stripes it had to discard.
+ *
+ * Without it, a helper that dies leaves the channel armed with nobody
+ * reading: the ring fills, captures start dropping, and the only record of
+ * that is a counter the dead helper was supposed to read.
+ *
+ * Opt-in because it changes who may end the channel's life.  A channel armed
+ * by one short-lived process and drained by another -- arm from a setup
+ * script, drain from a daemon -- is a legitimate arrangement and keeps
+ * working without it.  A channel bound to one file is -EBUSY to ARM from any
+ * other; an unbound one is claimed by the first ARM that binds it.
+ */
+#define BTRFS_RAID56_EVIDENCE_ARM_BIND		(1ULL << 0)
+
+/*
+ * DISARM: only if nothing is queued; -EBUSY otherwise, with the channel left
+ * armed and every entry still readable.  Closes the window between a helper's
+ * last READ and its DISARM, during which a capture could land and be thrown
+ * away.  A helper loops READ until -ENOENT, then DISARM with this, and goes
+ * back to reading on -EBUSY.
+ */
+#define BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY	(1ULL << 1)
+
 #define BTRFS_RAID56_EVIDENCE_MAX_COLS	34
 
 /*
@@ -1242,7 +1275,7 @@ struct btrfs_ioctl_raid56_stale_entry {
 struct btrfs_ioctl_raid56_evidence_args {
 	/* In: one of BTRFS_RAID56_EVIDENCE_*. */
 	__u64 op;
-	/* In: must be 0. */
+	/* In: BTRFS_RAID56_EVIDENCE_ARM_BIND or _DISARM_IF_EMPTY per op, else 0. */
 	__u64 flags;
 	/* Out: logical start of the full stripe this evidence came from. */
 	__u64 full_stripe_start;

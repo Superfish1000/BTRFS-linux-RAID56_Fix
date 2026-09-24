@@ -13,6 +13,21 @@
  *   evidence <mountpoint> disarm
  *   evidence <mountpoint> stats            counters only, ring left alone
  *   evidence <mountpoint> race <seconds>   arm/disarm/read as fast as possible
+ *   evidence <mountpoint> collect <outdir> [until-pid]
+ *                                           the whole job in one process: arm
+ *                                           bound to this process, drain while
+ *                                           the scrub runs, and disarm only
+ *                                           once nothing is left
+ *   evidence <mountpoint> hold             arm bound to this process and never
+ *                                           read -- what a helper that hangs or
+ *                                           gets killed looks like to the kernel
+ *   evidence <mountpoint> disarm-if-empty  disarm unless something is queued
+ *
+ * collect is the one to use.  The separate arm/drain/disarm commands leave the
+ * channel's lifetime to whoever runs them; collect ties it to this process
+ * (BTRFS_RAID56_EVIDENCE_ARM_BIND), so if it is killed the kernel disarms at
+ * once and says how many captured stripes that threw away, instead of leaving
+ * the ring to fill with nobody reading it.
  *
  * Only the DATA columns are in the payload.  The parity is named, not copied:
  * every column's devid and physical offset is in the header, and the block
@@ -29,11 +44,14 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
+#include <signal.h>
 
 #define BTRFS_IOCTL_MAGIC 0x94
 #define BTRFS_RAID56_EVIDENCE_ARM	0
 #define BTRFS_RAID56_EVIDENCE_READ	1
 #define BTRFS_RAID56_EVIDENCE_DISARM	2
+#define BTRFS_RAID56_EVIDENCE_ARM_BIND		(1ULL << 0)
+#define BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY	(1ULL << 1)
 #define MAX_COLS 34
 
 struct ev_args {
@@ -49,21 +67,43 @@ struct ev_args {
 
 #define CAP (16 * 65536)
 
-static int simple(int fd, uint64_t op)
+/* Returns 0 or the errno, so callers can tell EBUSY and EINVAL apart. */
+static int op_flags(int fd, uint64_t op, uint64_t flags)
 {
 	struct ev_args a;
 
 	memset(&a, 0, sizeof(a));
 	a.op = op;
-	if (ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, &a) < 0) {
+	a.flags = flags;
+	return ioctl(fd, BTRFS_IOC_RAID56_EVIDENCE, &a) < 0 ? errno : 0;
+}
+
+static int simple(int fd, uint64_t op)
+{
+	int err = op_flags(fd, op, 0);
+
+	if (err) {
 		fprintf(stderr, "EVIDENCE op %llu: %s\n",
-			(unsigned long long)op, strerror(errno));
+			(unsigned long long)op, strerror(err));
 		return 1;
 	}
 	return 0;
 }
 
+/* Drain everything queued now.  Returns how many it took, or -1 on error. */
+static int drain_quiet(int fd, const char *outdir, int verbose);
+
 static int drain(int fd, const char *outdir)
+{
+	int n = drain_quiet(fd, outdir, 1);
+
+	if (n < 0)
+		return 1;
+	printf("EVIDENCE_DRAINED %d\n", n);
+	return 0;
+}
+
+static int drain_quiet(int fd, const char *outdir, int verbose)
 {
 	struct ev_args *a = calloc(1, sizeof(*a) + CAP);
 	int n = 0;
@@ -89,7 +129,7 @@ static int drain(int fd, const char *outdir)
 			}
 			fprintf(stderr, "READ: %s\n", strerror(errno));
 			free(a);
-			return 1;
+			return -1;
 		}
 		snprintf(path, sizeof(path), "%s/stripe-%llu.data", outdir,
 			 (unsigned long long)a->full_stripe_start);
@@ -97,7 +137,7 @@ static int drain(int fd, const char *outdir)
 		if (out < 0 || write(out, a->buf, a->buf_size) != (ssize_t)a->buf_size) {
 			fprintf(stderr, "write %s: %s\n", path, strerror(errno));
 			free(a);
-			return 1;
+			return -1;
 		}
 		close(out);
 
@@ -126,18 +166,18 @@ static int drain(int fd, const char *outdir)
 			fclose(f);
 		}
 		n++;
-		printf("EVIDENCE stripe %llu data=%llu queued=%u captured=%llu dropped_full=%llu dropped_wide=%llu\n",
-		       (unsigned long long)a->full_stripe_start,
-		       (unsigned long long)a->buf_size, a->nr_queued,
-		       (unsigned long long)a->captured,
-		       (unsigned long long)a->dropped_full,
-		       (unsigned long long)a->dropped_wide);
+		if (verbose)
+			printf("EVIDENCE stripe %llu data=%llu queued=%u captured=%llu dropped_full=%llu dropped_wide=%llu\n",
+			       (unsigned long long)a->full_stripe_start,
+			       (unsigned long long)a->buf_size, a->nr_queued,
+			       (unsigned long long)a->captured,
+			       (unsigned long long)a->dropped_full,
+			       (unsigned long long)a->dropped_wide);
 		if (!a->nr_queued)
 			break;
 	}
-	printf("EVIDENCE_DRAINED %d\n", n);
 	free(a);
-	return 0;
+	return n;
 }
 
 /*
@@ -209,13 +249,124 @@ static int race(int fd, int secs)
 	return 0;
 }
 
+static volatile sig_atomic_t stop_requested;
+
+static void on_stop(int sig)
+{
+	(void)sig;
+	stop_requested = 1;
+}
+
+static int pid_gone(pid_t pid)
+{
+	return pid > 0 && kill(pid, 0) < 0 && errno == ESRCH;
+}
+
+/*
+ * The whole job, in one process, so that the channel's lifetime is this
+ * process's lifetime.
+ *
+ * Runs until told to stop (SIGINT/SIGTERM) or until @until -- normally the
+ * scrub -- exits.  Then it does not simply disarm: a capture can land between
+ * the last READ and the DISARM and would be thrown away, so it asks for
+ * DISARM_IF_EMPTY and goes back to reading whenever the kernel says -EBUSY.
+ */
+static int collect(int fd, const char *outdir, pid_t until)
+{
+	int bound = 1, total = 0, n, err;
+
+	err = op_flags(fd, BTRFS_RAID56_EVIDENCE_ARM, BTRFS_RAID56_EVIDENCE_ARM_BIND);
+	if (err == EINVAL) {
+		/* A kernel without ARM_BIND: still collect, but say what is lost. */
+		bound = 0;
+		fprintf(stderr, "EVIDENCE kernel has no ARM_BIND: if this process dies the channel stays armed\n");
+		err = op_flags(fd, BTRFS_RAID56_EVIDENCE_ARM, 0);
+	}
+	if (err) {
+		fprintf(stderr, "ARM: %s\n", strerror(err));
+		return 1;
+	}
+	printf("EVIDENCE_COLLECTING bound=%d\n", bound);
+	fflush(stdout);
+
+	signal(SIGINT, on_stop);
+	signal(SIGTERM, on_stop);
+	for (;;) {
+		n = drain_quiet(fd, outdir, 1);
+		if (n < 0)
+			return 1;
+		total += n;
+		if (stop_requested || pid_gone(until))
+			break;
+		/* Only pause when there was nothing to take: captures burst. */
+		if (!n)
+			usleep(100000);
+	}
+
+	/* What the kernel had to discard, if anything, before letting go. */
+	stats(fd);
+	for (;;) {
+		n = drain_quiet(fd, outdir, 1);
+		if (n < 0)
+			return 1;
+		total += n;
+		err = op_flags(fd, BTRFS_RAID56_EVIDENCE_DISARM,
+			       BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY);
+		if (!err)
+			break;
+		if (err == EBUSY)
+			continue;	/* something landed; read it and ask again */
+		if (err == EINVAL) {
+			/* No DISARM_IF_EMPTY: the best available is one last drain. */
+			n = drain_quiet(fd, outdir, 1);
+			total += n > 0 ? n : 0;
+			op_flags(fd, BTRFS_RAID56_EVIDENCE_DISARM, 0);
+			break;
+		}
+		fprintf(stderr, "DISARM: %s\n", strerror(err));
+		return 1;
+	}
+	printf("EVIDENCE_COLLECTED %d\n", total);
+	return 0;
+}
+
+/* Arm bound to this process and never read.  For tests to kill. */
+static int hold(int fd)
+{
+	int err = op_flags(fd, BTRFS_RAID56_EVIDENCE_ARM, BTRFS_RAID56_EVIDENCE_ARM_BIND);
+
+	if (err) {
+		fprintf(stderr, "ARM_BIND: %s\n", strerror(err));
+		return 1;
+	}
+	printf("EVIDENCE_HOLDING\n");
+	fflush(stdout);
+	for (;;)
+		pause();
+}
+
+static int disarm_if_empty(int fd)
+{
+	int err = op_flags(fd, BTRFS_RAID56_EVIDENCE_DISARM,
+			   BTRFS_RAID56_EVIDENCE_DISARM_IF_EMPTY);
+
+	if (!err)
+		printf("EVIDENCE_DISARM_IF_EMPTY ok\n");
+	else if (err == EBUSY)
+		printf("EVIDENCE_DISARM_IF_EMPTY busy\n");
+	else
+		printf("EVIDENCE_DISARM_IF_EMPTY error %s\n", strerror(err));
+	return err && err != EBUSY;
+}
+
 int main(int argc, char **argv)
 {
 	int fd, ret;
 
 	if (argc < 3) {
 		fprintf(stderr,
-			"usage: %s <mountpoint> arm|drain <dir>|disarm|stats|race <secs>\n",
+			"usage: %s <mountpoint> arm|drain <dir>|disarm|stats|race <secs>|"
+			"collect <dir> [until-pid]|hold|disarm-if-empty\n",
 			argv[0]);
 		return 2;
 	}
@@ -234,6 +385,12 @@ int main(int argc, char **argv)
 		ret = stats(fd);
 	else if (!strcmp(argv[2], "race") && argc >= 4)
 		ret = race(fd, atoi(argv[3]));
+	else if (!strcmp(argv[2], "collect") && argc >= 4)
+		ret = collect(fd, argv[3], argc >= 5 ? (pid_t)atoi(argv[4]) : 0);
+	else if (!strcmp(argv[2], "hold"))
+		ret = hold(fd);
+	else if (!strcmp(argv[2], "disarm-if-empty"))
+		ret = disarm_if_empty(fd);
 	else {
 		fprintf(stderr, "unknown command\n");
 		ret = 2;
