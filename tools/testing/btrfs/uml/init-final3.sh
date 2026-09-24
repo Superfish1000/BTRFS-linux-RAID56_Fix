@@ -738,12 +738,12 @@ nocow_stale)
 	# write whose data sector lands here takes one fault, which RAID5
 	# tolerates, so the write is acknowledged and the stripe is recorded.
 	dm_error_writes $FAIL; log "write errors on device $FAIL"
-	acked=0; failed=0
+	acked=0; failed=0; rm -f $T/umltest/nocow.acked.$TAG
 	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
 		if dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
 		   dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
 		      conv=notrunc,fsync status=none 2>/dev/null; then
-			acked=$((acked+1))
+			acked=$((acked+1)); echo $i >> $T/umltest/nocow.acked.$TAG
 		else
 			failed=$((failed+1))
 		fi
@@ -1726,7 +1726,6 @@ repair_pin)
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
 	HOLD=${HOLD:-40000}
-	echo $HOLD > /sys/module/btrfs/parameters/raid56_repair_hold_ms
 	[ "${CONTROL:-0}" = 1 ] && {
 		echo 1 > /sys/module/btrfs/parameters/raid56_repair_no_pin ||
 			log "CONTROL_ARM_FAIL"
@@ -1742,6 +1741,10 @@ repair_pin)
 		   conv=notrunc,fsync status=none 2>/dev/null
 	done
 	dm_heal $FAIL
+	# Only now: held during the faulted writes, every repair would sit on
+	# its stripe lock with the writes queued behind it.  The retries after
+	# the heal are the ones that get held.
+	echo $HOLD > /sys/module/btrfs/parameters/raid56_repair_hold_ms
 	held=no
 	for _ in $(seq 1 60); do
 		dmesg | grep -q "repair of full stripe .* holding" && { held=yes; break; }
