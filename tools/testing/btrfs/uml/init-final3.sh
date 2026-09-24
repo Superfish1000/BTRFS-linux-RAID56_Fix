@@ -1696,6 +1696,61 @@ rmw_torn_verify)
 	echo "$got $plat" > $T/umltest/rmw.torn.$TAG
 	finish
 	;;
+repair_pin)
+	# A repair held in flight (raid56_repair_hold_ms) while its block group
+	# is emptied, balanced away, and its device space refilled with new,
+	# checksummed data.  Unpinned, the repair wakes and writes its stripe
+	# into space that now belongs to the new data.  CONTROL=1 is that.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	HOLD=${HOLD:-40000}
+	echo $HOLD > /sys/module/btrfs/parameters/raid56_repair_hold_ms
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_repair_no_pin ||
+			log "CONTROL_ARM_FAIL"
+		log "repair not pinned (control)"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	dm_error_writes $FAIL
+	for i in $(seq 0 $((NOCOW_BLOCKS-1))); do
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((i * NOCOW_STRIDE)) count=1 \
+		   conv=notrunc,fsync status=none 2>/dev/null
+	done
+	dm_heal $FAIL
+	held=no
+	for _ in $(seq 1 60); do
+		dmesg | grep -q "repair of full stripe .* holding" && { held=yes; break; }
+		sleep 1
+	done
+	log "repair holding: $held"
+	t0=$(date +%s)
+	rm -f $MNT/nocow; sync
+	btrfs balance start --full-balance -d $MNT > /tmp/bal.out 2>&1
+	log "balance rc=$? after $(( $(date +%s) - t0 ))s: $(tail -1 /tmp/bal.out)"
+	dd if=/dev/urandom of=$MNT/new bs=1M count=${REFILL_MB:-300} conv=fsync status=none
+	sync
+	want=$(md5sum $MNT/new | awk '{print $1}')
+	log "refilled after $(( $(date +%s) - t0 ))s"
+	sleep $(( HOLD / 1000 + 15 ))
+	echo 3 > /proc/sys/vm/drop_caches
+	got=$(md5sum $MNT/new 2>/dev/null | awk '{print $1}')
+	[ "$got" = "$want" ] && ok=1 || ok=0
+	btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1
+	errs=$(sed -n 's/.*csum=\([0-9]*\).*/\1/p; s/.*csum_errors: *\([0-9]*\).*/\1/p' /tmp/scrub.out | head -1)
+	grep -iE "error|csum" /tmp/scrub.out | head -3 | while read -r l; do log "scrub: $l"; done
+	kmsg "still recorded in flight|holding|raid56:" 6
+	log "REPAIR_PIN held=$held new_intact=$ok scrub_csum_errors=${errs:-?}"
+	echo "$held $ok ${errs:-?}" > $T/umltest/repair.pin.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 rmw_cache)
 	# The stripe-cache path of a read-modify-write.  'B' is written while
 	# its column's device fails writes: accepted within the tolerance, the

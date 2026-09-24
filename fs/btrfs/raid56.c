@@ -13,6 +13,7 @@
 #include <linux/list_sort.h>
 #include <linux/raid/xor.h>
 #include <linux/mm.h>
+#include <linux/delay.h>
 #include "messages.h"
 #include "ctree.h"
 #include "disk-io.h"
@@ -3627,10 +3628,24 @@ static bool repair_ignores_freeze;
 module_param_named(raid56_repair_ignores_freeze, repair_ignores_freeze, bool, 0644);
 MODULE_PARM_DESC(raid56_repair_ignores_freeze,
 		 "Keep repairing while the filesystem is frozen (testing only: restores a known defect)");
+static bool repair_no_pin;
+module_param_named(raid56_repair_no_pin, repair_no_pin, bool, 0644);
+MODULE_PARM_DESC(raid56_repair_no_pin,
+		 "Neither freeze the block group under a repair nor drain repairs in relocation (testing only: restores a known defect)");
+/*
+ * Hold a repair this long between its log mark and its writes, so a test can
+ * relocate and reuse the space under it.  See uml/repair_pin.sh.
+ */
+static unsigned int repair_hold_ms;
+module_param_named(raid56_repair_hold_ms, repair_hold_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_repair_hold_ms,
+		 "Hold each repair this many ms before it writes (testing only)");
 #else
 #define no_repair_on_fault	false
 #define repair_keeps_record	false
 #define repair_ignores_freeze	false
+#define repair_no_pin		false
+#define repair_hold_ms		0
 #endif
 
 /* Caller holds wib->repair_lock. */
@@ -3699,7 +3714,8 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	 * (btrfs_raid56_drain_repairs()), and a repair counted only after
 	 * passing the read-only test could slip between the two.
 	 */
-	atomic_inc(&wib->repairs_inflight);
+	if (!READ_ONCE(repair_no_pin))
+		atomic_inc(&wib->repairs_inflight);
 	/*
 	 * A block group that is read-only belongs to a scrub, a balance or a
 	 * replace, each of which rewrites this stripe its own way; leave it to
@@ -3715,13 +3731,19 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 	spin_lock(&bg->lock);
 	busy = bg->ro || !(bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) ||
 	       test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags);
-	if (!busy)
+	if (!busy && !READ_ONCE(repair_no_pin))
 		btrfs_freeze_block_group(bg);
 	spin_unlock(&bg->lock);
 	if (busy) {
 		btrfs_put_block_group(bg);
 		atomic64_inc(&wib->stat_repair_skipped);
 		goto out_inflight;
+	}
+	if (READ_ONCE(repair_no_pin)) {
+		/* The control: counted late, nothing frozen. */
+		btrfs_put_block_group(bg);
+		bg = NULL;
+		atomic_inc(&wib->repairs_inflight);
 	}
 
 	btrfs_bio_counter_inc_blocked(fs_info);
@@ -3751,8 +3773,10 @@ static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
 
 out_counter:
 	btrfs_bio_counter_dec(fs_info);
-	btrfs_unfreeze_block_group(bg);
-	btrfs_put_block_group(bg);
+	if (bg) {
+		btrfs_unfreeze_block_group(bg);
+		btrfs_put_block_group(bg);
+	}
 out_inflight:
 	if (atomic_dec_and_test(&wib->repairs_inflight))
 		wake_up_all(&wib->wait);
@@ -3842,7 +3866,7 @@ void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 
-	if (wib)
+	if (wib && !READ_ONCE(repair_no_pin))
 		wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
 }
 
@@ -4121,6 +4145,13 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 					   crash_point, full_stripe_start);
 		}
 #endif
+	}
+
+	if (unlikely(READ_ONCE(repair_hold_ms)) &&
+	    test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
+		btrfs_info(fs_info, "raid56: repair of full stripe %llu holding for %u ms",
+			   full_stripe_start, READ_ONCE(repair_hold_ms));
+		msleep(READ_ONCE(repair_hold_ms));
 	}
 
 	bitmap_clear(rbio->error_bitmap, 0, rbio->nr_sectors);

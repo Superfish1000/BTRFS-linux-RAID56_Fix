@@ -72,6 +72,7 @@ the next recorded write:
 | `rmw_repair.sh` | seven arms: does the next write into a damaged stripe repair it, is a write into an undecidable stripe refused, does the repair queued on the fault put the stripe back with nothing else writing? Each against a control that restores the old behaviour |
 | `rmw_cache.sh` | two arms: does a write served from the stripe cache into a recorded stripe lose the stale column when its own parity write fails? |
 | `rmw_torn.sh` | two arms: does a crash in the write that repairs a stale column lose that column? |
+| `repair_pin.sh` | two arms: a repair held in flight while its block group is balanced away and the space refilled -- does it write into the new data? |
 | `repair_freeze.sh` | two arms: does the queued repair write to a frozen filesystem? |
 | `stale_read.sh` | two arms: does an ordinary read of an unchecksummed block the record names as stale return the old content? |
 | `early_record.sh` | four arms: RAID6 with one device missing and a column of another stale -- does the mount read its tree roots, and the file, with the record in hand? ro and rw, each against the old behaviour |
