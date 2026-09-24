@@ -37,7 +37,10 @@ watchdog() {
 	  # nothing blocked is something spinning.
 	  for d in /proc/[0-9]*; do
 		st=$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' $d/status 2>/dev/null)
-		case "$st" in S|I|"") continue;; esac
+		case "$st" in I|"") continue;; esac
+		# A sleeping kernel thread is normal; a sleeping user process
+		# is what a hang with nothing running is made of.
+		[ "$st" = S ] && [ ! -s $d/cmdline ] && continue
 		echo "WATCHDOG: $st $(cat $d/comm 2>/dev/null) pid ${d#/proc/} wchan $(cat $d/wchan 2>/dev/null) cmd $(tr '\0' ' ' < $d/cmdline 2>/dev/null | cut -c1-80)"
 		sed 's/^/WATCHDOG:   /' $d/stack 2>/dev/null | head -20
 	  done
