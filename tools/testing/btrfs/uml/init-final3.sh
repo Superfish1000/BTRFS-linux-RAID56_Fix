@@ -1788,9 +1788,17 @@ repair_pin)
 	chunks | while read -r l; do log "after: $l"; done
 	dmesg | grep -E "holding|still recorded" | while read -r l; do log "dmesg: $l"; done
 	sleep $(( HOLD / 1000 + 15 ))
+	# RAID5 heals a damaged data sector on the first read -- checksum
+	# failure, rebuild from parity, write back -- so the file reading back
+	# intact proves nothing.  Count the corrections: checksum failures in
+	# the log, and the devices' corruption counters.
+	corr() { btrfs device stats $MNT 2>/dev/null |
+		awk '/corruption_errs/ {n += $2} END {print n + 0}'; }
+	cf0=$(dmesg | grep -c "csum failed"); ce0=$(corr)
 	echo 3 > /proc/sys/vm/drop_caches
 	got=$(md5sum $MNT/new 2>/dev/null | awk '{print $1}')
 	[ "$got" = "$want" ] && ok=1 || ok=0
+	cf=$(( $(dmesg | grep -c "csum failed") - cf0 )); ce=$(( $(corr) - ce0 ))
 	pm0=$(sed -n 's/.*parity_mismatch_vertical_stripes \([0-9]*\).*/\1/p' /sys/fs/btrfs/*/raid56_write_profile | head -1)
 	btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1
 	grep -iE "error|csum" /tmp/scrub.out | head -3 | while read -r l; do log "scrub: $l"; done
@@ -1799,8 +1807,8 @@ repair_pin)
 	pm1=$(sed -n 's/.*parity_mismatch_vertical_stripes \([0-9]*\).*/\1/p' /sys/fs/btrfs/*/raid56_write_profile | head -1)
 	pm=$(( ${pm1:-0} - ${pm0:-0} ))
 	kmsg "still recorded in flight|holding|raid56:" 6
-	log "REPAIR_PIN held=$held new_intact=$ok parity_mismatch=$pm"
-	echo "$held $ok $pm" > $T/umltest/repair.pin.$TAG
+	log "REPAIR_PIN held=$held new_intact=$ok csum_failed=$cf corruption_errs=$ce parity_mismatch=$pm"
+	echo "$held $ok $(( cf + ce + pm ))" > $T/umltest/repair.pin.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
 	finish
