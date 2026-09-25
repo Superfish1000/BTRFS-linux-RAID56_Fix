@@ -3496,9 +3496,13 @@ module_param_named(raid56_rmw_trust_cache, rmw_trust_cache, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_trust_cache,
 		 "Serve a read-modify-write into a recorded stripe from the stripe cache (testing only: restores a known defect)");
 #else
-#define rmw_no_repair	false
-#define rmw_no_refuse	false
-#define rmw_trust_cache	false
+/*
+ * Constants, not macros: the callers read these with READ_ONCE(), which needs
+ * an lvalue.  The compiler folds them away all the same.
+ */
+static const bool rmw_no_repair;
+static const bool rmw_no_refuse;
+static const bool rmw_trust_cache;
 #endif
 
 /*
@@ -3642,11 +3646,11 @@ module_param_named(raid56_repair_hold_ms, repair_hold_ms, uint, 0644);
 MODULE_PARM_DESC(raid56_repair_hold_ms,
 		 "Hold each repair this many ms before it writes (testing only)");
 #else
-#define no_repair_on_fault	false
-#define repair_keeps_record	false
-#define repair_ignores_freeze	false
-#define repair_no_pin		false
-#define repair_hold_ms		0
+/* Constants, not macros: see rmw_no_repair. */
+static const bool no_repair_on_fault;
+static const bool repair_keeps_record;
+static const bool repair_ignores_freeze;
+static const bool repair_no_pin;
 #endif
 
 /* Caller holds wib->repair_lock. */
