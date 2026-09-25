@@ -533,31 +533,49 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 }
 
 /*
- * Can anything still make room in a full log?  A write in flight frees its
- * slot when it finishes; a queued or running repair retires the record it
- * repairs.  With neither, waiting cannot help.
+ * How long a write waits for room in a full log that only a repair can free.
+ * A repair about to land after a device healed frees a slot within a second
+ * or two; on a device that keeps failing, the queued repairs only retry on
+ * their backoff and free nothing, and a longer wait would stall every write
+ * that long before failing it.
  */
-static bool wib_can_make_room_locked(struct btrfs_wib *wib)
+static unsigned int log_full_repair_wait_ms = 5000;
+module_param_named(raid56_log_full_repair_wait_ms, log_full_repair_wait_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_log_full_repair_wait_ms,
+		 "How long a RAID5/6 write waits for a repair to make room in a full write-intent log before failing (default 5000)");
+
+/*
+ * What can still make room in a full log?  A write in flight frees its slot
+ * when it finishes; a queued or running repair retires the record it
+ * repairs, if its device takes it.  With neither, waiting cannot help.
+ */
+enum wib_room {
+	WIB_ROOM_NONE,
+	WIB_ROOM_REPAIR,
+	WIB_ROOM_WRITE,
+};
+
+static enum wib_room wib_room_source_locked(struct btrfs_wib *wib)
 {
 	lockdep_assert_held(&wib->lock);
 
-	if (atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr))
-		return true;
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
 		if (wib->entries[i].bitmap)
-			return true;
-	return false;
+			return WIB_ROOM_WRITE;
+	if (atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr))
+		return WIB_ROOM_REPAIR;
+	return WIB_ROOM_NONE;
 }
 
 static bool wib_can_make_room(struct btrfs_wib *wib)
 {
 	unsigned long flags;
-	bool can;
+	enum wib_room room;
 
 	spin_lock_irqsave(&wib->lock, flags);
-	can = wib_can_make_room_locked(wib);
+	room = wib_room_source_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
-	return can;
+	return room != WIB_ROOM_NONE;
 }
 
 /* True if btrfs_wib_try_mark() for the same range would succeed. */
@@ -1528,7 +1546,8 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
-	bool can_make_room;
+	enum wib_room room;
+	unsigned long timeout;
 	bool enabled;
 	u64 want;
 	int ret;
@@ -1560,7 +1579,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * finishing in between would otherwise look like nothing left
 		 * to wait for, and fail a write that now fits.
 		 */
-		can_make_room = wib_can_make_room_locked(wib);
+		room = wib_room_source_locked(wib);
 		spin_unlock_irqrestore(&wib->lock, flags);
 
 		/*
@@ -1577,19 +1596,22 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * would only make every write take a minute to fail.  Fail it
 		 * now, and wait below only while something can still finish.
 		 */
-		if (!can_make_room) {
+		if (room == WIB_ROOM_NONE) {
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL, logical, NULL, 0);
 			return -EIO;
 		}
+		/* A write in flight will finish; a repair may never land. */
+		timeout = room == WIB_ROOM_WRITE ? BTRFS_WIB_FULL_TIMEOUT :
+			  msecs_to_jiffies(READ_ONCE(log_full_repair_wait_ms));
 		btrfs_warn_rl(fs_info,
 			      "raid56 write-intent log full, waiting for in-flight writes and repairs");
 		if (!wait_event_timeout(wib->wait,
 					btrfs_wib_can_mark(wib, logical, len) ||
 					!wib_can_make_room(wib),
-					BTRFS_WIB_FULL_TIMEOUT)) {
+					timeout)) {
 			btrfs_err_rl(fs_info,
-	"raid56 write-intent log still full after %u seconds, failing the write",
-				     jiffies_to_msecs(BTRFS_WIB_FULL_TIMEOUT) / 1000);
+	"raid56 write-intent log still full after %u ms, failing the write",
+				     jiffies_to_msecs(timeout));
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL, logical, NULL, 0);
 			return -EIO;
 		}
