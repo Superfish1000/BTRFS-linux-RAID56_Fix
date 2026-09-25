@@ -415,7 +415,7 @@ unprov_scan() {	# echoes "<garbage> <unreadable>"
 
 case "$MODE" in
 prepare)
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	log "mount options: $(grep umltest /proc/mounts | head -1)"
 	stats
@@ -474,7 +474,7 @@ prepare_fsync)
 	# only referenced from the tree log (fsync without a transaction
 	# commit), the log tree blocks and the fsync'ed data.  f shares its
 	# vertical stripe with the crashed write of 'new'.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	stats
 	MAN=$T/umltest/manifest.$TAG
@@ -495,7 +495,7 @@ inplace)
 	# A nodatacow file overwritten in place with full stripe writes: the
 	# overwritten sectors are referenced, the crash leaves them with a
 	# stale parity unless the write was recorded.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	stats
 	allow_nodatacow
@@ -560,7 +560,7 @@ stress)
 	# Concurrent small-file writers with fsync; the host kills the UML
 	# process at a random moment.  Every file whose fsync returned is
 	# recorded (name + md5) in a host-side manifest before the next write.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	MAN=$T/umltest/manifest.$TAG
 	: > $MAN
@@ -607,7 +607,7 @@ replace)
 	# flight: exercises the dev-replace finishing path that waits for
 	# in-flight bios under device_list_mutex, and the RCU device list
 	# traversal of the log writer (lockdep is enabled in this kernel).
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF /dev/ubda /dev/ubdb /dev/ubdc /dev/ubdd || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF /dev/ubda /dev/ubdb /dev/ubdc /dev/ubdd || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS /dev/ubda
 	watchdog 150
 	writers_start
@@ -628,7 +628,7 @@ replace)
 convert)
 	# No RAID56 at mkfs time: the log must be enabled when the first
 	# RAID5 chunk is created by the balance, at the next commit.
-	mkfs.btrfs -q -f -d raid1 -m raid1 $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d raid1 -m raid1 $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	stats before
 	writers_start
@@ -645,7 +645,7 @@ convert)
 convert_away)
 	# RAID5 -> RAID1 with writers: the log stays enabled (flag set), the
 	# remaining RAID5 chunks are still protected until they are gone.
-	mkfs.btrfs -q -f -d raid5 -m raid5 $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d raid5 -m raid5 $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
 	md5sum $MNT/old | awk '{print $1}' > $T/umltest/old.md5.$TAG
@@ -662,7 +662,7 @@ convert_away)
 	;;
 toggle)
 	# Feature toggling through sysfs while writes are in flight.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS,noraid56_write_intent $MNTDEV
 	watchdog 150
 	writers_start
@@ -687,7 +687,7 @@ detach)
 	# is back, the next mount regenerates their parity.  Then the array
 	# must survive losing any other device.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	log "fs devices: $(btrfs filesystem show $MNT 2>/dev/null | grep devid | tr -s ' ' | tr '\n' ';')"
@@ -723,7 +723,7 @@ nocow_stale)
 	# tolerance) and the stripe recorded, which is exactly what makes the
 	# next mount scrub it.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount "$OPTS${NOLOG:+,noraid56_write_intent}" /dev/mapper/d0
 	log "log state: $(cat /sys/fs/btrfs/*/raid56_write_intent 2>/dev/null | tr '\n' ' ')"
@@ -766,7 +766,7 @@ pausehang_log_prep)
 	# which is the one recovery path that runs after the transaction kthread
 	# has been started -- the only place a commit can overlap it.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	dd if=/dev/urandom of=$MNT/base bs=1M count=8 conv=fsync status=none
@@ -821,7 +821,7 @@ pausehang_prep)
 	# boot's btrfs_wib_load() puts them in wib->pending -- which is the only
 	# thing btrfs_wib_recover() iterates.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	dd if=/dev/urandom of=$MNT/base bs=1M count=8 conv=fsync status=none
@@ -896,7 +896,7 @@ nocow_refuse)
 	# create: an inode marked NODATACOW before any RAID5/6 chunk existed,
 	# or whose extents a balance moved onto one afterwards.  Both are built
 	# here.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	log "incompat raid56 set: $(btrfs inspect-internal dump-super $MNTDEV 2>/dev/null | grep -o 'RAID56' | head -1)"
 	touch $MNT/direct
@@ -931,7 +931,7 @@ nocow_cow)
 	# inplace_full_stripe_writes stays at zero -- there is no in-place RMW
 	# left for a stale sector to arise in.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -986,7 +986,7 @@ nocow_rmw)
 	#
 	# A RAID5 full stripe here is 3 x 64K, so +64K is the next column.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1081,7 +1081,7 @@ nocow_replay_prep)
 	# that handles error records exclusively -- and the one nocow_stale.sh
 	# cannot reach, because it unmounts cleanly and so leaves no log.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1164,7 +1164,7 @@ nocow_two_stale)
 	# mkfs; dump the blocked tasks well before the host gives up on it.
 	watchdog ${WATCH:-600}
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1250,7 +1250,7 @@ nocow_persist_prep)
 	# used to live only in memory, so it did not survive this boundary and
 	# the scrub after the next mount had nothing to consult.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1493,7 +1493,7 @@ unprovable_prep)
 	# stripes so that a later read error on a DIFFERENT device is likely to
 	# land in a vertical stripe that has a stale sector in it.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1637,7 +1637,7 @@ repair_freeze)
 	# frozen -- then thaw and see the repair happen.  CONTROL=1 restores a
 	# repair that ignores the freeze.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1682,7 +1682,7 @@ rmw_torn)
 	# dropped with the data, and the record still names the column against
 	# a parity that has just changed.  CONTROL=1 restores that single batch.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1737,7 +1737,7 @@ repair_pin)
 	# checksummed data.  Unpinned, the repair wakes and writes its stripe
 	# into space that now belongs to the new data.  CONTROL=1 is that.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1827,7 +1827,7 @@ alert)
 	# CONTROL=1 runs the same writes with no fault: every listener must
 	# stay silent and the state must stay ok.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1901,7 +1901,7 @@ alert_read)
 	[ "${READ_TRUST:-0}" = 1 ] &&
 		echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -1965,7 +1965,7 @@ rmw_cache)
 	# refuses -- and its parity write failing leaves 'B''s column and the
 	# parity both wrong in the same row.  CONTROL=1 restores that.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -2086,7 +2086,7 @@ flakey)
 	# Like detach, but the drive only fails writes (reads still work), and
 	# the filesystem is crashed while the drive is bad.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	log "fs devices: $(btrfs filesystem show $MNT 2>/dev/null | grep devid | tr -s ' ' | tr '\n' ';')"
@@ -2111,7 +2111,7 @@ degraded_fresh)
 	# has no checksum to vouch for the result.  If the Q cross-check in
 	# recover_vertical() rejects that, a degraded array cannot write into
 	# fresh space at all.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS,degraded $MNTDEV
 	watchdog 120
 	fails=0
@@ -2176,7 +2176,7 @@ locate)
 	;;
 writers)
 	# Plain concurrent writer workload for a fixed time, no failure.
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DEVS || { log "MKFS_FAIL"; finish; }
 	do_mount $OPTS $MNTDEV
 	watchdog ${WATCH:-100}
 	writers_start
@@ -2199,7 +2199,7 @@ stale_parity)
 	# time.  This reproduces that exposure; see the "remaining exposures"
 	# section of tools/testing/btrfs/raid56_redundancy_model.py.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
@@ -2285,7 +2285,7 @@ devstats)
 	# while (transient), so the RMW retry should fire and the device error
 	# counters should move.  Previously raid56.c touched neither.
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount $OPTS /dev/mapper/d0
 	dd if=/dev/urandom of=$MNT/old bs=128K count=1 status=none; sync
@@ -2319,7 +2319,7 @@ r6deg_prep)
 	# one, and where the first whole full stripe of the nodatacow file lives.
 	watchdog 600
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount rw /dev/mapper/d0
 	allow_nodatacow
@@ -2467,7 +2467,7 @@ r6degL_prep)
 	# the stale columns survive to the next mount.
 	watchdog 600
 	dm_setup
-	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
 	do_mount rw /dev/mapper/d0
 	allow_nodatacow
