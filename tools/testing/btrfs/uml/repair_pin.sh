@@ -17,7 +17,7 @@ KERNEL=${1:?usage: repair_pin.sh <kernel>}
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-pin.sh
+cp $HERE/init-final3.sh $T/umltest/init-pin.sh.$$ && mv -f $T/umltest/init-pin.sh.$$ $T/umltest/init-pin.sh	# atomic: a guest may be reading it
 ulimit -c 0
 arm() {	# name control
 	local tag=repair-pin-$1 ubds=""

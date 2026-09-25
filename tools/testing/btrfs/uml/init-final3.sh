@@ -2127,6 +2127,71 @@ flakey)
 	log "NO_CRASH"
 	finish
 	;;
+degraded_log_full)
+	# A degraded mount must stay writable however long it runs.
+	#
+	# RAID5 data AND metadata over four devices; one is removed and the
+	# filesystem mounted degraded.  Every small in-place write into a full
+	# stripe with a column on the missing device then leaves a record
+	# naming that column, and none of them can retire while the device is
+	# gone.  NREG regions of 4 MiB, each written in all three data columns,
+	# is more than the log holds while anything is stale (82).  If the log
+	# keeps every such record, it fills: small writes fail, and a metadata
+	# write -- RAID5 metadata goes through the same log -- aborts the
+	# transaction and leaves the filesystem read-only, with no way to run
+	# 'btrfs replace'.  CONTROL=1 sets raid56_keep_naming_degraded=1.
+	watchdog ${WATCH:-900}
+	dm_setup
+	mkfs.btrfs -K -q -f -d raid5 -m raid5 $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_keep_naming_degraded 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: records naming a missing device are kept"
+	}
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	dd if=/dev/zero bs=1M count=$(( ${NREG:-120} * 4 + 16 )) status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	umount $MNT || { log "UMOUNT_FAIL"; finish; }
+	# Pull the last device: remove its dm node and let btrfs forget it.
+	last=$(( $(echo $DMDEVS | wc -w) - 1 ))
+	dmsetup remove d$last || log "DM_REMOVE_FAIL"
+	btrfs device scan --forget >/dev/null 2>&1
+	btrfs device scan $(echo $DMDEVS | tr ' ' '\n' | grep -v "d$last\$") >/dev/null 2>&1
+	do_mount $OPTS,degraded /dev/mapper/d0
+	log "mounted degraded without d$last: $(grep " $MNT " /proc/mounts | awk '{print $4}')"
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.dlf
+	ok=0; eio=0
+	for r in $(seq 0 $(( ${NREG:-120} - 1 ))); do
+		for c in 0 1 2; do
+			if dd if=/tmp/bblock.dlf of=$MNT/nocow bs=4096 oflag=direct conv=notrunc \
+			      seek=$(( r * 1024 + c * 16 )) count=1 status=none 2>/dev/null; then
+				ok=$((ok+1))
+			else
+				eio=$((eio+1))
+			fi
+		done
+	done
+	log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 ))"
+	# Metadata: many small files, then a commit.
+	meta=1
+	mkdir -p $MNT/meta 2>/dev/null || meta=0
+	for i in $(seq 1 200); do echo $i > $MNT/meta/f$i 2>/dev/null || meta=0; done
+	sync
+	btrfs filesystem sync $MNT 2>/dev/null || meta=0
+	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	hv() { awk -v k=$1 '$1 == k {print $2}' $H 2>/dev/null; }
+	stats "end"
+	log "DLF ok=$ok eio=$eio meta=$meta ro=$ro state=$(hv state) dropped=$(hv record_dropped) log_full=$(hv log_full) unack=$(hv unacknowledged)"
+	echo "$ok $eio $meta $ro $(hv record_dropped) $(hv log_full)" > $T/umltest/dlf.$TAG
+	kmsg "raid56|forced readonly|Transaction aborted" 8
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 degraded_fresh)
 	# A RAID6 array that is degraded from the start, writing into space
 	# that has never been written.  The parity of a never-written vertical

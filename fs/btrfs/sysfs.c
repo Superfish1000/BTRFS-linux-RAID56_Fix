@@ -1431,14 +1431,35 @@ BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
 /*
  * Whether the RAID5/6 write path is healthy, and if not what to do.  Wait on
  * it with poll(): it is notified on every change of state.  See
- * btrfs_raid56_alert().
+ * btrfs_raid56_alert().  Write "ack" (or "ack <unacknowledged_seq>") to it
+ * once the events it lists as unacknowledged have been dealt with; see
+ * btrfs_raid56_health_ack().
  */
 static ssize_t btrfs_raid56_health_show_attr(struct kobject *kobj,
 					     struct kobj_attribute *a, char *buf)
 {
 	return btrfs_raid56_health_show(to_fs_info(kobj), buf);
 }
-BTRFS_ATTR(, raid56_health, btrfs_raid56_health_show_attr);
+
+static ssize_t btrfs_raid56_health_store(struct kobject *kobj,
+					 struct kobj_attribute *a,
+					 const char *buf, size_t len)
+{
+	bool check_seq = false;
+	u64 seq = 0;
+	int ret;
+
+	/* "ack", or "ack <unacknowledged_seq>" to clear only what was seen. */
+	if (!sysfs_streq(buf, "ack")) {
+		if (strncmp(buf, "ack ", 4) || kstrtoull(skip_spaces(buf + 4), 0, &seq))
+			return -EINVAL;
+		check_seq = true;
+	}
+	ret = btrfs_raid56_health_ack(to_fs_info(kobj), check_seq, seq);
+	return ret < 0 ? ret : len;
+}
+BTRFS_ATTR_RW(, raid56_health, btrfs_raid56_health_show_attr,
+	      btrfs_raid56_health_store);
 
 static const char *btrfs_read_policy_name[] = {
 	"pid",

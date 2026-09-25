@@ -56,7 +56,7 @@ FAIL=1
 PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
 cc -O2 -o $T/umltest/evidence $HERE/../evidence.c 2>/dev/null || true
 cc -O2 -o $T/umltest/wibdump $HERE/../wibdump.c 2>/dev/null || true
 [ -x $T/umltest/evidence ] || { echo "RESULT: INCONCLUSIVE -- no compiler for the consumer"; exit 2; }

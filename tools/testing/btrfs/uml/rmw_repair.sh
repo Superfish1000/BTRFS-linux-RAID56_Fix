@@ -46,7 +46,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 # A private copy: other scripts overwrite init-final3.sh in place while their
 # guests may be reading it.
-cp $HERE/init-final3.sh $T/umltest/init-rmw.sh
+cp $HERE/init-final3.sh $T/umltest/init-rmw.sh.$$ && mv -f $T/umltest/init-rmw.sh.$$ $T/umltest/init-rmw.sh	# atomic: a guest may be reading it
 cp $HERE/nocow_platter.py $T/umltest/nocow_platter.py
 ulimit -c 0
 

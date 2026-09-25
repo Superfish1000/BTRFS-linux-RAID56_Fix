@@ -18,7 +18,7 @@ NDEV=${2:-4}; FAIL=${3:-1}; DELAY=${4:-40}
 TAG=pausehang
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D; rm -f $T/umltest/results.$TAG $T/umltest/stop.$TAG
 for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; done

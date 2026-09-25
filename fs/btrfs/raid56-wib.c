@@ -291,20 +291,97 @@ static bool wib_entry_names_member(const struct btrfs_wib_entry *e)
  * stale data column from a stale parity -- the two need opposite repairs, and
  * a scrub that cannot tell them apart may not touch the stripe at all.  An
  * entry with only @sticky says that something went wrong somewhere in the
- * stripe, which a scrub can rediscover by reading it.  So spend the vague
- * records first and the specific ones only when there is nothing else left.
+ * stripe, which a scrub can rediscover by reading it.  So only the vague
+ * records are ever spent.
  *
- * The second pass is not optional.  wib_count_entries_locked() counts every
- * entry without in-flight bits as available and btrfs_wib_try_mark() then
- * asserts that the room it was promised exists; a preference keeps that true,
- * refusing outright would not.  Losing the address of a fault is survivable,
- * losing the write path is not.
+ * A log full of specific ones fails the new write instead (btrfs_wib_mark()):
+ * the application sees EIO and the user an alert, where dropping the record
+ * would have lost acknowledged data with no sign at all.  The records retire
+ * as repairs reach their stripes.  wib_count_entries_locked() counts only
+ * what wib_evictable() allows as room, so btrfs_wib_try_mark() is never
+ * promised room this cannot find.
  */
+/*
+ * Testing only: let a full log evict records that name a stale member again.
+ * See wib_evict_sticky().
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool evict_naming;
+module_param_named(raid56_evict_naming, evict_naming, bool, 0644);
+MODULE_PARM_DESC(raid56_evict_naming,
+		 "Let a full write-intent log evict records that name a stale member (testing only: restores a known defect)");
+static bool keep_naming_degraded;
+module_param_named(raid56_keep_naming_degraded, keep_naming_degraded, bool, 0644);
+MODULE_PARM_DESC(raid56_keep_naming_degraded,
+		 "Never let a full write-intent log spend records naming a stale member, even with a device missing (testing only: restores a known wedge)");
+#else
+static const bool evict_naming;
+static const bool keep_naming_degraded;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+/* The self tests run at load, after the command line has set the knob. */
+bool btrfs_wib_evicts_naming(void)
+{
+	return READ_ONCE(evict_naming);
+}
+#endif
+
+/*
+ * May a full log spend a record that names a stale member?  Not while that
+ * member can still be repaired: such a record retires by itself once the
+ * device takes the repair or is replaced, and spending it loses acknowledged
+ * data without checksums.
+ *
+ * But with a device missing, the records naming its columns cannot retire --
+ * nothing can be written to it -- and every write of a degraded mount into a
+ * stripe with a column there makes another one.  Kept, they wedge the log
+ * within a few hundred megabytes: every small write fails, a metadata write
+ * turns the filesystem read-only, and 'btrfs replace', which needs it
+ * writable, can no longer run.  A degraded array has lost that redundancy
+ * anyway, and the returning device is a resync's job.  So spend them then,
+ * last, with the alert.  The same during log replay at mount, which must be
+ * able to write to finish mounting at all.
+ */
+static bool wib_may_evict_naming(const struct btrfs_wib *wib)
+{
+	const struct btrfs_fs_info *fs_info = wib->fs_info;
+
+	if (READ_ONCE(evict_naming))
+		return true;
+	if (READ_ONCE(keep_naming_degraded))
+		return false;
+	return READ_ONCE(fs_info->fs_devices->missing_devices) ||
+	       test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
+}
+
+static void wib_policy_locked(struct btrfs_wib *wib)
+{
+	lockdep_assert_held(&wib->lock);
+	wib->may_evict_naming = wib_may_evict_naming(wib);
+}
+
+/* May a full log evict @e?  See wib_may_evict_naming(). */
+static bool wib_evictable(const struct btrfs_wib *wib, const struct btrfs_wib_entry *e)
+{
+	return !e->bitmap && (wib->may_evict_naming || !wib_entry_names_member(e));
+}
+
 static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 {
 	lockdep_assert_held(&wib->lock);
 
-	for (int pass = 0; pass < 2; pass++) {
+	/*
+	 * Pass 0 takes records that only say "a write failed here"; pass 1
+	 * used to take records naming the stale member too, and that loses
+	 * data: the read path then trusts the stale platter, and the next RMW
+	 * or scrub folds it into the parity, silently for data without a
+	 * checksum -- the acknowledged value existed only in the parity.  A
+	 * full log now fails the new write instead (btrfs_wib_mark()), which
+	 * the caller sees -- except when wib_may_evict_naming() says keeping
+	 * them would wedge the log.
+	 */
+	for (int pass = 0; pass < (wib->may_evict_naming ? 2 : 1); pass++) {
 		for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 			struct btrfs_wib_entry *e = &wib->entries[i];
 
@@ -361,6 +438,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 static void wib_enforce_capacity_locked(struct btrfs_wib *wib)
 {
 	lockdep_assert_held(&wib->lock);
+	wib_policy_locked(wib);
 
 	while (wib_live_count(wib) > wib_live_max(wib)) {
 		if (!wib_evict_sticky(wib))
@@ -440,7 +518,7 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		if (!wib_entry_used(e))
 			continue;
 		live++;
-		if (!e->bitmap && (e->bytenr < first || e->bytenr > last))
+		if (wib_evictable(wib, e) && (e->bytenr < first || e->bytenr > last))
 			evictable++;
 	}
 	/*
@@ -454,6 +532,34 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		*avail = max + evictable - live;
 }
 
+/*
+ * Can anything still make room in a full log?  A write in flight frees its
+ * slot when it finishes; a queued or running repair retires the record it
+ * repairs.  With neither, waiting cannot help.
+ */
+static bool wib_can_make_room_locked(struct btrfs_wib *wib)
+{
+	lockdep_assert_held(&wib->lock);
+
+	if (atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr))
+		return true;
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
+		if (wib->entries[i].bitmap)
+			return true;
+	return false;
+}
+
+static bool wib_can_make_room(struct btrfs_wib *wib)
+{
+	unsigned long flags;
+	bool can;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	can = wib_can_make_room_locked(wib);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return can;
+}
+
 /* True if btrfs_wib_try_mark() for the same range would succeed. */
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len)
 {
@@ -462,6 +568,7 @@ bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len)
 	unsigned int avail;
 
 	spin_lock_irqsave(&wib->lock, flags);
+	wib_policy_locked(wib);
 	wib_count_entries_locked(wib, logical, len, &needed, &avail);
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return needed <= avail;
@@ -482,6 +589,7 @@ int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len)
 
 	lockdep_assert_held(&wib->lock);
 
+	wib_policy_locked(wib);
 	wib_count_entries_locked(wib, logical, len, &needed, &avail);
 	if (needed > avail)
 		return -ENOSPC;
@@ -1120,10 +1228,15 @@ static int wib_write_all_devices(struct btrfs_wib *wib, int *nr_errors_ret)
 	 * write fail while the filesystem was well inside its tolerance:
 	 * metadata raid6 on three devices with one failing writes, or RAID6
 	 * on four with two.
+	 *
+	 * Only ever a relaxation of that rule, never a tightening: past the
+	 * tolerance (k > t) t + 1 copies still let writes that do not touch
+	 * the failing devices go ahead, as they always did.
 	 */
 	if (nr - nr_errors >= 1 &&
-	    nr_errors + (int)READ_ONCE(fs_info->fs_devices->missing_devices) <=
-	    wib_max_tolerated_failures(fs_info)) {
+	    (nr - nr_errors >= wib_max_tolerated_failures(fs_info) + 1 ||
+	     nr_errors + (int)READ_ONCE(fs_info->fs_devices->missing_devices) <=
+	     wib_max_tolerated_failures(fs_info))) {
 		btrfs_warn_rl(fs_info,
 		"raid56 write-intent log: %d of %d device writes failed, continuing",
 			      nr_errors, nr);
@@ -1415,6 +1528,7 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
+	bool can_make_room;
 	bool enabled;
 	u64 want;
 	int ret;
@@ -1441,6 +1555,12 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			spin_unlock_irqrestore(&wib->lock, flags);
 			break;
 		}
+		/*
+		 * Sampled in the same locked section as the failure: a write
+		 * finishing in between would otherwise look like nothing left
+		 * to wait for, and fail a write that now fits.
+		 */
+		can_make_room = wib_can_make_room_locked(wib);
 		spin_unlock_irqrestore(&wib->lock, flags);
 
 		/*
@@ -1450,10 +1570,22 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * a wait that is guaranteed to end: bound it and fail the
 		 * write rather than hang the task forever.
 		 */
+		/*
+		 * Only a write in flight or a repair can make room.  With
+		 * neither, the log is full of records that must stay -- they
+		 * name stale data on a device that keeps failing -- and waiting
+		 * would only make every write take a minute to fail.  Fail it
+		 * now, and wait below only while something can still finish.
+		 */
+		if (!can_make_room) {
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL, logical, NULL, 0);
+			return -EIO;
+		}
 		btrfs_warn_rl(fs_info,
-			      "raid56 write-intent log full, waiting for in-flight writes");
+			      "raid56 write-intent log full, waiting for in-flight writes and repairs");
 		if (!wait_event_timeout(wib->wait,
-					btrfs_wib_can_mark(wib, logical, len),
+					btrfs_wib_can_mark(wib, logical, len) ||
+					!wib_can_make_room(wib),
 					BTRFS_WIB_FULL_TIMEOUT)) {
 			btrfs_err_rl(fs_info,
 	"raid56 write-intent log still full after %u seconds, failing the write",
@@ -1537,6 +1669,29 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
  * flight: used for stripes whose recovery could not complete.  Dropped with
  * a warning if the log is full.
  */
+/*
+ * Record [@logical, @logical + @len) as having had a failed write.  Returns
+ * -ENOSPC, recording nothing and saying nothing, if the log has no room: for
+ * a caller that can still fail the write instead.
+ */
+int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	int ret;
+
+	if (!wib)
+		return 0;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	ret = btrfs_wib_try_mark(wib, logical, len);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (ret < 0)
+		return ret;
+	btrfs_wib_done(fs_info, logical, len, true);
+	return 0;
+}
+
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;
@@ -2849,7 +3004,21 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_READ_AMBIGUOUS] = "read_unverifiable",
 	[BTRFS_RAID56_EV_LOG_WRITE]	= "log_write_failed",
 	[BTRFS_RAID56_EV_REPAIR_DROPPED] = "repair_dropped",
+	[BTRFS_RAID56_EV_READ_PARITY]	= "read_parities_disagree",
 };
+
+/*
+ * An episode ends when nothing is recorded any more, which proves every
+ * damaged stripe was repaired.  These events leave no record to retire: a
+ * write that failed before it reached a disk, a record the log had to drop,
+ * a read refused because the parities disagree.  Ending the episode on "no
+ * record" would turn the state back to ok the moment it went failing -- no
+ * poll() wake-up and no uevent anyone could see.  They hold it failing until
+ * someone acknowledges them: btrfs_raid56_health_ack().
+ */
+#define BTRFS_RAID56_LATCHED_EVENTS	(BIT(BTRFS_RAID56_EV_DROPPED) |		\
+					 BIT(BTRFS_RAID56_EV_LOG_WRITE) |	\
+					 BIT(BTRFS_RAID56_EV_READ_PARITY))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -2873,22 +3042,22 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 	switch (ev) {
 	case BTRFS_RAID56_EV_STALE:
 		btrfs_warn(fs_info,
-"raid56: %s failed a write into full stripe %llu; the parity still holds the data and the stripe will be repaired in the background. If the device keeps failing, writes into its damaged stripes will be refused: check it, and replace it with 'btrfs replace start %llu <new device> <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: %s failed a write into full stripe %llu; the parity still holds the data and a repair will be attempted in the background. If the device keeps failing, the repair gives up and writes into its damaged stripes are refused: check it, and replace it with 'btrfs replace start %llu <new device> <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
 			   who, logical, devid, fsid);
 		break;
 	case BTRFS_RAID56_EV_REFUSED:
 		btrfs_err(fs_info,
-"raid56: REFUSED a write into full stripe %llu (EIO to the application): its data on %s is stale and the device did not take the repair, so writing would have put acknowledged data at risk. Nothing already written was lost. Writes into stripes with stale data on that device will keep failing until it works again or is replaced ('btrfs replace start %llu <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'). State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: REFUSED a write into full stripe %llu (EIO to the application; a refused metadata write makes the filesystem read-only): its data on %s is stale and the device did not take the repair, so writing would have put acknowledged data at risk. Writes into stripes with stale data on that device will keep failing until it works again or is replaced ('btrfs replace start %llu <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'). State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, who, devid, fsid);
 		break;
 	case BTRFS_RAID56_EV_NOT_DURABLE:
 		btrfs_err(fs_info,
-"raid56: REFUSED a write into full stripe %llu (EIO to the application): its repair could not be made durable because a device did not confirm a cache flush. Nothing already written was lost. Find the failing device (btrfs device stats <mountpoint>, dmesg) and replace it, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: REFUSED a write into full stripe %llu (EIO to the application; a refused metadata write makes the filesystem read-only): its repair could not be made durable because a device did not confirm a cache flush. Find the failing device (btrfs device stats <mountpoint>, dmesg) and replace it, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_UNDECIDABLE:
 		btrfs_err(fs_info,
-"raid56: full stripe %llu has more of it recorded stale (%s among them) than its parity can rebuild; writes into it fail with EIO and it cannot be repaired automatically. The data still on the disks is kept. Bring back any missing device, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: full stripe %llu has more of it recorded stale or missing (%s among them) than its parity can rebuild -- a missing device, or writes that failed on more devices than the parity covers; writes into it fail with EIO and it cannot be repaired automatically. The data still on the disks is kept. Bring back any missing device and fix or replace the failing ones, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, who, fsid);
 		break;
 	case BTRFS_RAID56_EV_FAILED:
@@ -2903,17 +3072,17 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		break;
 	case BTRFS_RAID56_EV_LOG_FULL:
 		btrfs_err(fs_info,
-"raid56: a write near %llu failed (EIO to the application) because the write-intent log stayed full: it is held by stripes waiting for repair. Replace any failing device and run 'btrfs scrub start <mountpoint>' to free it. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: a write near %llu FAILED (EIO to the application) because the write-intent log is full of records that name stale data -- they cannot be dropped without forgetting which copy is wrong, so the log refuses new writes instead. This lasts while the device that caused them keeps failing: fix or replace it ('btrfs replace start <devid> <new device> <mountpoint>'); the records retire as their stripes are repaired. If the filesystem has gone read-only, detach that device and mount with -o degraded: records naming a missing device can be given up, and the replace can run. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_DROPPED:
 		btrfs_err(fs_info,
-"raid56: the write-intent log was full and dropped the record of stripes near %llu; which device holds stale data there may no longer be known. Run 'btrfs scrub start <mountpoint>' before relying on them. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: the write-intent log was full and dropped the record of failed writes near %llu (not which device took them). Data with checksums there is still verified on every read; data without checksums may read back an older version, and a scrub cannot tell which copy is right -- do not count on it to restore them. Fix or replace the failing device, then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_LOG_WRITE:
 		btrfs_err(fs_info,
-"raid56: a write near %llu FAILED (EIO to the application) before reaching any disk, because the write-intent log could not be written: either too few devices took the log write, or the log is full of records it cannot drop while a device does not complete cache flushes. Every such write will fail until the device is fixed or replaced (btrfs device stats <mountpoint> names it; 'btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'). State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: a write near %llu FAILED (EIO to the application) before reaching any disk, because the write-intent log could not be written: either too few devices took the log write, or the log is full of records it cannot drop while a device does not complete cache flushes. Every such write will fail until the device is fixed or replaced (btrfs device stats <mountpoint> names it; 'btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_REPAIR_DROPPED:
@@ -2924,6 +3093,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 	case BTRFS_RAID56_EV_READ_AMBIGUOUS:
 		btrfs_err(fs_info,
 "raid56: REFUSED a read of full stripe %llu (EIO to the application): more of it is missing or recorded stale (%s among them) than its parity can rebuild, and data without a checksum would have come back WRONG. Bring back any missing device, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+			  logical, who, fsid);
+		break;
+	case BTRFS_RAID56_EV_READ_PARITY:
+		btrfs_err(fs_info,
+"raid56: REFUSED a read of full stripe %llu (EIO to the application): data without a checksum had to be rebuilt (%s did not return it), and the stripe's two parities give different answers for it -- one of them is stale or corrupt and nothing can tell which, so either answer could be WRONG. Bring back or replace the device, run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  logical, who, fsid);
 		break;
 	default:
@@ -2991,7 +3165,7 @@ void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event e
 
 	spin_lock_irqsave(&wib->alert_lock, flags);
 	if (bioc) {
-		for_each_set_bit(col, &cols, bioc->num_stripes) {
+		for_each_set_bit(col, &cols, min_t(int, bioc->num_stripes, BITS_PER_LONG)) {
 			const struct btrfs_device *dev = bioc->stripes[col].dev;
 			char this[BTRFS_RAID56_ALERT_NAME];
 
@@ -3016,6 +3190,17 @@ void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event e
 	/* Notices: redundancy lost, nothing failed. */
 	if (ev != BTRFS_RAID56_EV_STALE && ev != BTRFS_RAID56_EV_REPAIR_DROPPED)
 		wib->alert_failing = true;
+	if (BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS) {
+		wib->alert_latched |= BIT(ev);
+		wib->alert_latch_seq++;
+	}
+	/*
+	 * A monitor hears of every new kind of trouble and of every latched
+	 * event, not only of changes of state: a second device failing while
+	 * the state is already failing is news too.
+	 */
+	if (first || (BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS))
+		wib->alert_announce = true;
 	wib->last_event = ev;
 	wib->last_logical = logical;
 	wib->last_devid = devid;
@@ -3061,6 +3246,7 @@ static void raid56_alert_work(struct work_struct *work)
 	const unsigned int nr_stale = atomic_read(&wib->nr_stale);
 	unsigned long flags;
 	u64 last_devid;
+	bool announce;
 	bool any = false;
 
 	if (btrfs_is_testing(fs_info))
@@ -3080,12 +3266,21 @@ static void raid56_alert_work(struct work_struct *work)
 	memset(wib->alert_pending, 0, sizeof(wib->alert_pending));
 	for (int i = 0; i < BTRFS_RAID56_NR_EVENTS; i++)
 		any |= pending[i] != 0;
-	/* Nothing recorded any more: every affected stripe was repaired. */
+	/*
+	 * Nothing recorded any more: every affected stripe was repaired, and
+	 * that part of the episode is over.  Forget the devices -- a replaced
+	 * one carries its old devid on a new disk -- and explain the next
+	 * trouble afresh.  Only events no record stands for remain, holding
+	 * the state failing until someone acknowledges them.
+	 */
 	if (!nr_stale && !nr_sticky) {
-		wib->alert_failing = false;
-		wib->alert_seen = 0;
+		wib->alert_seen &= wib->alert_latched;
 		memset(wib->alert_devs, 0, sizeof(wib->alert_devs));
+		if (!wib->alert_latched)
+			wib->alert_failing = false;
 	}
+	announce = wib->alert_announce;
+	wib->alert_announce = false;
 	if (wib->alert_failing)
 		health = BTRFS_RAID56_HEALTH_FAILING;
 	else if (nr_stale || nr_sticky)
@@ -3100,7 +3295,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -3112,22 +3307,25 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_READ_AMBIGUOUS],
 			   pending[BTRFS_RAID56_EV_LOG_WRITE],
 			   pending[BTRFS_RAID56_EV_REPAIR_DROPPED],
+			   pending[BTRFS_RAID56_EV_READ_PARITY],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
-		char env_health[48];
-		char env_event[64];
-		char env_devid[48];
-		char *envp[] = { env_health, env_event, env_devid, NULL };
-
 		if (health == BTRFS_RAID56_HEALTH_OK)
 			btrfs_info(fs_info,
-		"raid56: every recorded stripe has been repaired; health ok (was %s)",
+		"raid56: every recorded stripe has been repaired and every alert acknowledged; health ok (was %s)",
 				   raid56_health_names[old]);
 		else
 			btrfs_warn(fs_info, "raid56: health %s (was %s), see /sys/fs/btrfs/%pU/raid56_health",
 				   raid56_health_names[health], raid56_health_names[old],
 				   fs_info->fs_devices->fsid);
+	}
+	if (health != old || announce) {
+		char env_health[48];
+		char env_event[64];
+		char env_devid[48];
+		char *envp[] = { env_health, env_event, env_devid, NULL };
+
 		sysfs_notify(kobj, NULL, "raid56_health");
 		if (kobj->state_in_sysfs) {
 			snprintf(env_health, sizeof(env_health), "BTRFS_RAID56_HEALTH=%s",
@@ -3180,6 +3378,8 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 	u64 last_devid;
 	unsigned int nr_sticky;
 	unsigned int nr_stale;
+	unsigned long latched;
+	u64 latch_seq;
 	bool failing;
 	int len = 0;
 
@@ -3190,6 +3390,8 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 	nr_stale = atomic_read(&wib->nr_stale);
 	spin_lock_irqsave(&wib->alert_lock, flags);
 	failing = wib->alert_failing;
+	latched = wib->alert_latched;
+	latch_seq = wib->alert_latch_seq;
 	last_event = wib->last_event;
 	last_logical = wib->last_logical;
 	last_devid = wib->last_devid;
@@ -3223,6 +3425,14 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 			jiffies_to_msecs(jiffies - last_jiffies) / 1000);
 	else
 		len += sysfs_emit_at(buf, len, "last_event none\n");
+	len += sysfs_emit_at(buf, len, "unacknowledged");
+	if (!latched)
+		len += sysfs_emit_at(buf, len, " none");
+	for (int i = 0; i < BTRFS_RAID56_NR_EVENTS; i++)
+		if (latched & BIT(i))
+			len += sysfs_emit_at(buf, len, " %s", raid56_event_names[i]);
+	len += sysfs_emit_at(buf, len, "\n");
+	len += sysfs_emit_at(buf, len, "unacknowledged_seq %llu\n", latch_seq);
 	len += sysfs_emit_at(buf, len, "devices");
 	for (int i = 0; i < BTRFS_RAID56_ALERT_DEVS; i++)
 		if (devs[i].devid)
@@ -3245,7 +3455,8 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 					     named ? "," : "", devs[i].devid);
 			named = true;
 		}
-		len += sysfs_emit_at(buf, len, "%sscrub\n", named ? " then " : "");
+		len += sysfs_emit_at(buf, len, "%sscrub%s\n", named ? " then " : "",
+				     latched ? " then ack" : "");
 	} else if (health == BTRFS_RAID56_HEALTH_DEGRADED) {
 		/* Once the queue overflowed, waiting will not finish the job. */
 		len += sysfs_emit_at(buf, len, "%s\n",
@@ -3255,6 +3466,39 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 		len += sysfs_emit_at(buf, len, "none\n");
 	}
 	return len;
+}
+
+/*
+ * Someone has seen the events that no record stands for and dealt with them:
+ * "echo ack > /sys/fs/btrfs/<fsid>/raid56_health".  The state goes back to
+ * what the records say, announced as any change is.
+ *
+ * A script should write "ack <seq>" with the unacknowledged_seq it read: if
+ * another latched event arrived since, nothing is cleared and -EAGAIN tells it
+ * to look again, so an ack never covers an event nobody saw.
+ */
+int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 seq)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	unsigned long flags;
+	unsigned long was;
+
+	if (!wib)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	if (check_seq && seq != wib->alert_latch_seq) {
+		spin_unlock_irqrestore(&wib->alert_lock, flags);
+		return -EAGAIN;
+	}
+	was = wib->alert_latched;
+	wib->alert_latched = 0;
+	/* If it happens again, it is explained again. */
+	wib->alert_seen &= ~was;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	if (was)
+		btrfs_info(fs_info, "raid56: alerts acknowledged");
+	raid56_alert_kick(wib, 0);
+	return 0;
 }
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)

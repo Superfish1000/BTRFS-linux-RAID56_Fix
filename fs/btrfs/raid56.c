@@ -75,6 +75,20 @@
  */
 #define RBIO_REPAIR_BIT		7
 
+/*
+ * Set by recover_verify_q() when a rebuild from P does not match Q: the
+ * stripe's two parities disagree about the sector.  recover_sectors() keeps
+ * it only for the rows a read asked for.
+ */
+#define RBIO_PARITY_MISMATCH_BIT	8
+
+/*
+ * Set by fill_data_csums() when the checksum lookup ran and succeeded, so a
+ * clear bit in csum_bitmap -- or no bitmap at all -- means "no checksum"
+ * rather than "could not find out".  See rbio_sector_unchecked().
+ */
+#define RBIO_CSUMS_KNOWN_BIT		9
+
 #ifdef CONFIG_BTRFS_DEBUG
 /*
  * Crash injection for testing the write-intent log, module parameter
@@ -2591,8 +2605,10 @@ static int recover_verify_q(struct btrfs_raid_bio *rbio, int sector_nr,
 		pointers[qstripe] = scratch_q;
 		raid6_gen_syndrome(rbio->real_stripes, step, pointers);
 
-		if (unlikely(memcmp(scratch_q, unmap_array[qstripe], step) != 0))
+		if (unlikely(memcmp(scratch_q, unmap_array[qstripe], step) != 0)) {
+			set_bit(RBIO_PARITY_MISMATCH_BIT, &rbio->flags);
 			ret = -EIO;
+		}
 
 		for (int stripe_nr = qstripe; stripe_nr >= 0; stripe_nr--)
 			kunmap_local(unmap_array[stripe_nr]);
@@ -2846,6 +2862,8 @@ static int recover_sectors(struct btrfs_raid_bio *rbio)
 		 */
 		if (ret < 0 && rbio->operation == BTRFS_RBIO_READ_REBUILD &&
 		    !rbio_row_requested(rbio, sectornr)) {
+			/* Nor does its disagreement: see recover_rbio(). */
+			clear_bit(RBIO_PARITY_MISMATCH_BIT, &rbio->flags);
 			ret = 0;
 			continue;
 		}
@@ -2862,19 +2880,52 @@ out:
 }
 
 /*
- * Testing only: hand back a rebuild that had to use a column recorded stale,
- * as this code used to.  See rbio_rebuilt_unverified().
+ * Testing only: hand back a rebuild nothing can check, as this code used to --
+ * one that had to use a column recorded stale (rbio_rebuilt_unverified()), or
+ * a RAID6 retry from one parity when the other disagrees
+ * (set_rbio_raid6_extra_error()).
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool read_trusts_ambiguous;
 module_param_named(raid56_read_trusts_ambiguous, read_trusts_ambiguous, bool, 0644);
 MODULE_PARM_DESC(raid56_read_trusts_ambiguous,
-		 "Return data rebuilt from a column recorded stale when nothing can check it (testing only: restores a known defect)");
+		 "Return data rebuilt from a column recorded stale, or from one RAID6 parity the other contradicts, when nothing can check it (testing only: restores known defects)");
 #else
 static const bool read_trusts_ambiguous;
 #endif
 
 static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio);
+static bool set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio,
+				       int mirror_num, unsigned long *cols);
+
+/*
+ * A data sector a caller asked for, with no checksum: once it is rebuilt,
+ * nothing but the parity vouches for what comes back.
+ *
+ * Only data.  A tree block carries its own checksum, verified above this
+ * layer, which rejects a wrong rebuild and accepts a right one; refusing it
+ * here would turn correct metadata into read errors.
+ *
+ * @unknown is the answer when fill_data_csums() could not look (no memory, a
+ * csum leaf that would not read): whether refusing then costs a correct
+ * read or saves a wrong one depends on the caller.
+ */
+static bool rbio_sector_unchecked(struct btrfs_raid_bio *rbio, int stripe,
+				  int sectornr, bool unknown)
+{
+	const int idx = stripe * rbio->stripe_nsectors + sectornr;
+
+	if (!(rbio->bioc->map_type & BTRFS_BLOCK_GROUP_DATA) ||
+	    (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_METADATA))
+		return false;
+	if (stripe >= rbio->nr_data)
+		return false;
+	if (!sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
+		return false;
+	if (!test_bit(RBIO_CSUMS_KNOWN_BIT, &rbio->flags))
+		return unknown;
+	return !(rbio->csum_bitmap && test_bit(idx, rbio->csum_bitmap));
+}
 
 /*
  * Did this read rebuild a sector somebody asked for, that has no checksum,
@@ -2889,25 +2940,18 @@ static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio);
  */
 static bool rbio_rebuilt_unverified(struct btrfs_raid_bio *rbio)
 {
-	/*
-	 * Only data.  A tree block carries its own checksum, verified above
-	 * this layer, which rejects a wrong rebuild and accepts a right one;
-	 * refusing it here would turn correct metadata into read errors.
-	 */
-	if (!(rbio->bioc->map_type & BTRFS_BLOCK_GROUP_DATA) ||
-	    (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_METADATA))
-		return false;
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
 			const int idx = stripe * rbio->stripe_nsectors + nr;
 
-			if (!test_bit(idx, rbio->error_bitmap))
-				continue;
-			if (!sector_paddrs_in_rbio(rbio, stripe, nr, 1))
-				continue;
-			if (rbio->csum_bitmap && test_bit(idx, rbio->csum_bitmap))
-				continue;
-			return true;
+			/*
+			 * Not knowing is refusing: the rebuild used a stale
+			 * column, so it is wrong unless the write it lost
+			 * changed nothing, and a checksum would reject it too.
+			 */
+			if (test_bit(idx, rbio->error_bitmap) &&
+			    rbio_sector_unchecked(rbio, stripe, nr, true))
+				return true;
 		}
 	}
 	return false;
@@ -2916,6 +2960,8 @@ static bool rbio_rebuilt_unverified(struct btrfs_raid_bio *rbio)
 static void recover_rbio(struct btrfs_raid_bio *rbio)
 {
 	struct bio_list bio_list = BIO_EMPTY_LIST;
+	unsigned long checked_cols = 0;
+	bool checked = false;
 	int total_sector_nr;
 	int ret = 0;
 
@@ -2954,6 +3000,11 @@ static void recover_rbio(struct btrfs_raid_bio *rbio)
 		goto out;
 
 	index_rbio_pages(rbio);
+
+	/* Needs the checksums and the bio pages, so only now. */
+	if (rbio->retry_mirror)
+		checked = set_rbio_raid6_extra_error(rbio, rbio->retry_mirror,
+						     &checked_cols);
 
 	/*
 	 * Read everything that hasn't failed. However this time we will
@@ -3009,6 +3060,18 @@ static void recover_rbio(struct btrfs_raid_bio *rbio)
 				   rbio_stale_cols(rbio));
 		ret = -EIO;
 	}
+
+	/*
+	 * A RAID6 retry that kept every column it read -- see
+	 * set_rbio_raid6_extra_error() -- found the parities disagreeing
+	 * about a sector with no checksum.  Every such retry says so, not
+	 * just the first: a later one may be the only one that got this far.
+	 */
+	if (ret == -EIO && checked &&
+	    test_bit(RBIO_PARITY_MISMATCH_BIT, &rbio->flags))
+		btrfs_raid56_alert(rbio->bioc->fs_info, BTRFS_RAID56_EV_READ_PARITY,
+				   rbio->bioc->full_stripe_logical, rbio->bioc,
+				   checked_cols);
 out:
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }
@@ -3027,8 +3090,14 @@ static void recover_rbio_work_locked(struct work_struct *work)
 	recover_rbio(container_of(work, struct btrfs_raid_bio, work));
 }
 
-static void set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio, int mirror_num)
+/*
+ * Returns whether any row was left alone -- see the comment in the loop --
+ * and sets the bits of their columns in @cols.
+ */
+static bool set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio,
+				       int mirror_num, unsigned long *cols)
 {
+	bool checked = false;
 	bool found = false;
 	int sector_nr;
 
@@ -3057,6 +3126,27 @@ static void set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio, int mirror_n
 		ASSERT(found_errors == 1);
 		found = true;
 
+		/*
+		 * Leaving a column out that read fine is how a checksum gets
+		 * a second opinion when P gave a wrong answer: rebuild from Q
+		 * instead, and let the checksum pick.  A sector without one
+		 * has nothing to pick with.  If the stripe is consistent this
+		 * mirror gives the answer mirror 2 gave; if not -- mirror 2
+		 * failed its Q cross-check -- one parity is stale, and
+		 * trusting the other returned whichever it happened to be,
+		 * old data included, as good.  Leave the row with its one
+		 * failure instead: it is rebuilt from P and checked against Q,
+		 * and a stripe that disagrees fails the read.
+		 */
+		if (!READ_ONCE(read_trusts_ambiguous) &&
+		    rbio_sector_unchecked(rbio, faila, sector_nr, false)) {
+			/* A column past BITS_PER_LONG counts, unnamed. */
+			if (faila < BITS_PER_LONG)
+				*cols |= BIT(faila);
+			checked = true;
+			continue;
+		}
+
 		/* Now select another stripe to mark as error. */
 		failb = rbio->real_stripes - (mirror_num - 1);
 		if (failb <= faila)
@@ -3070,6 +3160,7 @@ static void set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio, int mirror_n
 
 	/* We should found at least one vertical stripe with error.*/
 	ASSERT(found);
+	return checked;
 }
 
 /*
@@ -3099,10 +3190,11 @@ void raid56_parity_recover(struct bio *bio, struct btrfs_io_context *bioc,
 	/*
 	 * Loop retry:
 	 * for 'mirror == 2', reconstruct from all other stripes.
-	 * for 'mirror_num > 2', select a stripe to fail on every retry.
+	 * for 'mirror_num > 2', select a stripe to fail on every retry,
+	 * done by recover_rbio() once the checksums are in.
 	 */
 	if (mirror_num > 2)
-		set_rbio_raid6_extra_error(rbio, mirror_num);
+		rbio->retry_mirror = mirror_num;
 
 	start_async_work(rbio, recover_rbio_work);
 }
@@ -3156,6 +3248,7 @@ static void fill_data_csums(struct btrfs_raid_bio *rbio)
 					rbio->csum_buf, rbio->csum_bitmap);
 	if (ret < 0)
 		goto error;
+	set_bit(RBIO_CSUMS_KNOWN_BIT, &rbio->flags);
 	if (bitmap_empty(rbio->csum_bitmap, len >> fs_info->sectorsize_bits))
 		goto no_csum;
 	return;
@@ -3627,6 +3720,20 @@ static unsigned long rbio_failed_cols(const struct btrfs_raid_bio *rbio)
 }
 
 /*
+ * Columns on devices that are gone, which have failed in every row whether or
+ * not this rbio wrote to them -- as get_rbio_vertical_faults() counts them.
+ */
+static unsigned long rbio_missing_cols(const struct btrfs_raid_bio *rbio)
+{
+	unsigned long cols = 0;
+
+	for (int i = 0; i < rbio->real_stripes && i < BITS_PER_LONG; i++)
+		if (!rbio->bioc->stripes[i].dev->bdev)
+			cols |= BIT(i);
+	return cols;
+}
+
+/*
  * Which members the record names stale, as bioc->stripes[] bits: data
  * column i is stripes[i], P and Q follow the data.  For the alerts.
  */
@@ -4027,8 +4134,13 @@ void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 
-	if (wib && !READ_ONCE(repair_no_pin))
-		wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
+	if (!wib || READ_ONCE(repair_no_pin))
+		return;
+	/* Relocation has to wait for it; it need not wait in silence. */
+	while (!wait_event_timeout(wib->wait, atomic_read(&wib->repairs_inflight) == 0,
+				   30 * HZ))
+		btrfs_warn(fs_info,
+"raid56: relocation still waiting for a RAID5/6 repair stuck on a device that does not complete its I/O; check the devices (dmesg, btrfs device stats)");
 }
 
 /*
@@ -4134,6 +4246,10 @@ void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info)
 module_param_named(raid56_rmw_single_phase, rmw_single_phase, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_single_phase,
 		 "Write repaired sectors in the same batch as the new parity (testing only: restores a known defect)");
+static bool ack_per_row;
+module_param_named(raid56_ack_per_row, ack_per_row, bool, 0644);
+MODULE_PARM_DESC(raid56_ack_per_row,
+		 "Acknowledge a write whose failures span more columns than the parity covers, as long as each row is within it (testing only: restores a known defect)");
 static bool refusal_clears_marks;
 module_param_named(raid56_refusal_clears_marks, refusal_clears_marks, bool, 0644);
 MODULE_PARM_DESC(raid56_refusal_clears_marks,
@@ -4143,6 +4259,7 @@ module_param_named(raid56_persist_fail_keeps_clear, persist_fail_keeps_clear, bo
 MODULE_PARM_DESC(raid56_persist_fail_keeps_clear,
 		 "Leave the stale marks cleared when the repair could not be made durable (testing only: restores a known defect)");
 #else
+static const bool ack_per_row;
 static const bool refusal_clears_marks;
 static const bool persist_fail_keeps_clear;
 #endif
@@ -4493,6 +4610,19 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 			break;
 		}
 	}
+	/*
+	 * And per column: the record names a whole column stale, so failures
+	 * in more columns than there are parities -- each row within the
+	 * tolerance, one in row 0 of column 0, one in row 15 of column 1 --
+	 * leave a stripe the record calls undecidable for good: every later
+	 * write refused, untouched data unreadable.  Do not acknowledge the
+	 * write that makes it so.  A missing device's column counts whether
+	 * or not this write touched it: it is gone in every row.
+	 */
+	if (!ret && !READ_ONCE(ack_per_row) &&
+	    hweight_long(rbio_failed_cols(rbio) | rbio_missing_cols(rbio)) >
+	    rbio_max_errors(rbio))
+		ret = -EIO;
 out:
 	/*
 	 * The caller is told this write failed.  The stripe pages hold data
@@ -4602,10 +4732,32 @@ out:
 		 * log already records, which btrfs_wib_add_sticky() has just
 		 * done.
 		 */
-		btrfs_wib_add_sticky(fs_info, full_stripe_start, full_stripe_len);
-		rmw_update_stale_data(rbio, full_stripe_start);
-		rmw_update_stale_parity(rbio, full_stripe_start);
-		faulted = true;
+		if (btrfs_wib_try_add_sticky(fs_info, full_stripe_start,
+					     full_stripe_len) < 0) {
+			/*
+			 * No room to say which device holds the stale column:
+			 * acknowledged, the write would later read back as the
+			 * old content wherever there is no checksum.  Nothing
+			 * references this copy-on-write extent yet, so failing
+			 * it loses nothing that was acknowledged.
+			 */
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL,
+					   full_stripe_start, NULL, 0);
+			ret = -EIO;
+		} else {
+			rmw_update_stale_data(rbio, full_stripe_start);
+			rmw_update_stale_parity(rbio, full_stripe_start);
+			faulted = true;
+		}
+	} else if (ret < 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {
+		/*
+		 * A full stripe write beyond the tolerance, refused.  Nothing
+		 * references what it wrote, so there is nothing to record or
+		 * repair -- but devices are failing writes, and the caller's
+		 * EIO alone reaches nobody who can do something about it.
+		 */
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_FAILED, full_stripe_start,
+				   rbio->bioc, rbio_failed_cols(rbio));
 	}
 
 	/*

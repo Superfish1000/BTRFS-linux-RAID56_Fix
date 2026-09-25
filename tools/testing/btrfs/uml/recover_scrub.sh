@@ -41,7 +41,7 @@ FAIL=${3:-1}
 PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
 cp $HERE/nocow_platter.py $T/umltest/nocow_platter.py
 ulimit -c 0
 

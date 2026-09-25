@@ -41,6 +41,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_READ_AMBIGUOUS,	/* read refused: its rebuild needed a stale column */
 	BTRFS_RAID56_EV_LOG_WRITE,	/* write failed: the log could not be written */
 	BTRFS_RAID56_EV_REPAIR_DROPPED,	/* the repair queue was full: no automatic repair */
+	BTRFS_RAID56_EV_READ_PARITY,	/* read refused: the RAID6 parities disagree */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -323,6 +324,12 @@ struct btrfs_wib {
 	 * and when a commit completes.
 	 */
 	wait_queue_head_t wait;
+	/*
+	 * Under @lock: whether a full log may spend a record naming a stale
+	 * member, taken once per locked section (wib_policy_locked()) so the
+	 * room counted and the room found by eviction always agree.
+	 */
+	bool may_evict_naming;
 
 	/* Sequence number of the last successful commit. */
 	u64 seq;
@@ -470,6 +477,15 @@ struct btrfs_wib {
 	bool alert_stopped;
 	/* Set by any event but STALE; cleared when the episode ends. */
 	bool alert_failing;
+	/*
+	 * Events no record stands for -- see BTRFS_RAID56_LATCHED_EVENTS --
+	 * that keep the episode open until someone acknowledges them.
+	 */
+	unsigned long alert_latched;
+	/* Bumped by every latched event: "ack <seq>" names what was seen. */
+	u64 alert_latch_seq;
+	/* Something new to announce even if the state did not change. */
+	bool alert_announce;
 	/* Events whose first occurrence this episode has been explained. */
 	unsigned long alert_seen;
 	/* Events since the last summary. */
@@ -488,6 +504,10 @@ void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event e
 			u64 logical, const struct btrfs_io_context *bioc,
 			unsigned long cols);
 ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf);
+int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 seq);
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_evicts_naming(void);
+#endif
 void btrfs_raid56_alert_stop(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info);
@@ -621,6 +641,7 @@ void btrfs_wib_finalize_pending(struct btrfs_wib *wib);
 int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 		       struct btrfs_wib_entry *out);

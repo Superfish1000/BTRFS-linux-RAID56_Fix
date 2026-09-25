@@ -174,6 +174,12 @@ struct btrfs_raid_bio {
 	u8 repair_tries;
 
 	/*
+	 * For a RAID6 read retry past mirror 2: the mirror asked for.  See
+	 * set_rbio_raid6_extra_error().
+	 */
+	u8 retry_mirror;
+
+	/*
 	 * For a repair rbio: its block group, frozen (btrfs_freeze_block_group())
 	 * for the repair's lifetime so the chunk's device space cannot be freed
 	 * and reused under it.

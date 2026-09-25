@@ -33,7 +33,7 @@ PROFILE=raid6:raid1c3
 HERE=$(cd "$(dirname "$0")" && pwd)
 DUMP=$HERE/../../../raid56_wib_dump.py
 mkdir -p $T/umltest
-cp $HERE/init-r6deg.sh $T/umltest/init-open-r6deg.sh
+cp $HERE/init-r6deg.sh $T/umltest/init-open-r6deg.sh.$$ && mv -f $T/umltest/init-open-r6deg.sh.$$ $T/umltest/init-open-r6deg.sh	# atomic: a guest may be reading it
 cp $HERE/r6deg_layout.py $T/umltest/r6deg_layout.py
 cp $HERE/r6exp.py $T/umltest/r6exp.py
 ulimit -c 0

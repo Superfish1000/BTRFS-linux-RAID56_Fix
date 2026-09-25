@@ -22,7 +22,7 @@ NDEV=${2:-4}
 FAIL=${3:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-sread.sh
+cp $HERE/init-final3.sh $T/umltest/init-sread.sh.$$ && mv -f $T/umltest/init-sread.sh.$$ $T/umltest/init-sread.sh	# atomic: a guest may be reading it
 ulimit -c 0
 
 arm() {	# name knob

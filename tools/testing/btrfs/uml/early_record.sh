@@ -32,7 +32,7 @@ OMIT=${3:-0}
 NDEV=5
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-early.sh
+cp $HERE/init-final3.sh $T/umltest/init-early.sh.$$ && mv -f $T/umltest/init-early.sh.$$ $T/umltest/init-early.sh	# atomic: a guest may be reading it
 ulimit -c 0
 [ "$FAIL" = "$OMIT" ] && { echo "fail and omit devices must differ"; exit 2; }
 

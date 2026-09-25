@@ -1073,11 +1073,19 @@ static void scrub_stripe_report_errors(struct scrub_ctx *sctx,
 	struct btrfs_device *dev = NULL;
 	const unsigned long extent_bitmap = scrub_bitmap_read_has_extent(stripe);
 	const unsigned long error_bitmap = scrub_bitmap_read_error(stripe);
+	/*
+	 * A sector repaired in memory whose write-back failed is still wrong
+	 * on the disk.  The repair worker waited for those writes, so this is
+	 * complete.
+	 */
+	const unsigned long write_error_bitmap = stripe->write_error_bitmap &
+						 errors->init_error_bitmap;
 	u64 physical = 0;
 	int nr_data_sectors = 0;
 	int nr_meta_sectors = 0;
 	int nr_nodatacsum_sectors = 0;
 	int nr_repaired_sectors = 0;
+	int nr_write_failed = 0;
 	int sector_nr;
 
 	if (test_bit(SCRUB_STRIPE_FLAG_NO_REPORT, &stripe->state))
@@ -1128,7 +1136,8 @@ skip:
 		}
 
 		if (test_bit(sector_nr, &errors->init_error_bitmap) &&
-		    !test_bit(sector_nr, &error_bitmap)) {
+		    !test_bit(sector_nr, &error_bitmap) &&
+		    !test_bit(sector_nr, &write_error_bitmap)) {
 			nr_repaired_sectors++;
 			repaired = true;
 		}
@@ -1136,6 +1145,21 @@ skip:
 		/* Good sector from the beginning, nothing need to be done. */
 		if (!test_bit(sector_nr, &errors->init_error_bitmap))
 			continue;
+
+		/*
+		 * The right content was found, but the device did not take it:
+		 * reported as corrected, this used to tell the user the disk
+		 * was fixed while it still held the error.
+		 */
+		if (test_bit(sector_nr, &write_error_bitmap) &&
+		    !test_bit(sector_nr, &error_bitmap)) {
+			nr_write_failed++;
+			btrfs_err_rl(fs_info,
+"scrub: unable to fixup error at logical %llu on dev %s physical %llu: the repair write failed",
+				     sector_logical, dev ? btrfs_dev_name(dev) : "?",
+				     sector_physical);
+			continue;
+		}
 
 		/*
 		 * Report error for the corrupted sectors.  If repaired, just
@@ -1206,7 +1230,7 @@ skip:
 	sctx->stat.verify_errors += errors->nr_meta_errors +
 				    errors->nr_meta_gen_errors;
 	sctx->stat.uncorrectable_errors +=
-		bitmap_weight(&error_bitmap, stripe->nr_sectors);
+		bitmap_weight(&error_bitmap, stripe->nr_sectors) + nr_write_failed;
 	sctx->stat.corrected_errors += nr_repaired_sectors;
 	spin_unlock(&sctx->stat_lock);
 }

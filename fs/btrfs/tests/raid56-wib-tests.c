@@ -873,9 +873,10 @@ static int drain_marks(struct btrfs_fs_info *fs_info, u64 base, u64 nr)
  * from a stale parity, and the two need opposite repairs.  Losing the vague
  * one costs a rescan; losing the specific one costs the evidence.
  *
- * The fallback is equally required: refusing to evict a named record would
- * break the promise wib_count_entries_locked() makes to btrfs_wib_try_mark(),
- * which asserts the room it counted exists.  Preference, not refusal.
+ * And a named record is never spent at all: with nothing vague left, a new
+ * mark waits for a write in flight to finish, or fails -- see
+ * test_named_records_stay().  wib_count_entries_locked() counts only what
+ * wib_evictable() allows, so the room btrfs_wib_try_mark() asserts is there.
  */
 static int test_evict_precedence(struct btrfs_fs_info *fs_info)
 {
@@ -939,34 +940,121 @@ static int test_evict_precedence(struct btrfs_fs_info *fs_info)
 		return -EINVAL;
 	}
 
-	/* Nothing vague left: the named record must now be spendable. */
-	ret = btrfs_wib_mark(fs_info, (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE,
-			     BTRFS_WIB_BLOCK_SIZE);
-	if (ret) {
-		test_err("mark with only a named record left failed: %d", ret);
-		return ret;
-	}
-	if (find_live_entry(wib, named)) {
-		test_err("the named record was not evicted when it was all that was left");
-		return -EINVAL;
-	}
-	if (atomic64_read(&wib->stat_stale_evicted) != stale_evicted0 + 1) {
-		test_err("losing a named record was not counted");
-		return -EINVAL;
-	}
-	if (btrfs_wib_any_stale(fs_info)) {
-		test_err("nr_stale was not decremented when the named record went");
-		return -EINVAL;
-	}
-
+	/*
+	 * Nothing vague left, and the named record is not spendable: room
+	 * comes only from the writes in flight.  Finish them, and the next
+	 * mark fits beside the named record.
+	 */
 	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++)
 		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
+	ret = btrfs_wib_mark(fs_info, (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE,
+			     BTRFS_WIB_BLOCK_SIZE);
+	if (ret) {
+		test_err("mark after the writes in flight finished failed: %d", ret);
+		return ret;
+	}
+	if (!find_live_entry(wib, named)) {
+		test_err("the named record was spent to make room");
+		return -EINVAL;
+	}
+	if (atomic64_read(&wib->stat_stale_evicted) != stale_evicted0) {
+		test_err("stale_evicted moved: a named record was dropped");
+		return -EINVAL;
+	}
+	if (!btrfs_wib_any_stale(fs_info)) {
+		test_err("the named record stopped counting as stale");
+		return -EINVAL;
+	}
+
+	/* A repair retires it. */
+	btrfs_wib_clear_sticky(fs_info, named, BTRFS_WIB_BLOCK_SIZE);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("nr_stale was not decremented when the named record was retired");
+		return -EINVAL;
+	}
 	ret = drain_marks(fs_info, base + BTRFS_WIB_MAX_ENTRIES, 1);
 	if (ret)
 		return ret;
 	if (block_nr_entries(wib->last) != 0) {
 		test_err("log not empty after the eviction precedence test");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * A log full of records that name stale members, with no write in flight:
+ * nothing can make room, so a new mark fails at once -- it does not wait a
+ * minute first -- and no record is dropped.  The records stay until repairs
+ * retire them.
+ */
+static int test_named_records_stay(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 base = 1200;
+	const u64 stale_evicted0 = atomic64_read(&wib->stat_stale_evicted);
+	const u64 full0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_FULL]);
+	unsigned long start;
+	int ret;
+
+	/* A negative-control run asked for the old eviction on purpose. */
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the named-records test");
+		return 0;
+	}
+
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		const u64 logical = (base + i) * BTRFS_WIB_ENTRY_SIZE;
+
+		btrfs_wib_add_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		btrfs_wib_mark_stale(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (!find_live_entry(wib, logical)) {
+			test_err("named record %llu was not created", i);
+			return -EINVAL;
+		}
+	}
+
+	start = jiffies;
+	ret = btrfs_wib_mark(fs_info, (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE,
+			     BTRFS_WIB_BLOCK_SIZE);
+	if (ret != -EIO) {
+		test_err("mark into a log full of named records returned %d, expected -EIO", ret);
+		return -EINVAL;
+	}
+	if (time_after(jiffies, start + 5 * HZ)) {
+		test_err("mark into a log full of named records waited %u ms with nothing in flight",
+			 jiffies_to_msecs(jiffies - start));
+		return -EINVAL;
+	}
+	if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_FULL]) != full0 + 1) {
+		test_err("the failed mark raised no log-full alert");
+		return -EINVAL;
+	}
+	if (atomic64_read(&wib->stat_stale_evicted) != stale_evicted0) {
+		test_err("a named record was dropped to make room");
+		return -EINVAL;
+	}
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		if (!find_live_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE)) {
+			test_err("named record %llu is gone", i);
+			return -EINVAL;
+		}
+	}
+
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_BLOCK_SIZE);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after retiring every named record");
+		return -EINVAL;
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		return ret;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the named-records test");
 		return -EINVAL;
 	}
 	return 0;
@@ -1220,6 +1308,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_evict_precedence(fs_info);
+	if (ret)
+		goto out;
+	ret = test_named_records_stay(fs_info);
 	if (ret)
 		goto out;
 	ret = test_stale_parity_only(fs_info);

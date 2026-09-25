@@ -33,7 +33,7 @@ FAIL=${3:-1}
 PROFILE=raid5:raid1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
 # The reference reader for BTRFS_IOC_RAID56_STALE_STRIPES.  Built on the host
 # and run from hostfs inside the guest; a missing compiler just means the
 # scenario logs WIBDUMP_MISSING and the record check below is skipped.

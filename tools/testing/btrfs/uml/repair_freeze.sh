@@ -12,7 +12,7 @@ KERNEL=${1:?usage: repair_freeze.sh <kernel>}
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-freeze.sh
+cp $HERE/init-final3.sh $T/umltest/init-freeze.sh.$$ && mv -f $T/umltest/init-freeze.sh.$$ $T/umltest/init-freeze.sh	# atomic: a guest may be reading it
 ulimit -c 0
 arm() {	# name control
 	local tag=repair-freeze-$1 ubds=""

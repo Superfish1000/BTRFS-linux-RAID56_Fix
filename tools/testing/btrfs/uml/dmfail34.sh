@@ -6,7 +6,7 @@ T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=$1; TAG=$2; MODE=$3; PROFILE=$4; OPTS=$5; NDEV=$6; FAIL=$7
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
 cp $HERE/../raid56_wib_dump.py $T/umltest/ 2>/dev/null || true
 # The checksum reader the diagnostics use: it prints what the csum tree holds
 # for each sector next to the crc32c of the bytes the filesystem hands back, so

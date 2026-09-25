@@ -18,7 +18,7 @@ KERNEL=${1:?usage: alert.sh <kernel>}
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
-cp $HERE/init-final3.sh $T/umltest/init-alert.sh
+cp $HERE/init-final3.sh $T/umltest/init-alert.sh.$$ && mv -f $T/umltest/init-alert.sh.$$ $T/umltest/init-alert.sh	# atomic: a guest may be reading it
 cp $HERE/raid56_layout.py $HERE/raid56_alert_listen.py $T/umltest/
 ulimit -c 0
 
