@@ -21,6 +21,7 @@
 #include <linux/sched/mm.h>
 #include <linux/log2.h>
 #include <linux/shrinker.h>
+#include <linux/fserror.h>
 #include "misc.h"
 #include "ctree.h"
 #include "fs.h"
@@ -292,6 +293,12 @@ static void end_bbio_compressed_write(struct btrfs_bio *bbio)
 	struct compressed_bio *cb = to_compressed_bio(bbio);
 	struct folio_iter fi;
 
+	/* As end_bbio_data_write(): tell a monitor, not only fsync(). */
+	if (cb->bbio.bio.bi_status != BLK_STS_OK)
+		fserror_report_io(&cb->bbio.inode->vfs_inode, FSERR_BUFFERED_WRITE,
+				  cb->start, cb->len,
+				  blk_status_to_errno(cb->bbio.bio.bi_status),
+				  GFP_ATOMIC);
 	btrfs_finish_ordered_extent(cb->bbio.ordered, cb->start, cb->len,
 				    cb->bbio.bio.bi_status == BLK_STS_OK);
 

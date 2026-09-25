@@ -16,6 +16,7 @@
 #include <linux/prefetch.h>
 #include <linux/fsverity.h>
 #include <linux/lockdep.h>
+#include <linux/fserror.h>
 #include "extent_io.h"
 #include "extent-io-tree.h"
 #include "extent_map.h"
@@ -554,8 +555,16 @@ static void end_bbio_data_write(struct btrfs_bio *bbio)
 		btrfs_folio_clear_writeback(fs_info, folio, start, len);
 	}
 
-	if (error)
+	if (error) {
 		mapping_set_error(bbio->inode->vfs_inode.i_mapping, error);
+		/*
+		 * The error reaches a program only if it calls fsync() and
+		 * looks; tell a monitor too (fanotify FAN_FS_ERROR), as iomap
+		 * does for the filesystems that use it.
+		 */
+		fserror_report_io(&bbio->inode->vfs_inode, FSERR_BUFFERED_WRITE,
+				  bbio->file_offset, bio_size, error, GFP_ATOMIC);
+	}
 
 	btrfs_finish_ordered_extent(bbio->ordered, bbio->file_offset, bio_size, !error);
 	bio_put(bio);

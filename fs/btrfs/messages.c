@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/fs.h>
+#include <linux/fserror.h>
 #include "fs.h"
 #include "messages.h"
 #include "discard.h"
@@ -173,6 +175,8 @@ void __btrfs_handle_fs_error(struct btrfs_fs_info *fs_info, const char *function
 
 	/* Handle error by forcing the filesystem readonly. */
 	btrfs_set_sb_rdonly(sb);
+	/* And let a monitor know (fanotify FAN_FS_ERROR), as xfs and ext4 do. */
+	fserror_report_shutdown(sb, GFP_ATOMIC);
 	btrfs_info(fs_info, "forced readonly");
 	/*
 	 * Note that a running device replace operation is not canceled here
