@@ -1428,6 +1428,18 @@ static ssize_t btrfs_raid56_write_profile_show(struct kobject *kobj,
 }
 BTRFS_ATTR(, raid56_write_profile, btrfs_raid56_write_profile_show);
 
+/*
+ * Whether the RAID5/6 write path is healthy, and if not what to do.  Wait on
+ * it with poll(): it is notified on every change of state.  See
+ * btrfs_raid56_alert().
+ */
+static ssize_t btrfs_raid56_health_show_attr(struct kobject *kobj,
+					     struct kobj_attribute *a, char *buf)
+{
+	return btrfs_raid56_health_show(to_fs_info(kobj), buf);
+}
+BTRFS_ATTR(, raid56_health, btrfs_raid56_health_show_attr);
+
 static const char *btrfs_read_policy_name[] = {
 	"pid",
 #ifdef CONFIG_BTRFS_EXPERIMENTAL
@@ -1671,6 +1683,7 @@ static const struct attribute *btrfs_attrs[] = {
 	BTRFS_ATTR_PTR(, temp_fsid),
 	BTRFS_ATTR_PTR(, raid56_write_intent),
 	BTRFS_ATTR_PTR(, raid56_write_profile),
+	BTRFS_ATTR_PTR(, raid56_health),
 	NULL,
 };
 

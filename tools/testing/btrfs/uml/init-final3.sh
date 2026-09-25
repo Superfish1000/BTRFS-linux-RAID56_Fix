@@ -1816,6 +1816,82 @@ repair_pin)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+alert)
+	# Does a person find out?  Every channel btrfs has for "RAID5/6 writes
+	# are in trouble" is recorded by a listener while one episode runs:
+	#   1. a device fails a write the parity covers    -> degraded
+	#   2. it heals and the queued repair runs         -> ok
+	#   3. it fails for good: a write is refused (EIO) and the repair gives
+	#      up                                          -> failing
+	#   4. it heals and a scrub runs                   -> ok
+	# CONTROL=1 runs the same writes with no fault: every listener must
+	# stay silent and the state must stay ok.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	[ -n "$H" ] || { log "NO_HEALTH_FILE"; finish; }
+	A=$T/umltest/alert.$TAG; rm -rf $A; mkdir -p $A
+	python3 $T/umltest/raid56_alert_listen.py uevent $A/uevent &
+	python3 $T/umltest/raid56_alert_listen.py poll $A/poll $H &
+	python3 $T/umltest/raid56_alert_listen.py fanotify $A/fan $MNT &
+	sleep 2
+	snap() { log "HEALTH[$1] $(tr '\n' '|' < $H)"; sed -n 1p $H | cut -d' ' -f2 > $A/state.$1; }
+	wr() {	# name offset char [dd flags]: one 4K block, fsync'ed
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' "$3" |
+		dd of=$MNT/nocow bs=4096 seek=$(($2 / 4096)) count=1 conv=notrunc,fsync \
+		   status=none $4 2>/dev/null && r=ok || r=EIO
+		log "write $1: $r"; echo $r > $A/write.$1
+	}
+	echo 200 > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	eval "$L"
+	[ -n "${FO_B:-}" ] || { log "LAYOUT_FAIL"; finish; }
+	snap start
+	F=$IDX_B
+	[ "${CONTROL:-0}" = 1 ] && F=
+	# 1: a fault the parity covers
+	[ -n "$F" ] && dm_error_writes $F
+	wr b1 $FO_B B
+	sleep 3; snap fault
+	# 2: healed, the queued repair runs
+	[ -n "$F" ] && dm_heal $F
+	sleep 8; snap healed
+	# 3: for good.  B again goes stale; C in the next column of the same
+	# row must then put B back first, cannot, and is refused -- once by
+	# O_DIRECT, once buffered with no fsync (the error then only reaches a
+	# later fsync, and a monitor through fanotify).
+	[ -n "$F" ] && dm_error_writes $F
+	wr b2 $((FO_B + 4096)) B
+	wr c_direct $FO_C C oflag=direct
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'D' |
+		dd of=$MNT/nocow bs=4096 seek=$(((FO_C + 4096) / 4096)) count=1 conv=notrunc \
+		status=none 2>/dev/null
+	sync
+	python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY); os.fsync(fd)' \
+		$MNT/nocow 2>/dev/null && r=ok || r=EIO
+	log "later fsync of the buffered write: $r"; echo $r > $A/write.d_fsync
+	sleep 20; snap failing
+	# 4: healed and scrubbed
+	[ -n "$F" ] && dm_heal $F
+	btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1; log "scrub rc=$?"
+	sleep 5; snap recovered
+	sleep 2
+	kill $(jobs -p) 2>/dev/null
+	# All of it: a warning does not reach a quiet console.
+	dmesg | grep -a "raid56:" > $A/dmesg
+	kmsg "raid56:|health" 6
+	log "ALERT devid_b=$((IDX_B + 1)) uevents=$(grep -c BTRFS_RAID56_HEALTH $A/uevent) polls=$(grep -c woken $A/poll) fanotify=$(grep -c FAN_FS_ERROR $A/fan)"
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 rmw_cache)
 	# The stripe-cache path of a read-modify-write.  'B' is written while
 	# its column's device fails writes: accepted within the tolerance, the

@@ -3521,6 +3521,39 @@ static bool rbio_stripe_recorded(struct btrfs_raid_bio *rbio)
 				      &st);
 }
 
+/* Bit i set: a sector of bioc->stripes[i] failed.  For the alerts. */
+static unsigned long rbio_failed_cols(const struct btrfs_raid_bio *rbio)
+{
+	unsigned long cols = 0;
+
+	for (int i = 0; i < rbio->real_stripes && i < BITS_PER_LONG; i++) {
+		const int first = i * rbio->stripe_nsectors;
+
+		if (find_next_bit(rbio->error_bitmap, first + rbio->stripe_nsectors,
+				  first) < first + rbio->stripe_nsectors)
+			cols |= BIT(i);
+	}
+	return cols;
+}
+
+/*
+ * Which members the record names stale, as bioc->stripes[] bits: data
+ * column i is stripes[i], P and Q follow the data.  For the alerts.
+ */
+static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio)
+{
+	struct btrfs_wib_stripe_state st;
+	unsigned long cols;
+
+	if (!btrfs_wib_stripe_state(rbio->bioc->fs_info, rbio->bioc->full_stripe_logical,
+				    rbio->nr_data, rbio->real_stripes - rbio->nr_data,
+				    &st))
+		return 0;
+	cols = st.stale_cols & (BIT(rbio->nr_data) - 1);
+	cols |= (unsigned long)st.bad_parity << rbio->nr_data;
+	return cols;
+}
+
 /*
  * A read-modify-write has just read the whole full stripe and rebuilt what it
  * could not believe.  Decide what of that goes back to the disks.
@@ -3839,14 +3872,19 @@ static void raid56_repair_finished(struct btrfs_raid_bio *rbio, int ret, bool fa
 	if (test_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags)) {
 		/* No retry changes that; it waits for a scrub or a human. */
 		atomic64_inc(&wib->stat_repair_failed);
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_UNDECIDABLE, logical,
+				   rbio->bioc, rbio_stale_cols(rbio));
 	} else if (ret < 0 || faulted) {
 		atomic64_inc(&wib->stat_repair_failed);
-		if (rbio->repair_tries + 1 < RAID56_REPAIR_MAX_TRIES)
+		if (rbio->repair_tries + 1 < RAID56_REPAIR_MAX_TRIES) {
 			btrfs_raid56_queue_repair(fs_info, logical, rbio->repair_tries + 1);
-		else
+		} else {
 			btrfs_warn_rl(fs_info,
 "raid56: gave up repairing full stripe %llu after %u attempts; it stays recorded for the next scrub or mount",
 				      logical, RAID56_REPAIR_MAX_TRIES);
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_GAVE_UP, logical,
+					   rbio->bioc, rbio_failed_cols(rbio));
+		}
 	} else {
 		atomic64_inc(&wib->stat_repair_ok);
 		/*
@@ -4010,6 +4048,14 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		btrfs_warn_rl(fs_info,
 "raid56: could not write back the rebuilt sectors of full stripe %llu; refusing the write rather than change a parity they still depend on",
 			      full_stripe_start);
+		/*
+		 * A queued repair that could not write is not a refused write:
+		 * it retries, and only giving up is news (raid56_repair_finished()).
+		 */
+		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REFUSED,
+					   full_stripe_start, rbio->bioc,
+					   rbio_failed_cols(rbio));
 		return -EIO;
 	}
 
@@ -4035,6 +4081,9 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		btrfs_warn_rl(fs_info,
 "raid56: could not make the repair of full stripe %llu durable (%d); refusing the write",
 			      full_stripe_start, ret);
+		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_NOT_DURABLE,
+					   full_stripe_start, NULL, 0);
 		return -EIO;
 	}
 	/* On disk now; phase B writes only the new data and the parity. */
@@ -4050,6 +4099,8 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	struct bio_list bio_list;
 	bool logged = false;
 	bool faulted = false;
+	/* Refused, and already reported as such. */
+	bool refused = false;
 	int crash_point = 0;
 	int sectornr;
 	int ret = 0;
@@ -4114,6 +4165,12 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 "raid56: refusing a write into full stripe %llu: the write-intent log records more of it stale than its parity can rebuild, and writing would destroy the only copy of acknowledged data",
 				      full_stripe_start);
 			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
+			/* A repair's is reported by raid56_repair_finished(). */
+			if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+				btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_UNDECIDABLE,
+						   full_stripe_start, rbio->bioc,
+						   rbio_stale_cols(rbio));
+			refused = true;
 			ret = -EIO;
 			goto out;
 		}
@@ -4188,8 +4245,10 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 
 	if (!READ_ONCE(rmw_single_phase)) {
 		ret = rmw_repair_first(rbio, full_stripe_start);
-		if (ret < 0)
+		if (ret < 0) {
+			refused = true;
 			goto out;
+		}
 	}
 
 	index_rbio_pages(rbio);
@@ -4345,10 +4404,24 @@ out:
 	 * record now names.  Ask for that now rather than whenever a scrub or
 	 * the next write to this stripe happens to come along.
 	 */
-	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
 		raid56_repair_finished(rbio, ret, faulted);
-	else if (faulted)
+	} else if (faulted) {
+		const unsigned long cols = rbio_failed_cols(rbio);
+
+		/*
+		 * Tell someone: within the tolerance the write succeeded but
+		 * the stripe lost its redundancy; beyond it the caller gets
+		 * EIO.  A refusal has said so already, and names the cause.
+		 */
+		if (ret >= 0)
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_STALE,
+					   full_stripe_start, rbio->bioc, cols);
+		else if (!refused && cols)
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_FAILED,
+					   full_stripe_start, rbio->bioc, cols);
 		btrfs_raid56_queue_repair(fs_info, full_stripe_start, 0);
+	}
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }
 

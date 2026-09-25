@@ -14,10 +14,48 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/btrfs_tree.h>
 #include <uapi/linux/btrfs.h>
 
 struct btrfs_fs_info;
+struct btrfs_io_context;
+
+/*
+ * What a user has to be told about.  See btrfs_raid56_alert().
+ *
+ * STALE is a notice: a device failed a write the parity covered, so that
+ * stripe has lost its redundancy until it is repaired.  Every other event
+ * means a write failed, a repair was abandoned or the log lost track of
+ * something -- the filesystem is FAILING until nothing is recorded any more.
+ */
+enum btrfs_raid56_event {
+	BTRFS_RAID56_EV_STALE,		/* a device failed a write within tolerance */
+	BTRFS_RAID56_EV_REFUSED,	/* write refused: the repair did not land */
+	BTRFS_RAID56_EV_NOT_DURABLE,	/* write refused: the repair could not be made durable */
+	BTRFS_RAID56_EV_UNDECIDABLE,	/* write refused: more stale than the parity can rebuild */
+	BTRFS_RAID56_EV_FAILED,		/* write failed on more devices than the parity covers */
+	BTRFS_RAID56_EV_GAVE_UP,	/* a queued repair was abandoned */
+	BTRFS_RAID56_EV_LOG_FULL,	/* write failed: the log stayed full */
+	BTRFS_RAID56_EV_DROPPED,	/* the log was full and dropped a record */
+	BTRFS_RAID56_NR_EVENTS
+};
+
+enum btrfs_raid56_health {
+	BTRFS_RAID56_HEALTH_OK,
+	BTRFS_RAID56_HEALTH_DEGRADED,	/* something is recorded stale or waiting */
+	BTRFS_RAID56_HEALTH_FAILING,	/* writes are failing or records were lost */
+};
+
+/* Devices named in alerts since the filesystem was last healthy. */
+#define BTRFS_RAID56_ALERT_DEVS		8
+#define BTRFS_RAID56_ALERT_NAME		64
+
+struct btrfs_raid56_alert_dev {
+	u64 devid;
+	u64 events;
+	char name[BTRFS_RAID56_ALERT_NAME];
+};
 
 /*
  * On-disk layout.
@@ -418,7 +456,36 @@ struct btrfs_wib {
 	 * declined to trust.
 	 */
 	atomic64_t stat_read_ambiguous;
+
+	/*
+	 * Alerts: see btrfs_raid56_alert().  The counters are totals since
+	 * mount; everything under @alert_lock describes the current episode,
+	 * which ends when nothing is recorded stale or waiting any more.
+	 */
+	atomic64_t stat_alert[BTRFS_RAID56_NR_EVENTS];
+	spinlock_t alert_lock;
+	bool alert_stopped;
+	/* Set by any event but STALE; cleared when the episode ends. */
+	bool alert_failing;
+	/* Events whose first occurrence this episode has been explained. */
+	unsigned long alert_seen;
+	/* Events since the last summary. */
+	u64 alert_pending[BTRFS_RAID56_NR_EVENTS];
+	enum btrfs_raid56_health health;
+	enum btrfs_raid56_event last_event;
+	u64 last_logical;
+	u64 last_devid;
+	unsigned long last_jiffies;
+	char last_name[BTRFS_RAID56_ALERT_NAME];
+	struct btrfs_raid56_alert_dev alert_devs[BTRFS_RAID56_ALERT_DEVS];
+	struct delayed_work alert_work;
 };
+
+void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event ev,
+			u64 logical, const struct btrfs_io_context *bioc,
+			unsigned long cols);
+ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf);
+void btrfs_raid56_alert_stop(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_alloc(struct btrfs_fs_info *fs_info);
 void btrfs_wib_free(struct btrfs_fs_info *fs_info);

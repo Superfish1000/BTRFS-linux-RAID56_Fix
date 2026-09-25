@@ -71,6 +71,7 @@ the next recorded write:
 | `evidence_drop.sh` | eight arms: what the evidence channel does when it cannot keep a stripe -- ring full, stripe too wide, disarmed under a live capture -- plus the bound helper: one `evidence collect` keeps everything, `DISARM_IF_EMPTY` refuses a non-empty ring, a killed reader disarms the channel |
 | `rmw_repair.sh` | seven arms: does the next write into a damaged stripe repair it, is a write into an undecidable stripe refused, does the repair queued on the fault put the stripe back with nothing else writing? Each against a control that restores the old behaviour |
 | `rmw_cache.sh` | two arms: does a write served from the stripe cache into a recorded stripe lose the stale column when its own parity write fails? |
+| `alert.sh` | two arms: does every channel (kernel log, `raid56_health` + poll, uevent, fanotify, EIO) report a degraded -> failing -> recovered episode, and stay silent without a fault? Needs CONFIG_FANOTIFY. |
 | `rmw_torn.sh` | two arms: does a crash in the write that repairs a stale column lose that column? |
 | `repair_pin.sh` | two arms: a repair held in flight while its block group is balanced away and the space refilled -- does it write into the new data? |
 | `repair_freeze.sh` | two arms: does the queued repair write to a frozen filesystem? |
