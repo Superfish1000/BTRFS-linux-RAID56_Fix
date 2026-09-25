@@ -1892,6 +1892,46 @@ alert)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+alert_read)
+	# The one silent failure a caller never sees: a read of a column the
+	# log records stale, while another device of the same row is gone.
+	# The read cannot rebuild the acknowledged value and returns what is on
+	# the disk -- for data without a checksum, possibly OLD content, with no
+	# error.  It must at least raise an alert.
+	dm_setup
+	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	echo 600000 > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	eval "$L"
+	[ -n "${IDX_C:-}" ] || { log "LAYOUT_FAIL"; finish; }
+	dm_error_writes $IDX_B
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_B / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
+	dm_heal $IDX_B
+	sync
+	[ "${CONTROL:-0}" = 1 ] || dm_detach $IDX_C
+	echo 3 > /proc/sys/vm/drop_caches
+	got=$(dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none 2>/dev/null |
+	      od -An -c | head -1 | tr -s ' ' | cut -c1-12)
+	sleep 3
+	log "read back [$got]"
+	log "HEALTH[after] $(tr '\n' '|' < $H)"
+	dmesg | grep -a "raid56:" > $T/umltest/alert_read.$TAG
+	log "ALERT_READ unverifiable=$(sed -n 's/^read_unverifiable //p' $H) state=$(sed -n 's/^state //p' $H)"
+	echo "$(sed -n 's/^read_unverifiable //p' $H) $(sed -n 's/^state //p' $H)" > $T/umltest/alert_read.result.$TAG
+	umount $MNT 2>/dev/null || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 rmw_cache)
 	# The stripe-cache path of a read-modify-write.  'B' is written while
 	# its column's device fails writes: accepted within the tolerance, the

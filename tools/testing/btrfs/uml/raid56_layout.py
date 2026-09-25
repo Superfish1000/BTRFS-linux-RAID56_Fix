@@ -9,7 +9,7 @@
 # device holding column 0 (IDX_B) and the parity P (IDX_P), and the physical
 # offset of column 0's first sector on its device (PHYS_B).  The geometry is
 # btrfs_map_block()'s: data column c of full stripe n on stripe (n + c) %
-# num_stripes, P after the data.
+# num_stripes, P after the data.  IDX_C is the device of column 1.
 import re
 import subprocess
 import sys
@@ -65,9 +65,9 @@ for c in chunks:
         d = devpath[c['stripes'][k][0]]
         m = re.search(r'(\d+)$', d)
         return m.group(1)
-    ib, ip = (row + 0) % num, (row + nd) % num
+    ib, ic, ip = (row + 0) % num, (row + 1) % num, (row + nd) % num
     print(f'FULL={fss} NDATA={nd} FO_B={f0 + fss - p0} FO_C={f0 + fss - p0 + SL} '
-          f'IDX_B={idx(ib)} IDX_P={idx(ip)} DEV_B={devpath[c["stripes"][ib][0]]} '
+          f'IDX_B={idx(ib)} IDX_C={idx(ic)} IDX_P={idx(ip)} DEV_B={devpath[c["stripes"][ib][0]]} '
           f'PHYS_B={c["stripes"][ib][1] + row * SL}')
     break
 else:

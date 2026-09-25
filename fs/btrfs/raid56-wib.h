@@ -38,6 +38,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_GAVE_UP,	/* a queued repair was abandoned */
 	BTRFS_RAID56_EV_LOG_FULL,	/* write failed: the log stayed full */
 	BTRFS_RAID56_EV_DROPPED,	/* the log was full and dropped a record */
+	BTRFS_RAID56_EV_READ_AMBIGUOUS,	/* a read got data the parity cannot vouch for */
 	BTRFS_RAID56_NR_EVENTS
 };
 

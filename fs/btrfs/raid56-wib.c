@@ -2828,6 +2828,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_GAVE_UP]	= "repair_gave_up",
 	[BTRFS_RAID56_EV_LOG_FULL]	= "log_full",
 	[BTRFS_RAID56_EV_DROPPED]	= "record_dropped",
+	[BTRFS_RAID56_EV_READ_AMBIGUOUS] = "read_unverifiable",
 };
 
 static const char * const raid56_health_names[] = {
@@ -2889,6 +2890,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		btrfs_err(fs_info,
 "raid56: the write-intent log was full and dropped the record of stripes near %llu; which device holds stale data there may no longer be known. Run 'btrfs scrub start <mountpoint>' before relying on them. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
+		break;
+	case BTRFS_RAID56_EV_READ_AMBIGUOUS:
+		btrfs_err(fs_info,
+"raid56: a read of full stripe %llu returned data as it is on the disks although more of the stripe is recorded stale (%s among them) than its parity can rebuild: data without a checksum there may be OLD content. Bring back any missing device, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+			  logical, who, fsid);
 		break;
 	default:
 		break;
@@ -3063,7 +3069,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -3072,6 +3078,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_GAVE_UP],
 			   pending[BTRFS_RAID56_EV_LOG_FULL],
 			   pending[BTRFS_RAID56_EV_DROPPED],
+			   pending[BTRFS_RAID56_EV_READ_AMBIGUOUS],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {

@@ -2079,6 +2079,17 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
 		if (add)
 			set_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags);
+		/*
+		 * A read handing back what may be old content is the one
+		 * failure here that no caller ever sees, for data without a
+		 * checksum: say so.  (A write or a repair that finds the same
+		 * reports it itself.)
+		 */
+		if (add && rbio->operation == BTRFS_RBIO_READ_REBUILD)
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_READ_AMBIGUOUS,
+					   rbio->bioc->full_stripe_logical, rbio->bioc,
+					   (unsigned long)(st.stale_cols & (BIT(rbio->nr_data) - 1)) |
+					   ((unsigned long)st.bad_parity << rbio->nr_data));
 		return;
 	}
 
