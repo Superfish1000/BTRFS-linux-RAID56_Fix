@@ -3592,6 +3592,17 @@ bool btrfs_raid56_allow_nodatacow(void)
 	return READ_ONCE(allow_nodatacow);
 }
 
+/* See btrfs_scrub_replace_ignores_write_errors() in volumes.h. */
+static bool replace_ignores_write_errors;
+module_param_named(scrub_replace_ignores_write_errors, replace_ignores_write_errors, bool, 0644);
+MODULE_PARM_DESC(scrub_replace_ignores_write_errors,
+		 "Let a device replace finish although writes to the target failed, as it did before (testing only: restores a known defect)");
+
+bool btrfs_scrub_replace_ignores_write_errors(void)
+{
+	return READ_ONCE(replace_ignores_write_errors);
+}
+
 /* See btrfs_raid56_scrub_trusts_rebuild() in volumes.h. */
 static bool scrub_trusts_rebuild;
 module_param_named(raid56_scrub_trusts_rebuild, scrub_trusts_rebuild, bool, 0644);

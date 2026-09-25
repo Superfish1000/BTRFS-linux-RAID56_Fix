@@ -1154,10 +1154,15 @@ skip:
 		if (test_bit(sector_nr, &write_error_bitmap) &&
 		    !test_bit(sector_nr, &error_bitmap)) {
 			nr_write_failed++;
-			btrfs_err_rl(fs_info,
+			if (dev)
+				btrfs_err_rl(fs_info,
 "scrub: unable to fixup error at logical %llu on dev %s physical %llu: the repair write failed",
-				     sector_logical, dev ? btrfs_dev_name(dev) : "?",
-				     sector_physical);
+					     sector_logical, btrfs_dev_name(dev),
+					     sector_physical);
+			else
+				btrfs_err_rl(fs_info,
+"scrub: unable to fixup error at logical %llu on mirror %u: the repair write failed",
+					     sector_logical, stripe->mirror_num);
 			continue;
 		}
 
@@ -2203,6 +2208,12 @@ static int flush_scrub_stripes(struct scrub_ctx *sctx)
 			has_extent = scrub_bitmap_read_has_extent(stripe);
 			error = scrub_bitmap_read_error(stripe);
 			bitmap_andnot(&good, &has_extent, &error, stripe->nr_sectors);
+			/*
+			 * The repair write-backs' errors were consumed by the
+			 * report (REPAIR_DONE); from here the bitmap is the
+			 * target's, read below.
+			 */
+			stripe->write_error_bitmap = 0;
 			scrub_write_sectors(sctx, stripe, good, true);
 		}
 	}
@@ -2212,6 +2223,23 @@ static int flush_scrub_stripes(struct scrub_ctx *sctx)
 		stripe = &sctx->stripes[i];
 
 		wait_scrub_stripe_io(stripe);
+		/*
+		 * A sector the target did not take is missing from it, and the
+		 * replace must not finish as if it were there: on a profile
+		 * with one copy that loses the only good one.  Count it, and
+		 * scrub_enumerate_chunks() aborts the replace with EIO.  The
+		 * count was lost when this write path replaced the old one.
+		 */
+		if (sctx->is_dev_replace && stripe->write_error_bitmap &&
+		    !btrfs_scrub_replace_ignores_write_errors()) {
+			const int nr = bitmap_weight(&stripe->write_error_bitmap,
+						     stripe->nr_sectors);
+
+			atomic64_add(nr, &fs_info->dev_replace.num_write_errors);
+			btrfs_err_rl(fs_info,
+"scrub: device replace could not write %d sector(s) at logical %llu to the target device; the replace will be aborted",
+				     nr, stripe->logical);
+		}
 		spin_lock(&sctx->stat_lock);
 		sctx->stat.last_physical = stripe->physical + stripe_length(stripe);
 		spin_unlock(&sctx->stat_lock);

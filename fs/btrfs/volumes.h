@@ -844,12 +844,19 @@ bool btrfs_raid56_trace_reads(void);
  * control for that -- see btrfs_check_read_bio().
  */
 bool btrfs_raid56_read_ignores_stale(void);
+/*
+ * Let a device replace finish although sectors failed to reach the target, as
+ * it did before scrub counted them.  The negative control for that -- see
+ * flush_scrub_stripes().
+ */
+bool btrfs_scrub_replace_ignores_write_errors(void);
 #else
 static inline bool btrfs_raid56_allow_nodatacow(void) { return false; }
 static inline bool btrfs_raid56_stale_read_legacy(void) { return false; }
 static inline bool btrfs_raid56_scrub_trusts_rebuild(void) { return false; }
 static inline bool btrfs_raid56_trace_reads(void) { return false; }
 static inline bool btrfs_raid56_read_ignores_stale(void) { return false; }
+static inline bool btrfs_scrub_replace_ignores_write_errors(void) { return false; }
 #endif
 
 unsigned long btrfs_full_stripe_len(struct btrfs_fs_info *fs_info,

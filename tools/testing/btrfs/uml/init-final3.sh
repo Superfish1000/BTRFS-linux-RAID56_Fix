@@ -2192,6 +2192,59 @@ degraded_log_full)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+replace_target_fail)
+	# Does a device replace notice a target that does not take its writes?
+	#
+	# RAID5 over the first four devices, the fifth the replace target.  The
+	# target fails every write past its first MiB (so the replace can start
+	# and write its superblock), then 'btrfs replace start -B'.  The copy of
+	# every sector goes to the target and is lost; a replace that finishes
+	# anyway swaps in a device with holes where the source had data.
+	# CONTROL=1 sets scrub_replace_ignores_write_errors=1, the old
+	# behaviour: then a read-only scrub afterwards finds them.
+	watchdog ${WATCH:-900}
+	dm_setup
+	set -- $DMDEVS
+	mkfs.btrfs -K -q -f -d raid5 -m raid1 $1 $2 $3 $4 || { log "MKFS_FAIL"; finish; }
+	TGT=$5
+	btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $1 $2 $3 $4 >/dev/null 2>&1
+	do_mount $OPTS $1
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/scrub_replace_ignores_write_errors 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: target write errors ignored"
+	}
+	head -c 96M /dev/urandom > $MNT/data
+	sync
+	want=$(md5sum < $MNT/data | awk '{print $1}')
+	d=$(echo $DEVS | awk '{print $5}')
+	sz=$(blockdev --getsz $d)
+	printf '0 2048 linear %s 0\n2048 %d flakey %s 2048 0 1000 1 error_writes\n' $d $((sz - 2048)) $d |
+		{ dmsetup suspend --nolockfs --noflush d4 && dmsetup reload d4 && dmsetup resume d4; } ||
+		log "DM_RELOAD_FAIL d4"
+	log "target $TGT fails writes past 1 MiB"
+	btrfs replace start -B -f 1 $TGT $MNT > /tmp/rep.out 2>&1
+	rrc=$?
+	log "replace rc=$rrc: $(tr '\n' ' ' < /tmp/rep.out | cut -c1-200)"
+	log "replace status: $(btrfs replace status -1 $MNT 2>&1 | tr '\n' ' ' | cut -c1-160)"
+	dm_heal 4
+	inuse=0; btrfs filesystem show $MNT 2>/dev/null | grep -q "$TGT" && inuse=1
+	log "target in use after replace: $inuse"
+	# Scrub read-only BEFORE reading the file: a read repairs what it
+	# finds wrong (from the parity, written back to the new device) and
+	# would leave the scrub nothing to count.
+	btrfs scrub start -Br $MNT > /tmp/scrub.out 2>&1
+	csum=$(grep -o "csum=[0-9]*" /tmp/scrub.out | head -1 | cut -d= -f2)
+	echo 3 > /proc/sys/vm/drop_caches
+	got=$(md5sum < $MNT/data 2>/dev/null | awk '{print $1}')
+	log "scrub: $(tr '\n' ' ' < /tmp/scrub.out | grep -o 'Error summary:.*' | cut -c1-120)"
+	kmsg "replace|scrub: device replace could not write" 6
+	log "RTF rrc=$rrc inuse=$inuse md5ok=$([ "$got" = "$want" ] && echo 1 || echo 0) csum=${csum:-0}"
+	echo "$rrc $inuse $([ "$got" = "$want" ] && echo 1 || echo 0) ${csum:-0}" > $T/umltest/rtf.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 degraded_fresh)
 	# A RAID6 array that is degraded from the start, writing into space
 	# that has never been written.  The parity of a never-written vertical
