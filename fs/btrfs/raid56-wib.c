@@ -1108,10 +1108,22 @@ static int wib_write_all_devices(struct btrfs_wib *wib, int *nr_errors_ret)
 		return 0;
 
 	/*
-	 * The block must be on enough devices that after losing the
-	 * tolerated number of devices at least one copy remains.
+	 * The block must survive every further device loss the filesystem
+	 * can still survive.  A device that is missing, or that has just
+	 * failed this write, has already used up tolerance -- its data is
+	 * not current either -- so with k of them the filesystem can lose
+	 * t - k more, and t - k + 1 copies are needed.  The n - k devices
+	 * that took the write always provide that while k <= t; past it the
+	 * filesystem has nothing left to lose and one copy is all there is.
+	 *
+	 * Asking for t + 1 regardless, as this used to, made every recorded
+	 * write fail while the filesystem was well inside its tolerance:
+	 * metadata raid6 on three devices with one failing writes, or RAID6
+	 * on four with two.
 	 */
-	if (nr - nr_errors >= wib_max_tolerated_failures(fs_info) + 1) {
+	if (nr - nr_errors >= 1 &&
+	    nr_errors + (int)READ_ONCE(fs_info->fs_devices->missing_devices) <=
+	    wib_max_tolerated_failures(fs_info)) {
 		btrfs_warn_rl(fs_info,
 		"raid56 write-intent log: %d of %d device writes failed, continuing",
 			      nr_errors, nr);
@@ -1458,6 +1470,12 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	if (ret < 0) {
 		/* Nothing will be written, don't leave the bits in flight. */
 		btrfs_wib_done(fs_info, logical, len, false);
+		/*
+		 * The write fails without a single byte reaching a disk, and
+		 * nothing else says why: every recorded write will, until the
+		 * cause goes.
+		 */
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_WRITE, logical, NULL, 0);
 	}
 	return ret;
 }
@@ -2829,6 +2847,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_LOG_FULL]	= "log_full",
 	[BTRFS_RAID56_EV_DROPPED]	= "record_dropped",
 	[BTRFS_RAID56_EV_READ_AMBIGUOUS] = "read_unverifiable",
+	[BTRFS_RAID56_EV_LOG_WRITE]	= "log_write_failed",
 };
 
 static const char * const raid56_health_names[] = {
@@ -2889,6 +2908,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 	case BTRFS_RAID56_EV_DROPPED:
 		btrfs_err(fs_info,
 "raid56: the write-intent log was full and dropped the record of stripes near %llu; which device holds stale data there may no longer be known. Run 'btrfs scrub start <mountpoint>' before relying on them. State: /sys/fs/btrfs/%pU/raid56_health",
+			  logical, fsid);
+		break;
+	case BTRFS_RAID56_EV_LOG_WRITE:
+		btrfs_err(fs_info,
+"raid56: a write near %llu FAILED (EIO to the application) before reaching any disk, because the write-intent log could not be written: either too few devices took the log write, or the log is full of records it cannot drop while a device does not complete cache flushes. Every such write will fail until the device is fixed or replaced (btrfs device stats <mountpoint> names it; 'btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'). State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_AMBIGUOUS:
@@ -3069,7 +3093,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -3079,6 +3103,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_LOG_FULL],
 			   pending[BTRFS_RAID56_EV_DROPPED],
 			   pending[BTRFS_RAID56_EV_READ_AMBIGUOUS],
+			   pending[BTRFS_RAID56_EV_LOG_WRITE],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {

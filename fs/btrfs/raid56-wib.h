@@ -39,6 +39,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_LOG_FULL,	/* write failed: the log stayed full */
 	BTRFS_RAID56_EV_DROPPED,	/* the log was full and dropped a record */
 	BTRFS_RAID56_EV_READ_AMBIGUOUS,	/* read refused: its rebuild needed a stale column */
+	BTRFS_RAID56_EV_LOG_WRITE,	/* write failed: the log could not be written */
 	BTRFS_RAID56_NR_EVENTS
 };
 

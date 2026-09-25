@@ -2868,6 +2868,14 @@ static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio);
  */
 static bool rbio_rebuilt_unverified(struct btrfs_raid_bio *rbio)
 {
+	/*
+	 * Only data.  A tree block carries its own checksum, verified above
+	 * this layer, which rejects a wrong rebuild and accepts a right one;
+	 * refusing it here would turn correct metadata into read errors.
+	 */
+	if (!(rbio->bioc->map_type & BTRFS_BLOCK_GROUP_DATA) ||
+	    (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_METADATA))
+		return false;
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
 			const int idx = stripe * rbio->stripe_nsectors + nr;
@@ -4069,6 +4077,17 @@ static bool rmw_single_phase;
 module_param_named(raid56_rmw_single_phase, rmw_single_phase, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_single_phase,
 		 "Write repaired sectors in the same batch as the new parity (testing only: restores a known defect)");
+static bool refusal_clears_marks;
+module_param_named(raid56_refusal_clears_marks, refusal_clears_marks, bool, 0644);
+MODULE_PARM_DESC(raid56_refusal_clears_marks,
+		 "Update the stale record after a write that never wrote its data and parity (testing only: restores a known defect)");
+static bool persist_fail_keeps_clear;
+module_param_named(raid56_persist_fail_keeps_clear, persist_fail_keeps_clear, bool, 0644);
+MODULE_PARM_DESC(raid56_persist_fail_keeps_clear,
+		 "Leave the stale marks cleared when the repair could not be made durable (testing only: restores a known defect)");
+#else
+static const bool refusal_clears_marks;
+static const bool persist_fail_keeps_clear;
 #endif
 
 static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
@@ -4078,6 +4097,8 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 	struct bio_list bio_list;
 	struct bio *bio;
 	u64 cols = 0;
+	/* Columns whose mark this cleared, to put back if persisting fails. */
+	u64 cleared = 0;
 	int bit;
 	int ret;
 
@@ -4106,6 +4127,8 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		btrfs_warn_rl(fs_info,
 "raid56: could not write back the rebuilt sectors of full stripe %llu; refusing the write rather than change a parity they still depend on",
 			      full_stripe_start);
+		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
 		/*
 		 * A queued repair that could not write is not a refused write:
 		 * it retries, and only giving up is news (raid56_repair_finished()).
@@ -4129,16 +4152,36 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 			    !(rbio->verified_bitmap &&
 			      test_bit(first + nr, rbio->verified_bitmap)))
 				all = false;
-		if (all)
+		if (all) {
 			btrfs_wib_clear_stale(fs_info,
 					      full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
 					      BTRFS_STRIPE_LEN);
+			cleared |= BIT_ULL(stripe);
+		}
 	}
 	ret = btrfs_wib_persist_now(fs_info);
 	if (ret < 0) {
 		btrfs_warn_rl(fs_info,
 "raid56: could not make the repair of full stripe %llu durable (%d); refusing the write",
 			      full_stripe_start, ret);
+		/*
+		 * Put the marks back.  The log on disk still names these
+		 * columns -- that is what failing to persist means -- and a
+		 * record clean in memory but stale on disk makes the next
+		 * write skip phase A and change the parity in one batch; a
+		 * crash then has recovery rebuild a column that is right from
+		 * a parity that is torn.  Memory must agree with the disk, so
+		 * that the next write repeats phase A and the persist.
+		 */
+		if (!READ_ONCE(persist_fail_keeps_clear)) {
+			for (int stripe = 0; stripe < rbio->nr_data; stripe++)
+				if (cleared & BIT_ULL(stripe))
+					btrfs_wib_mark_stale(fs_info,
+						full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
+						BTRFS_STRIPE_LEN);
+		}
+		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
+			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
 		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_NOT_DURABLE,
 					   full_stripe_start, NULL, 0);
@@ -4159,6 +4202,8 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	bool faulted = false;
 	/* Refused, and already reported as such. */
 	bool refused = false;
+	/* The data and parity were submitted: the record can be updated. */
+	bool phase_b = false;
 	int crash_point = 0;
 	int sectornr;
 	int ret = 0;
@@ -4332,6 +4377,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 
 	/* We should have at least one bio assembled. */
 	ASSERT(bio_list_size(&bio_list));
+	phase_b = true;
 	submit_write_bios(rbio, &bio_list);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
 
@@ -4425,8 +4471,22 @@ out:
 		 * again, and skipping that for a refused write leaves a stale
 		 * mark on the one column that is now right.
 		 */
-		rmw_update_stale_data(rbio, full_stripe_start);
-		rmw_update_stale_parity(rbio, full_stripe_start);
+		/*
+		 * Only for a write whose data and parity went out.  One that
+		 * stopped before -- refused in phase A, undecidable, or failed
+		 * on the way -- wrote nothing this bookkeeping could describe:
+		 * no parity (so no parity mark may be cleared), no column the
+		 * bio supplied (so no data mark either).  Phase A itself only
+		 * ever writes columns already recorded stale and clears nothing
+		 * unless every one of its writes landed, so skipping this loses
+		 * nothing true.  Run it anyway and a refused write clears the
+		 * mark of a Q or of a missing column it never touched, and a
+		 * later read trusts the old content (both seen on RAID6).
+		 */
+		if (phase_b || READ_ONCE(refusal_clears_marks)) {
+			rmw_update_stale_data(rbio, full_stripe_start);
+			rmw_update_stale_parity(rbio, full_stripe_start);
+		}
 	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {
 		/*
@@ -4466,6 +4526,22 @@ out:
 		raid56_repair_finished(rbio, ret, faulted);
 	} else if (faulted) {
 		const unsigned long cols = rbio_failed_cols(rbio);
+		unsigned long present = 0;
+		int col;
+
+		/*
+		 * A column on a missing device cannot be repaired until the
+		 * device is back; queueing it only makes six failed attempts
+		 * and a "gave up" that sends the user to a scrub that cannot
+		 * help either.  Every write of a degraded mount lands here.
+		 */
+		for_each_set_bit(col, &cols, rbio->real_stripes) {
+			const struct btrfs_device *dev = rbio->bioc->stripes[col].dev;
+
+			if (dev && dev->bdev &&
+			    !test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state))
+				present |= BIT(col);
+		}
 
 		/*
 		 * Tell someone: within the tolerance the write succeeded but
@@ -4478,7 +4554,8 @@ out:
 		else if (!refused && cols)
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_FAILED,
 					   full_stripe_start, rbio->bioc, cols);
-		btrfs_raid56_queue_repair(fs_info, full_stripe_start, 0);
+		if (present || !cols)
+			btrfs_raid56_queue_repair(fs_info, full_stripe_start, 0);
 	}
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }
