@@ -2785,6 +2785,15 @@ static int recover_vertical(struct btrfs_raid_bio *rbio, int sector_nr,
 	return 0;
 }
 
+/* Does any bio of this rbio read or write vertical stripe @sectornr? */
+static bool rbio_row_requested(struct btrfs_raid_bio *rbio, int sectornr)
+{
+	for (int stripe = 0; stripe < rbio->nr_data; stripe++)
+		if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
+			return true;
+	return false;
+}
+
 static int recover_sectors(struct btrfs_raid_bio *rbio)
 {
 	const bool has_qstripe = rbio->real_stripes - rbio->nr_data == 2;
@@ -2828,6 +2837,18 @@ static int recover_sectors(struct btrfs_raid_bio *rbio)
 	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
 		ret = recover_vertical(rbio, sectornr, pointers, unmap_array,
 				       scratch_p, scratch_q);
+		/*
+		 * A read has only the rows it asked for at stake.  A row of
+		 * free space whose parity is inconsistent -- scrub and
+		 * recovery skip rows with no extents -- fails the RAID6 Q
+		 * cross-check, and used to fail the whole read, rows that
+		 * rebuild correctly included.
+		 */
+		if (ret < 0 && rbio->operation == BTRFS_RBIO_READ_REBUILD &&
+		    !rbio_row_requested(rbio, sectornr)) {
+			ret = 0;
+			continue;
+		}
 		if (ret < 0)
 			break;
 	}
@@ -3587,6 +3608,9 @@ static bool rbio_stripe_recorded(struct btrfs_raid_bio *rbio)
 				      &st);
 }
 
+/* See rmw_repair_first(). */
+static bool rmw_single_phase;
+
 /* Bit i set: a sector of bioc->stripes[i] failed.  For the alerts. */
 static unsigned long rbio_failed_cols(const struct btrfs_raid_bio *rbio)
 {
@@ -3688,7 +3712,12 @@ static void rmw_prepare_repair(struct btrfs_raid_bio *rbio)
 				bitmap_set(&rbio->dbitmap, 0, rbio->stripe_nsectors);
 		}
 	}
-	if (nr)
+	/*
+	 * Counted here only when the write-back goes out with the data
+	 * (raid56_rmw_single_phase); otherwise rmw_repair_first() counts
+	 * what actually landed.
+	 */
+	if (nr && READ_ONCE(rmw_single_phase))
 		atomic64_add(nr, &fs_info->raid56_write_stats.rmw_repaired_sectors);
 }
 
@@ -3772,6 +3801,7 @@ void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	unsigned long delay;
+	bool dropped = false;
 
 	if (!wib || READ_ONCE(no_repair_on_fault))
 		return;
@@ -3785,6 +3815,7 @@ void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 			goto out;
 	if (wib->repair_nr == BTRFS_WIB_REPAIR_SLOTS) {
 		atomic64_inc(&wib->stat_repair_dropped);
+		dropped = true;
 		goto out;
 	}
 	wib->repair_queue[wib->repair_nr++] = (struct btrfs_wib_repair_slot) {
@@ -3796,6 +3827,14 @@ void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 	raid56_repair_schedule(wib);
 out:
 	spin_unlock(&wib->repair_lock);
+	/*
+	 * Nothing retries a stripe the queue had no room for: it stays
+	 * recorded, and without redundancy, until a write, a scrub or a mount.
+	 * Say so, or a second failure finds it unannounced.
+	 */
+	if (dropped)
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPAIR_DROPPED,
+				   full_stripe_start, NULL, 0);
 }
 
 static void raid56_submit_repair(struct btrfs_fs_info *fs_info, u64 logical,
@@ -3998,17 +4037,32 @@ void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info)
  * never waits on anything freeze holds -- it takes no transaction and no
  * sb_start_write() -- so waiting for it here cannot deadlock.
  */
-void btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info)
+#define BTRFS_RAID56_PAUSE_TIMEOUT	(30 * HZ)
+
+int btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 
 	if (!wib || READ_ONCE(repair_ignores_freeze))
-		return;
+		return 0;
 	spin_lock(&wib->repair_lock);
 	wib->repair_paused = true;
 	spin_unlock(&wib->repair_lock);
 	cancel_delayed_work_sync(&wib->repair_work);
-	wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
+	/*
+	 * Bounded: a repair stuck on a device that has stopped answering would
+	 * otherwise hang fsfreeze, or a suspend that freezes filesystems, with
+	 * nothing said.  Failing the freeze is the lesser evil.
+	 */
+	if (!wait_event_timeout(wib->wait, atomic_read(&wib->repairs_inflight) == 0,
+				BTRFS_RAID56_PAUSE_TIMEOUT)) {
+		btrfs_err(fs_info,
+"raid56: cannot freeze: a RAID5/6 repair has been waiting %u s for a device that does not complete its I/O; check the devices (dmesg, btrfs device stats)",
+			  jiffies_to_msecs(BTRFS_RAID56_PAUSE_TIMEOUT) / 1000);
+		btrfs_raid56_resume_repairs(fs_info);
+		return -EBUSY;
+	}
+	return 0;
 }
 
 void btrfs_raid56_resume_repairs(struct btrfs_fs_info *fs_info)
@@ -4039,7 +4093,11 @@ void btrfs_raid56_stop_repairs(struct btrfs_fs_info *fs_info)
 	wib->repair_nr = 0;
 	spin_unlock(&wib->repair_lock);
 	cancel_delayed_work_sync(&wib->repair_work);
-	wait_event(wib->wait, atomic_read(&wib->repairs_inflight) == 0);
+	/* Unmount has to wait for it; it need not wait in silence. */
+	while (!wait_event_timeout(wib->wait, atomic_read(&wib->repairs_inflight) == 0,
+				   30 * HZ))
+		btrfs_warn(fs_info,
+"raid56: still waiting for a RAID5/6 repair stuck on a device that does not complete its I/O; check the devices (dmesg, btrfs device stats)");
 }
 
 void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info)
@@ -4072,7 +4130,6 @@ void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info)
  * before B: the parity is untouched and still holds the acknowledged value,
  * and the record still says where.
  */
-static bool rmw_single_phase;
 #ifdef CONFIG_BTRFS_DEBUG
 module_param_named(raid56_rmw_single_phase, rmw_single_phase, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_single_phase,
@@ -4122,6 +4179,39 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		bio->bi_opf |= REQ_FUA;
 	submit_write_bios(rbio, &bio_list);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
+
+	/*
+	 * One retry, as phase B gets (rmw_retry_failed_sectors(), which cannot
+	 * serve here: it would write the bio's new data for a sector the bio
+	 * supplies, where phase A must write the value the parity describes).
+	 * A single transient blip would otherwise refuse the caller's write.
+	 */
+	if (find_first_bit(rbio->error_bitmap, data_sectors) < data_sectors) {
+		bio_list_init(&bio_list);
+		for_each_set_bit(bit, rbio->repair_bitmap, data_sectors) {
+			const int stripe = bit / rbio->stripe_nsectors;
+			const int sectornr = bit % rbio->stripe_nsectors;
+
+			if (!test_bit(bit, rbio->error_bitmap))
+				continue;
+			ret = rbio_add_io_paddrs(rbio, &bio_list,
+						 rbio_stripe_paddrs(rbio, stripe, sectornr),
+						 stripe, sectornr, REQ_OP_WRITE);
+			if (ret) {
+				bio_list_put(&bio_list);
+				bio_list_init(&bio_list);
+				break;
+			}
+		}
+		if (!bio_list_empty(&bio_list)) {
+			for_each_set_bit(bit, rbio->repair_bitmap, data_sectors)
+				clear_bit(bit, rbio->error_bitmap);
+			bio_list_for_each(bio, &bio_list)
+				bio->bi_opf |= REQ_FUA;
+			submit_write_bios(rbio, &bio_list);
+			wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
+		}
+	}
 
 	if (find_first_bit(rbio->error_bitmap, data_sectors) < data_sectors) {
 		btrfs_warn_rl(fs_info,
@@ -4188,6 +4278,8 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		return -EIO;
 	}
 	/* On disk now; phase B writes only the new data and the parity. */
+	atomic64_add(bitmap_weight(rbio->repair_bitmap, data_sectors),
+		     &fs_info->raid56_write_stats.rmw_repaired_sectors);
 	bitmap_clear(rbio->repair_bitmap, 0, data_sectors);
 	return 0;
 }
@@ -4522,6 +4614,19 @@ out:
 	 * record now names.  Ask for that now rather than whenever a scrub or
 	 * the next write to this stripe happens to come along.
 	 */
+	/*
+	 * A full-stripe copy-on-write write that landed everywhere rewrote
+	 * every column and every parity of a stripe that held nothing in use
+	 * (it was allocated whole), so whatever the record says about it is
+	 * over.  Left in place, a stale mark keeps diverting reads of the new
+	 * data to a rebuild the record then calls undecidable: EIO for good.
+	 * Such a write is not logged, so nothing else would clear it.
+	 */
+	if (!logged && ret >= 0 && rbio_is_full(rbio) &&
+	    bitmap_empty(rbio->error_bitmap, rbio->nr_sectors) &&
+	    unlikely(btrfs_wib_any_stale(fs_info)))
+		btrfs_wib_clear_sticky(fs_info, full_stripe_start, full_stripe_len);
+
 	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
 		raid56_repair_finished(rbio, ret, faulted);
 	} else if (faulted) {

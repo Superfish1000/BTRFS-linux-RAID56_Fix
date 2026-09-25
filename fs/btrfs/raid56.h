@@ -328,7 +328,7 @@ void btrfs_raid56_queue_repair(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 void btrfs_raid56_repair_work(struct work_struct *work);
 void btrfs_raid56_stop_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info);
-void btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info);
+int btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_resume_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info);
 

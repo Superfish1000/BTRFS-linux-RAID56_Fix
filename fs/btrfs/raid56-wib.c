@@ -2848,6 +2848,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_DROPPED]	= "record_dropped",
 	[BTRFS_RAID56_EV_READ_AMBIGUOUS] = "read_unverifiable",
 	[BTRFS_RAID56_EV_LOG_WRITE]	= "log_write_failed",
+	[BTRFS_RAID56_EV_REPAIR_DROPPED] = "repair_dropped",
 };
 
 static const char * const raid56_health_names[] = {
@@ -2914,6 +2915,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		btrfs_err(fs_info,
 "raid56: a write near %llu FAILED (EIO to the application) before reaching any disk, because the write-intent log could not be written: either too few devices took the log write, or the log is full of records it cannot drop while a device does not complete cache flushes. Every such write will fail until the device is fixed or replaced (btrfs device stats <mountpoint> names it; 'btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'). State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
+		break;
+	case BTRFS_RAID56_EV_REPAIR_DROPPED:
+		btrfs_warn(fs_info,
+"raid56: too many damaged stripes to repair in the background; full stripe %llu and any others past the first %u stay without redundancy until a write reaches them, a scrub or the next mount. Run 'btrfs scrub start <mountpoint>' once the failing device is fixed or replaced. State: /sys/fs/btrfs/%pU/raid56_health",
+			   logical, BTRFS_WIB_REPAIR_SLOTS, fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_AMBIGUOUS:
 		btrfs_err(fs_info,
@@ -3007,7 +3013,8 @@ void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event e
 	first = !(wib->alert_seen & BIT(ev));
 	wib->alert_seen |= BIT(ev);
 	wib->alert_pending[ev]++;
-	if (ev != BTRFS_RAID56_EV_STALE)
+	/* Notices: redundancy lost, nothing failed. */
+	if (ev != BTRFS_RAID56_EV_STALE && ev != BTRFS_RAID56_EV_REPAIR_DROPPED)
 		wib->alert_failing = true;
 	wib->last_event = ev;
 	wib->last_logical = logical;
@@ -3093,7 +3100,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -3104,6 +3111,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_DROPPED],
 			   pending[BTRFS_RAID56_EV_READ_AMBIGUOUS],
 			   pending[BTRFS_RAID56_EV_LOG_WRITE],
+			   pending[BTRFS_RAID56_EV_REPAIR_DROPPED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
@@ -3239,7 +3247,10 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 		}
 		len += sysfs_emit_at(buf, len, "%sscrub\n", named ? " then " : "");
 	} else if (health == BTRFS_RAID56_HEALTH_DEGRADED) {
-		len += sysfs_emit_at(buf, len, "wait-for-repair-or-scrub\n");
+		/* Once the queue overflowed, waiting will not finish the job. */
+		len += sysfs_emit_at(buf, len, "%s\n",
+				     atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_REPAIR_DROPPED]) ?
+				     "scrub" : "wait-for-repair-or-scrub");
 	} else {
 		len += sysfs_emit_at(buf, len, "none\n");
 	}
@@ -3393,6 +3404,14 @@ static int wib_read_slot(struct btrfs_device *device, unsigned int slot, void *b
 	return ret;
 }
 
+/* Testing only: take stale marks from every device's newest block again. */
+static bool load_unions_stale;
+#ifdef CONFIG_BTRFS_DEBUG
+module_param_named(raid56_load_unions_stale, load_unions_stale, bool, 0644);
+MODULE_PARM_DESC(raid56_load_unions_stale,
+		 "At mount, take stale marks from every device's newest log block, not only the newest overall (testing only: restores a known defect)");
+#endif
+
 /*
  * Read the log blocks of all present devices and build the list of full
  * stripes to recover before the filesystem is written to.  Called at mount
@@ -3405,6 +3424,18 @@ static int wib_read_slot(struct btrfs_device *device, unsigned int slot, void *b
  * devices the union is taken: a device that missed a commit (torn write,
  * IO error, or absent at the time) still lists the stripes that commit
  * dropped, and scrubbing a consistent stripe is harmless.
+ *
+ * Except the stale marks.  "In flight" makes recovery recompute the parity
+ * from the data, which is harmless on a consistent stripe; "stale" makes it
+ * rebuild the named column FROM the parity, which is harmless only while the
+ * parity has not moved on.  A mark the newest block no longer carries was
+ * cleared on purpose -- the column was written back with FUA and the log
+ * made durable before the next write changed the parity (rmw_repair_first())
+ * -- and a device that missed that block still names it.  Brought back by
+ * the union, it has recovery rebuild a column that is right from a parity a
+ * crash has since torn: silent, for data without a checksum.  So stale and
+ * stale_par come only from devices holding the newest block; every other
+ * device's entries still count, without them.
  */
 int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 {
@@ -3430,10 +3461,27 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	/* Allocations under device_list_mutex must not enter reclaim. */
 	nofs_flag = memalloc_nofs_save();
 	mutex_lock(&fs_devices->device_list_mutex);
+
+	/* The newest sequence number on any device: see above. */
+	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+		const struct btrfs_wib_disk_header *hdr = buf;
+
+		if (!device->bdev ||
+		    !test_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state))
+			continue;
+		for (unsigned int slot = 0; slot < BTRFS_WIB_NR_SLOTS; slot++) {
+			if (wib_read_slot(device, slot, buf) < 0 ||
+			    !btrfs_wib_block_valid(fs_info, buf))
+				continue;
+			max_seq = max(max_seq, le64_to_cpu(hdr->seq));
+		}
+	}
+
 	list_for_each_entry(device, &fs_devices->devices, dev_list) {
 		const struct btrfs_wib_disk_header *hdr = buf;
 		u64 dev_seq = 0;
 		int dev_slot = -1;
+		bool newest;
 		u32 nr;
 
 		device->wib_next_slot = 0;
@@ -3465,6 +3513,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			continue;
 		/* Don't overwrite the newest block of this device first. */
 		device->wib_next_slot = (dev_slot + 1) % BTRFS_WIB_NR_SLOTS;
+		newest = dev_seq >= max_seq || READ_ONCE(load_unions_stale);
 		if (dev_seq > max_seq)
 			max_seq = dev_seq;
 
@@ -3482,6 +3531,10 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			struct btrfs_wib_entry e;
 
 			btrfs_wib_read_entry(buf, i, &e);
+			if (!newest) {
+				e.stale = 0;
+				e.stale_par = 0;
+			}
 			ret = btrfs_wib_add_pending(wib, &e);
 			if (ret < 0)
 				goto out;
