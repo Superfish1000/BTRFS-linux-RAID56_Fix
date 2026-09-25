@@ -1052,6 +1052,9 @@ nocow_rmw)
 nocow_rmw_probe)
 	# Read pass 1's blocks with the failing device omitted, so every one of
 	# them must come from the parity.
+	# A measurement of what the parity holds, not a user's read: see
+	# nocow_probe for why the undecidable rebuild is let through.
+	echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous 2>/dev/null
 	do_mount ro,degraded $MNTDEV
 	# Same rules as nocow_bad(): an acknowledged block must read back as
 	# 'B' (all 4096 bytes -- a failed read has none), a refused one as its
@@ -1121,6 +1124,9 @@ nocow_replay_probe)
 	# boot, so open_ctree() has no reason to call btrfs_wib_rw_mount() here
 	# and no recovery runs.  (ro,nologreplay,degraded is refused outright at
 	# option-parsing time -- "bad option", with no message from btrfs.)
+	# A measurement of what the parity holds, not a user's read: see
+	# nocow_probe for why the undecidable rebuild is let through.
+	echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous 2>/dev/null
 	do_mount ro,degraded $MNTDEV
 	bad=$(nocow_bad)
 	log "NOCOW_REPLAY_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
@@ -1598,6 +1604,9 @@ unprovable_diag)
 	# what the scrub would then persist.  A zero here means the scenario
 	# never built the state, and the scrub arms below cannot mean anything.
 	dm_setup; dm_scan
+	# A measurement of what the parity holds, not a user's read: see
+	# nocow_probe for why the undecidable rebuild is let through.
+	echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous 2>/dev/null
 	do_mount ro,degraded /dev/mapper/d0
 	set -- $(unprov_scan)
 	log "UNPROV_DIAG_GARBAGE=$1 UNPROV_DIAG_UNREAD=$2 (device $VICTIM omitted)"
@@ -1623,6 +1632,12 @@ nocow_probe)
 	# sectors the failed writes left stale, which forces every one of them
 	# to be reconstructed from the parity -- so this measures what the
 	# parity still holds.
+	#
+	# A measurement, not a user's read: where the record leaves the rebuild
+	# undecidable the kernel now refuses it (EIO) rather than vouch for
+	# it, which is right for a user and hides from this probe exactly the
+	# parity content it exists to see.  Let the rebuild through here.
+	echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous 2>/dev/null
 	do_mount ro,degraded $MNTDEV
 	bad=$(nocow_bad)
 	log "NOCOW_PROBE_${PROBE:-x} bad=$bad of $NOCOW_BLOCKS"
