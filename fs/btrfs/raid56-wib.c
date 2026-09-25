@@ -2893,7 +2893,7 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		break;
 	case BTRFS_RAID56_EV_READ_AMBIGUOUS:
 		btrfs_err(fs_info,
-"raid56: a read of full stripe %llu returned data as it is on the disks although more of the stripe is recorded stale (%s among them) than its parity can rebuild: data without a checksum there may be OLD content. Bring back any missing device, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
+"raid56: REFUSED a read of full stripe %llu (EIO to the application): more of it is missing or recorded stale (%s among them) than its parity can rebuild, and data without a checksum would have come back WRONG. Bring back any missing device, then run 'btrfs scrub start <mountpoint>'. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, who, fsid);
 		break;
 	default:

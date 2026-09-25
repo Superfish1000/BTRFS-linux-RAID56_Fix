@@ -2079,17 +2079,6 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
 		if (add)
 			set_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags);
-		/*
-		 * A read handing back what may be old content is the one
-		 * failure here that no caller ever sees, for data without a
-		 * checksum: say so.  (A write or a repair that finds the same
-		 * reports it itself.)
-		 */
-		if (add && rbio->operation == BTRFS_RBIO_READ_REBUILD)
-			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_READ_AMBIGUOUS,
-					   rbio->bioc->full_stripe_logical, rbio->bioc,
-					   (unsigned long)(st.stale_cols & (BIT(rbio->nr_data) - 1)) |
-					   ((unsigned long)st.bad_parity << rbio->nr_data));
 		return;
 	}
 
@@ -2851,6 +2840,50 @@ out:
 	return ret;
 }
 
+/*
+ * Testing only: hand back a rebuild that had to use a column recorded stale,
+ * as this code used to.  See rbio_rebuilt_unverified().
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool read_trusts_ambiguous;
+module_param_named(raid56_read_trusts_ambiguous, read_trusts_ambiguous, bool, 0644);
+MODULE_PARM_DESC(raid56_read_trusts_ambiguous,
+		 "Return data rebuilt from a column recorded stale when nothing can check it (testing only: restores a known defect)");
+#else
+static const bool read_trusts_ambiguous;
+#endif
+
+static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio);
+
+/*
+ * Did this read rebuild a sector somebody asked for, that has no checksum,
+ * from a stripe with more recorded stale than its parity can rebuild?
+ *
+ * mark_stale_sectors() leaves the stale columns in as sources then -- there is
+ * nothing better to rebuild from -- so what comes out for the missing member
+ * is the parity undone with the OLD content of the stale one: wrong wherever
+ * the lost write changed anything.  A sector with a checksum is checked by
+ * recover_vertical() and fails there if it is wrong.  One without has nothing
+ * to catch it, and a caller would take it for the data.
+ */
+static bool rbio_rebuilt_unverified(struct btrfs_raid_bio *rbio)
+{
+	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
+		for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
+			const int idx = stripe * rbio->stripe_nsectors + nr;
+
+			if (!test_bit(idx, rbio->error_bitmap))
+				continue;
+			if (!sector_paddrs_in_rbio(rbio, stripe, nr, 1))
+				continue;
+			if (rbio->csum_bitmap && test_bit(idx, rbio->csum_bitmap))
+				continue;
+			return true;
+		}
+	}
+	return false;
+}
+
 static void recover_rbio(struct btrfs_raid_bio *rbio)
 {
 	struct bio_list bio_list = BIO_EMPTY_LIST;
@@ -2933,6 +2966,20 @@ static void recover_rbio(struct btrfs_raid_bio *rbio)
 
 	submit_read_wait_bio_list(rbio, &bio_list);
 	ret = recover_sectors(rbio);
+
+	/*
+	 * Refuse rather than hand back data that is wrong for all anyone can
+	 * tell -- the read-side twin of refusing a write into an undecidable
+	 * stripe.  The caller gets EIO, and the user an alert.
+	 */
+	if (ret == 0 && rbio->operation == BTRFS_RBIO_READ_REBUILD &&
+	    test_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags) &&
+	    !READ_ONCE(read_trusts_ambiguous) && rbio_rebuilt_unverified(rbio)) {
+		btrfs_raid56_alert(rbio->bioc->fs_info, BTRFS_RAID56_EV_READ_AMBIGUOUS,
+				   rbio->bioc->full_stripe_logical, rbio->bioc,
+				   rbio_stale_cols(rbio));
+		ret = -EIO;
+	}
 out:
 	rbio_orig_end_io(rbio, errno_to_blk_status(ret));
 }

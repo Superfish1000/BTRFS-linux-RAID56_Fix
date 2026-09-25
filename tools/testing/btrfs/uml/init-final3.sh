@@ -1893,11 +1893,13 @@ alert)
 	finish
 	;;
 alert_read)
-	# The one silent failure a caller never sees: a read of a column the
-	# log records stale, while another device of the same row is gone.
-	# The read cannot rebuild the acknowledged value and returns what is on
-	# the disk -- for data without a checksum, possibly OLD content, with no
-	# error.  It must at least raise an alert.
+	# A read whose rebuild needs a column the log records stale, because
+	# another device of the same row is gone.  It used to come back WRONG
+	# with no error for data without a checksum; now it must fail with EIO
+	# and raise an alert.  READ_TRUST=1 restores the old behaviour (the
+	# control that shows the wrong data); CONTROL=1 leaves every device in.
+	[ "${READ_TRUST:-0}" = 1 ] &&
+		echo 1 > /sys/module/btrfs/parameters/raid56_read_trusts_ambiguous
 	dm_setup
 	mkfs.btrfs -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
@@ -1918,9 +1920,30 @@ alert_read)
 		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
 	dm_heal $IDX_B
 	sync
-	[ "${CONTROL:-0}" = 1 ] || dm_detach $IDX_C
+	# The second hole has to be KNOWN before the read -- a device missing
+	# at mount.  One that only fails during the read makes the rebuild
+	# fail, and the read returns EIO: visible, not silent.  ro, so mount
+	# recovery does not run.
+	umount $MNT || log "UMOUNT_FAIL"
+	if [ "${CONTROL:-0}" = 1 ]; then
+		do_mount ro /dev/mapper/d0
+	else
+		dmsetup remove d$IDX_C || log "REMOVE_FAIL"
+		btrfs device scan --forget >/dev/null 2>&1
+		for i in $(seq 0 $((NDEV-1))); do
+			[ $i = $IDX_C ] || btrfs device scan /dev/mapper/d$i >/dev/null 2>&1
+		done
+		m=$([ $IDX_C = 0 ] && echo 1 || echo 0)
+		do_mount ro,degraded /dev/mapper/d$m
+	fi
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 	echo 3 > /proc/sys/vm/drop_caches
-	got=$(dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none 2>/dev/null |
+	# Read the MISSING device's column (C), in the row of the stale one.
+	# Its rebuild takes the stale column as it is on disk ('A' where 'B'
+	# was acknowledged), so C comes back as A ^ B ^ A = 'B', not its 'A'.
+	# (Reading the stale column itself is diverted as a checksum failure
+	# and fails with EIO -- visible.)
+	got=$(dd if=$MNT/nocow bs=4096 skip=$((FO_C / 4096)) count=1 status=none 2>/dev/null |
 	      od -An -c | head -1 | tr -s ' ' | cut -c1-12)
 	sleep 3
 	log "read back [$got]"

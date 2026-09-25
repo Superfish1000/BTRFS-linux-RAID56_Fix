@@ -36,7 +36,7 @@ boot() {	# arm control
 boot fixed 0
 boot control 1
 # The read that cannot be verified: fixed arm pulls a second device of the row.
-boot_read() {	# arm control
+boot_read() {	# arm control [read_trust]
 	local tag=alert-read-$1 ubds=""
 	local D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D; rm -f $T/umltest/alert_read.result.$tag
@@ -44,10 +44,11 @@ boot_read() {	# arm control
 	timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 		init=$T/umltest/init-alert.sh $ubds quiet con=null con0=fd:0,fd:1 \
 		BTRFS_TEST_DIR=$T MODE=alert_read OPTS=rw PROFILE=raid5:raid1 TAG=$tag \
-		NDEV=$NDEV CONTROL=$2 > $D/log 2>&1
+		NDEV=$NDEV CONTROL=$2 READ_TRUST=${3:-0} > $D/log 2>&1
 	rm -f $D/disk*.img
 }
 boot_read fixed 0
+boot_read trusting 0 1
 boot_read control 1
 
 fails=0
@@ -105,11 +106,13 @@ echo "unverifiable read:"
 grep -ah "read back\|ALERT_READ" $T/umltest/alert-read-*/log | sed 's/^/  /'
 read -r RU RS < $T/umltest/alert_read.result.alert-read-fixed 2>/dev/null
 read -r CU CS < $T/umltest/alert_read.result.alert-read-control 2>/dev/null
+got() { grep -ao 'read back \[[^]]*\]' $T/umltest/alert-read-$1/log | tail -1; }
+check "the rebuild that needed a stale column is refused (EIO)" test "$(got fixed)" = "read back []"
 check "counted"                                  test "${RU:-0}" -ge 1
 check "state failing"                            test "${RS:-}" = failing
-check "kernel log explains it"                   has $T/umltest/alert_read.alert-read-fixed "a read of full stripe"
-check "control (no second hole): not counted"    test "${CU:-1}" -eq 0
-check "control: not failing"                     test "${CS:-failing}" != failing
+check "kernel log explains it"                   has $T/umltest/alert_read.alert-read-fixed "REFUSED a read of full stripe"
+check "old behaviour (control): the same read comes back WRONG, as B" sh -c "echo '$(got trusting)' | grep -q ' B B B'"
+check "no second hole (control): reads A, not counted, not failing" sh -c "echo '$(got control)' | grep -q ' A A A' && [ ${CU:-1} -eq 0 ] && [ '${CS:-failing}' != failing ]"
 
 [ $fails -eq 0 ] || { echo "RESULT: FAIL -- $fails check(s) failed"; exit 1; }
 echo "RESULT: PASS -- every channel reported the episode and nothing reported the control"
