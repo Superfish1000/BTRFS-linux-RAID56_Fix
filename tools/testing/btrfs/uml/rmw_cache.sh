@@ -14,7 +14,12 @@
 #                 parity.  Fixed, it names only what a write went to.  The
 #                 arm shows that only if 'B' is on its platter and its read
 #                 fails; a read that returns anything but 'B' without an
-#                 error is a wrong read, and fails the test.
+#                 error is a wrong read, and fails the test.  The readd
+#                 names only in a stripe recorded in flight, and C is
+#                 recorded only once its repair is durable, so this arm
+#                 records it first, as before: raid56_rmw_mark_before_repair=1
+#   fixed-order   that alone: 'B' reads back and is on its platter, so the
+#                 name-control arm's refusal is the naming's
 # The model predicted the loss (raid56_redundancy_model.py with the kernel's
 # cache rule); this is it on a real kernel.
 set -u
@@ -43,17 +48,20 @@ arm() {	# name control [kernel args...]
 # Each: 'B' bytes read back, 'B' bytes on its platter, 1 if the read failed.
 read -r f_read f_plat f_rc <<<"$(arm fixed 0)"
 read -r c_read c_plat c_rc <<<"$(arm control 1)"
-read -r n_read n_plat n_rc <<<"$(arm name-control 0 btrfs.raid56_wf_name_unwritten=1)"
+ORDER=btrfs.raid56_rmw_mark_before_repair=1
+read -r n_read n_plat n_rc <<<"$(arm name-control 0 btrfs.raid56_wf_name_unwritten=1 $ORDER)"
+read -r o_read o_plat o_rc <<<"$(arm fixed-order 0 $ORDER)"
 spl=$(grep -l KERNEL_SPLAT $T/umltest/rmw-cache-*/log 2>/dev/null | wc -l)
-for a in fixed control name-control; do
+for a in fixed control name-control fixed-order; do
 	grep -ah "layout:\|acknowledged\|refused\|RMW_CACHE\|did not confirm\|refusing a read" \
 		$T/umltest/rmw-cache-$a/log | sed "s/^/  [$a] /"
 done
 echo "  'B' bytes read back / on its platter (4096 each = intact): fixed $f_read/$f_plat," \
-     "control $c_read/$c_plat, name-control $n_read/$n_plat, splats $spl"
+     "control $c_read/$c_plat, name-control $n_read/$n_plat," \
+     "fixed-order $o_read/$o_plat, splats $spl"
 echo "  read failed (1) or returned data (0): fixed ${f_rc:-?}, control ${c_rc:-?}," \
-     "name-control ${n_rc:-?}"
-case "$f_read$f_plat$c_read$c_plat$n_read$n_plat${n_rc:-?}" in
+     "name-control ${n_rc:-?}, fixed-order ${o_rc:-?}"
+case "$f_read$f_plat$c_read$c_plat$n_read$n_plat${n_rc:-?}$o_read$o_plat" in
 *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
 esac
 [ "$spl" -eq 0 ] || { echo "RESULT: FAIL -- kernel splat"; exit 1; }
@@ -61,9 +69,20 @@ grep -aq "knob raid56_wf_name_unwritten=Y" $T/umltest/rmw-cache-name-control/log
 	echo "RESULT: INCONCLUSIVE -- raid56_wf_name_unwritten is not set in the name-control arm"
 	echo "        (not a CONFIG_BTRFS_DEBUG kernel, or one without the knob)"; exit 2
 }
+for a in name-control fixed-order; do
+	grep -aq "knob raid56_rmw_mark_before_repair=Y" $T/umltest/rmw-cache-$a/log || {
+		echo "RESULT: INCONCLUSIVE -- raid56_rmw_mark_before_repair is not set" \
+		     "in the $a arm"
+		exit 2
+	}
+done
 [ "$f_read" = 4096 ] && [ "$f_plat" = 4096 ] || {
 	echo "RESULT: FAIL -- 'B' lost or refused with the fix" \
 	     "(read $f_read, platter $f_plat)"; exit 1
+}
+[ "$o_read" = 4096 ] && [ "$o_plat" = 4096 ] || {
+	echo "RESULT: FAIL -- 'B' lost or refused with the fix, C recorded before its" \
+	     "repair (read $o_read, platter $o_plat)"; exit 1
 }
 if [ "$c_read" = 4096 ] && [ "$c_plat" = 4096 ]; then
 	echo "RESULT: INCONCLUSIVE -- the control kept 'B', so a clean fix proves nothing"; exit 2

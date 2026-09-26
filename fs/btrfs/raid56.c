@@ -129,6 +129,10 @@
  *  4: the next parity scrub (as used by the write-intent log replay) panics
  *     before writing the regenerated parity (can be given on the kernel
  *     command line to crash the replay).
+ *  5: the next sub-stripe RMW panics before its write-back of what the
+ *     record names stale (rmw_repair_first()) goes out.
+ *  6: the next sub-stripe RMW panics once that write-back has landed, before
+ *     the record says so.
  *
  * Only the first matching rbio after the parameter is set is affected.
  */
@@ -4619,11 +4623,33 @@ void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info)
  * If A does not land, or the log cannot be made durable, the write fails
  * before B: the parity is untouched and still holds the acknowledged value,
  * and the record still says where.
+ *
+ * The full stripe is recorded in flight after A, not before (rmw_rbio()).
+ * Recorded before, a crash ahead of A or inside it left a stripe marked
+ * possibly torn next to the column its record names, which the parity alone
+ * has to rebuild: the recovery cannot decide that (SCRUB_WIB_TORN), and the
+ * column's data without a checksum read as EIO for good, although nothing had
+ * touched the parity that holds it.  A needs no mark of its own: it writes
+ * only what the record names stale or what failed its checksum, at the value
+ * the parity describes, and clears the name only once that is on disk, so a
+ * crash inside it leaves a record the recovery rebuilds the column from.
+ * raid56_rmw_mark_before_repair=1 restores the mark before A, for
+ * uml/rmw_inflight.sh.
+ *
+ * The mark still covers the whole full stripe, not only the columns B writes.
+ * A failed flush names parity p on the stripe's block p, and only where the
+ * log lists that block (wib_name_devices()); and a record marked possibly torn
+ * is written as in flight too (wib_write_entry()), so a recovery could not
+ * tell a narrower mark from it.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 module_param_named(raid56_rmw_single_phase, rmw_single_phase, bool, 0644);
 MODULE_PARM_DESC(raid56_rmw_single_phase,
 		 "Write repaired sectors in the same batch as the new parity (testing only: restores a known defect)");
+static bool rmw_mark_before_repair;
+module_param_named(raid56_rmw_mark_before_repair, rmw_mark_before_repair, bool, 0644);
+MODULE_PARM_DESC(raid56_rmw_mark_before_repair,
+		 "Record the full stripe in flight before the write-back of what the record names stale, not after it is durable (testing only: restores a known defect)");
 static bool ack_per_row;
 module_param_named(raid56_ack_per_row, ack_per_row, bool, 0644);
 MODULE_PARM_DESC(raid56_ack_per_row,
@@ -4637,6 +4663,7 @@ module_param_named(raid56_persist_fail_keeps_clear, persist_fail_keeps_clear, bo
 MODULE_PARM_DESC(raid56_persist_fail_keeps_clear,
 		 "Leave the stale marks cleared when the repair could not be made durable (testing only: restores a known defect)");
 #else
+static const bool rmw_mark_before_repair;
 static const bool ack_per_row;
 static const bool refusal_clears_marks;
 static const bool persist_fail_keeps_clear;
@@ -4672,7 +4699,8 @@ static void rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 			       logged);
 }
 
-static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
+static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
+			    int crash_point)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 	const int data_sectors = rbio->nr_data * rbio->stripe_nsectors;
@@ -4755,6 +4783,12 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 		return -EIO;
 	}
 
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(crash_point == 6))
+		panic("btrfs: raid56 crash injection 6 after the write-back of full stripe %llu",
+		      full_stripe_start);
+#endif
+
 	/* Each such column matches the parity again; say so, durably. */
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		const int first = stripe * rbio->stripe_nsectors;
@@ -4819,10 +4853,14 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	const u64 full_stripe_start = rbio->bioc->full_stripe_logical;
 	const u64 full_stripe_len = (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT;
 	struct bio_list bio_list;
+	/* A sub-stripe or in-place write: the log records it in flight. */
+	bool record = false;
 	bool logged = false;
 	bool faulted = false;
 	/* Refused, and already reported as such. */
 	bool refused = false;
+	/* Refused in phase A, before the write was recorded in flight. */
+	bool repair_refused = false;
 	/* The data and parity were submitted: the record can be updated. */
 	bool phase_b = false;
 	int crash_point = 0;
@@ -4925,8 +4963,10 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 * A sub-stripe write leaves the full stripe inconsistent if we crash
 	 * in the middle of its writes, and other, committed data in the same
 	 * vertical stripes would then lose its redundancy.  Record the full
-	 * stripe in the write-intent log before submitting anything, so that
-	 * the parity can be regenerated at the next mount.
+	 * stripe in the write-intent log before submitting the data and the
+	 * parity, so that the parity can be regenerated at the next mount --
+	 * but after the write-back of what the record names stale is durable
+	 * (rmw_repair_first()), which needs no such record.
 	 *
 	 * Full stripe COW writes only touch freshly allocated space and need
 	 * no record: every sector of the stripe is unreferenced until the
@@ -4935,29 +4975,33 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 * (nodatacow, prealloc) overwrite referenced sectors and are recorded
 	 * even when they cover the full stripe.
 	 */
-	if (!rbio_is_full(rbio) || test_bit(RBIO_INPLACE_BIT, &rbio->flags)) {
+	record = !rbio_is_full(rbio) || test_bit(RBIO_INPLACE_BIT, &rbio->flags);
+	if (record && READ_ONCE(rmw_mark_before_repair)) {
 		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
 		if (ret < 0)
 			goto out;
 		logged = true;
+	}
 #ifdef CONFIG_BTRFS_DEBUG
-		if (unlikely(READ_ONCE(btrfs_raid56_crash_point) >= 1 &&
-			     READ_ONCE(btrfs_raid56_crash_point) <= 3)) {
+	if (record) {
+		const int armed = READ_ONCE(btrfs_raid56_crash_point);
+
+		if (unlikely((armed >= 1 && armed <= 3) || armed == 5 || armed == 6)) {
 			crash_point = xchg(&btrfs_raid56_crash_point, 0);
 			if (crash_point)
 				btrfs_crit(fs_info,
 			"raid56 crash injection %d armed for full stripe %llu",
 					   crash_point, full_stripe_start);
 		}
-#endif
 	}
+#endif
 
 #ifdef CONFIG_BTRFS_DEBUG
 	/*
-	 * Testing: hold ONE repair here, after it has read the stripe, decided
-	 * what to write and marked the log, and before it writes.  One: every
-	 * held rbio keeps an rmw worker asleep, and holding them all would
-	 * stall every other write on the pool, which is a different test.
+	 * Testing: hold ONE repair here, after it has read the stripe and
+	 * decided what to write, and before it writes.  One: every held rbio
+	 * keeps an rmw worker asleep, and holding them all would stall every
+	 * other write on the pool, which is a different test.
 	 */
 	if (unlikely(READ_ONCE(repair_hold_ms)) &&
 	    test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
@@ -4973,12 +5017,30 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 
 	bitmap_clear(rbio->error_bitmap, 0, rbio->nr_sectors);
 
+#ifdef CONFIG_BTRFS_DEBUG
+	if (unlikely(crash_point == 5))
+		panic("btrfs: raid56 crash injection 5 before the write-back of full stripe %llu",
+		      full_stripe_start);
+#endif
+
 	if (!READ_ONCE(rmw_single_phase)) {
-		ret = rmw_repair_first(rbio, full_stripe_start);
+		ret = rmw_repair_first(rbio, full_stripe_start, crash_point);
 		if (ret < 0) {
 			refused = true;
+			repair_refused = !logged;
 			goto out;
 		}
+	}
+
+	/*
+	 * Only now, with the write-back on disk and the record saying so: a
+	 * crash from here on may tear the stripe, and until here it could not.
+	 */
+	if (record && !logged) {
+		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
+		if (ret < 0)
+			goto out;
+		logged = true;
 	}
 
 	index_rbio_pages(rbio);
@@ -5128,6 +5190,16 @@ out:
 			rmw_update_stale_data(rbio, full_stripe_start);
 			rmw_update_stale_parity(rbio, full_stripe_start);
 		}
+	} else if (repair_refused) {
+		/*
+		 * Phase A was refused before the write was recorded in flight.
+		 * Nothing of phase B went out, and what phase A did write is
+		 * what the parity describes, over sectors the record names --
+		 * and still names -- or that failed their checksum: nothing new
+		 * for the record.  The device that refused the write-back gets
+		 * the repair a refused write always queued.
+		 */
+		faulted = true;
 	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {
 		/*

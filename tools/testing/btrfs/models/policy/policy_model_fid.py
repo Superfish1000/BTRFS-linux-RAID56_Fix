@@ -48,6 +48,9 @@ Knobs (--mut).  Two refinements, measured as variants:
                      (just before phase B) and names only the data column
                      phase B writes; recovery trusts a one-parity rebuild whose
                      holes contain every such column (old or new value)
+  inflight_whole     with narrow_inflight: the mark still covers the whole
+                     stripe (possibly torn, as before), only its timing
+                     changes -- the kernel's rmw_rbio() order
 Mutations (negative controls; each must produce its failure class):
   evict_naming       A/A2/B/C: a full log evicts records naming members
   a2_no_taint        A2: drop without tainting the device
@@ -120,7 +123,7 @@ AL_UNFL = 2
 ZERO = -9          # zeros a replace wrote where it could neither copy nor rebuild
 VALS = (1, 2, 3, 4, 5)
 POLICIES = ("OLD", "A", "CUR", "A2", "B", "C", "CB", "CTM")
-MUTS = ("strict_degraded", "narrow_inflight", "evict_naming", "a2_no_taint", "c_trust_unverified", "no_suspect",
+MUTS = ("strict_degraded", "narrow_inflight", "inflight_whole", "evict_naming", "a2_no_taint", "c_trust_unverified", "no_suspect",
         "read_trust_torn", "absent_par_unnamed", "ack_unnamed", "b_no_record")
 
 
@@ -656,7 +659,8 @@ class Model:
                 wc.rec[s] = None
         elif self.log:
             torn, names, verdict = wc.rec[s] if wc.rec[s] else (False, EMPTY, False)
-            if "narrow_inflight" in self.muts and torn is not True:
+            if "narrow_inflight" in self.muts and "inflight_whole" not in self.muts and \
+                    torn is not True:
                 t2 = (torn or EMPTY) | (frozenset([i]) if i is not None else EMPTY)
                 wc.rec[s] = (t2 if t2 else False, names, verdict) if (t2 or names or verdict) else None
             else:

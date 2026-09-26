@@ -57,7 +57,10 @@
 #              =100): each retry is a write recorded after the last
 #              transaction commit -- a repair takes none -- into a stripe
 #              whose record names the column, and it finishes, failed, with
-#              the log still listing it in flight.  Then the heal, and a
+#              the log still listing it in flight.  Recorded, that is, with
+#              raid56_rmw_mark_before_repair=1 on the prep boot: a retry is
+#              refused in its write-back of the column, before it would be
+#              recorded otherwise.  Then the heal, and a
 #              remount read-only before the unmount, which then writes
 #              nothing.  The remount writes the log as an unmount does: as
 #              clean as the quiet arm
@@ -141,7 +144,8 @@ arm control 1 0
 arm ambiguous 0 1
 arm quiet 0 0 "$QUIET"
 arm inflight 0 0 "$QUIET btrfs.$KNOB=1"
-RETRY="btrfs.raid56_repair_delay_ms=100 RETRY_GIVE_UP=1 REMOUNT_RO=1"
+RETRY="btrfs.raid56_repair_delay_ms=100 btrfs.raid56_rmw_mark_before_repair=1 RETRY_GIVE_UP=1"
+RETRY="$RETRY REMOUNT_RO=1"
 arm remount 0 0 "$RETRY"
 arm remountctl 0 0 "$RETRY btrfs.raid56_wf_remount_ro_keeps_inflight=1"
 
@@ -210,8 +214,15 @@ if [ "$I_ST" -eq 0 ] || [ "${I_TORN:-0}" -eq 0 ]; then
 fi
 for a in remount remountctl; do
 	grep -q "remounted read-only" $T/umltest/recover-scrub-$a/log.nocow_persist_prep.* \
-		2>/dev/null && continue
-	echo "RESULT: INCONCLUSIVE -- the $a arm's prep could not remount read-only"; exit 2
+		2>/dev/null || {
+		echo "RESULT: INCONCLUSIVE -- the $a arm's prep could not remount read-only"
+		exit 2
+	}
+	grep -q "knob raid56_rmw_mark_before_repair=Y" \
+		$T/umltest/recover-scrub-$a/log.nocow_persist_prep.* 2>/dev/null || {
+		echo "RESULT: INCONCLUSIVE -- the $a arm's prep did not record the retries first"
+		exit 2
+	}
 done
 # Without a retry that gave up there is nothing listed in flight for the
 # remount to drop: the remount arm is the quiet arm again.

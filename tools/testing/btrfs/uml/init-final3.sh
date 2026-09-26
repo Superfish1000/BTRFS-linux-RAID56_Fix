@@ -1408,12 +1408,16 @@ nocow_persist_prep)
 	sync
 	log "in-place overwrites: $acked of $NOCOW_BLOCKS acknowledged"
 	# RETRY_GIVE_UP=1 (with a short raid56_repair_delay_ms): the device
-	# goes on failing until every repair queued on it has given up.  Each
-	# retry is a write recorded after the last transaction commit -- a
-	# repair takes none -- into a stripe whose record names the column,
-	# and it finishes, failed: the log goes on listing it in flight until
-	# something flushes every device and writes the log again.
+	# goes on failing until every repair queued on it has given up.  With
+	# raid56_rmw_mark_before_repair=1 each retry is a write recorded after
+	# the last transaction commit -- a repair takes none -- into a stripe
+	# whose record names the column, and it finishes, failed: the log goes
+	# on listing it in flight until something flushes every device and
+	# writes the log again.  Without it the retry is refused in its
+	# write-back before it is recorded.
 	if [ "${RETRY_GIVE_UP:-0}" = 1 ]; then
+		knob=/sys/module/btrfs/parameters/raid56_rmw_mark_before_repair
+		log "knob raid56_rmw_mark_before_repair=$(cat $knob 2>/dev/null || echo absent)"
 		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
 		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 		wv() { awk -v k=$1 '$1 == k {print $2}' $W 2>/dev/null; }
@@ -2608,6 +2612,8 @@ rmw_cache)
 	}
 	knob=/sys/module/btrfs/parameters/raid56_wf_name_unwritten
 	log "knob raid56_wf_name_unwritten=$(cat $knob 2>/dev/null || echo absent)"
+	knob=/sys/module/btrfs/parameters/raid56_rmw_mark_before_repair
+	log "knob raid56_rmw_mark_before_repair=$(cat $knob 2>/dev/null || echo absent)"
 	touch $MNT/nocow; chattr +C $MNT/nocow
 	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
 	sync
@@ -5052,9 +5058,11 @@ torn_present_fault)
 	#                 names what it can -- a data column stale, the 'N's
 	#                 only in the parity -- and keeps the record (the repair
 	#                 is held off).  Then the device is healed.
-	#   CRASH=<1|2>   then block ROW of column TORN is overwritten in place
+	#   CRASH=<1|2|5|6> then block ROW of column TORN is overwritten in place
 	#                 with 'C's with raid56_crash_point armed: with 1 the new
-	#                 data lands, the parity does not, and the kernel panics.
+	#                 data lands, the parity does not, and the kernel panics;
+	#                 with 5 it panics before the write-back of what the log
+	#                 names stale, with 6 once that has landed.
 	eval "$(cat $T/umltest/layout.$TAG)"
 	watchdog 600
 	dm_setup
@@ -5116,6 +5124,7 @@ torn_present_read)
 	#                 no more than that (n = 164: a narrow block holds 165).
 	#                 FILLDEV is healed and one write goes into a new
 	#                 region, with nothing in flight: it spends one of them.
+	#   SCRUB=1       once the mount is done, a scrub runs to its end first.
 	# The sixteen blocks of each column in READCOLS of the stripe are read
 	# back:
 	#   ok     what was acknowledged: 'N' where the fault boot wrote them, 'A'
@@ -5144,6 +5153,10 @@ torn_present_read)
 	fi
 	kmsg "write-intent|scrub|possibly torn|crash injection|raid56" 20
 	stats
+	if [ "${SCRUB:-0}" = 1 ]; then
+		btrfs scrub start -B $MNT > /dev/null 2>&1
+		log "scrub rc $?"
+	fi
 	fillout=""
 	if [ -n "${BAD:-}" ] && [ -n "${FILL:-}" ]; then
 		allow_nodatacow
