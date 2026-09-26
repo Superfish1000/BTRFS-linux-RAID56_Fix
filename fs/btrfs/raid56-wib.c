@@ -150,6 +150,7 @@
 #include "zoned.h"
 
 static void raid56_alert_kick(struct btrfs_wib *wib, unsigned long delay);
+static u32 raid56_latched_now(struct btrfs_wib *wib);
 static void raid56_alert_failed(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event ev,
 				u64 logical, const struct btrfs_wib_flush_failed *failed);
 
@@ -390,6 +391,11 @@ static_assert(sizeof(struct btrfs_wib_disk_header) +
 static_assert(sizeof(struct btrfs_wib_disk_header) +
 	      BTRFS_WIB_MAX_ENTRIES * sizeof(struct btrfs_wib_disk_entry) <=
 	      BTRFS_WIB_TRAILER_OFFSET);
+/* A wide block always has room for the latched alerts, one bit per event. */
+static_assert(sizeof(struct btrfs_wib_disk_header) +
+	      BTRFS_WIB_MAX_ENTRIES * sizeof(struct btrfs_wib_disk_entry) <=
+	      BTRFS_WIB_LATCH_OFFSET);
+static_assert(BTRFS_RAID56_NR_EVENTS <= 32);
 /*
  * @stale is a strict subset of @error, and btrfs_wib_block_valid() enforces
  * that on read.  The two parity bits of a full stripe live in @stale_par at
@@ -1355,6 +1361,38 @@ static void wib_write_entry(void *block, u32 i, const struct btrfs_wib_entry *e)
 	}
 }
 
+/*
+ * Do the entries of @block leave its latch word free (BTRFS_WIB_LATCH_OFFSET)?
+ * @nr_entries must be set.
+ */
+static bool wib_block_has_latch(const void *block)
+{
+	const struct btrfs_wib_disk_header *hdr = block;
+	const size_t size = wib_block_is_v1(block) ? sizeof(struct btrfs_wib_disk_entry_v1) :
+						     sizeof(struct btrfs_wib_disk_entry);
+
+	return sizeof(*hdr) + le32_to_cpu(hdr->nr_entries) * size <= BTRFS_WIB_LATCH_OFFSET;
+}
+
+/* The latched alerts @block carries: none if it has no room for them. */
+EXPORT_FOR_TESTS
+u32 btrfs_wib_block_latched(const void *block)
+{
+	u64 word;
+
+	if (!wib_block_has_latch(block))
+		return 0;
+	word = le64_to_cpu(*(const __le64 *)(block + BTRFS_WIB_LATCH_OFFSET));
+	return upper_32_bits(word) == BTRFS_WIB_LATCH_MAGIC ? lower_32_bits(word) : 0;
+}
+
+static void wib_block_set_latched(void *block, u32 latched)
+{
+	if (wib_block_has_latch(block))
+		*(__le64 *)(block + BTRFS_WIB_LATCH_OFFSET) =
+			latched ? cpu_to_le64((u64)BTRFS_WIB_LATCH_MAGIC << 32 | latched) : 0;
+}
+
 /* Does @block carry any stale record at all? */
 static bool wib_block_has_stale(const void *block)
 {
@@ -1491,6 +1529,8 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	hdr->seq = cpu_to_le64(seq);
 	hdr->nr_entries = cpu_to_le32(nr);
 	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT);
+	/* Where the entries leave room: see BTRFS_WIB_LATCH_OFFSET. */
+	wib_block_set_latched(block, raid56_latched_now(wib));
 	/*
 	 * This kernel marks what may hide a torn write, whatever this block
 	 * lists -- raid56_wf_torn_no_persist=1 included, which is a writer that
@@ -1588,7 +1628,8 @@ bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *bloc
 	 * reason; flags is where a KNOWN format change announces itself, and
 	 * BTRFS_WIB_FLAG_STALE is one, so that one is read rather than
 	 * refused.  The trailer is not checked, on purpose: every value there
-	 * can be read (btrfs_wib_block_marks_torn()).
+	 * can be read (btrfs_wib_block_marks_torn()).  Nor is anything else
+	 * past the entries, the latched alerts (btrfs_wib_block_latched()).
 	 */
 	for (int i = 0; i < ARRAY_SIZE(hdr->reserved); i++)
 		if (hdr->reserved[i] != 0)
@@ -3443,13 +3484,17 @@ static int wib_write_block_locked(struct btrfs_wib *wib, u64 seq, const void *ba
 
 	/*
 	 * Nothing changed since the last commit and that one reached every
-	 * device: the set is already durable, no IO needed.
+	 * device: the set is already durable, no IO needed.  Everything past
+	 * the header counts, the latched alerts too -- and so does no more than
+	 * the slot: the entries of a narrow block are half as wide, and their
+	 * count in wide ones reached past it.
 	 */
 	if (!force && wib->last_ok &&
 	    le64_to_cpu(last->magic) == BTRFS_WIB_MAGIC &&
+	    last->flags == hdr->flags &&
 	    le32_to_cpu(last->nr_entries) == le32_to_cpu(hdr->nr_entries) &&
 	    memcmp(wib->last + sizeof(*hdr), wib->block + sizeof(*hdr),
-		   le32_to_cpu(hdr->nr_entries) * sizeof(struct btrfs_wib_disk_entry)) == 0)
+		   BTRFS_WIB_SLOT_SIZE - sizeof(*hdr)) == 0)
 		goto done;
 
 	ret = wib_write_all_devices(wib, &nr_errors);
@@ -5691,6 +5736,60 @@ static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
 }
 
 /*
+ * Write the block the devices hold again, @last, with the latched alerts as
+ * they are now (BTRFS_WIB_LATCH_OFFSET).  Its entries stay what they were, so
+ * what the log says about the stripes does not change, and the sequence a
+ * mark waits for (wib_commit_wait()) is left alone: nothing of a mark's is in
+ * it.  Nothing to do if @last carries them already or has no room for them.
+ * commit_mutex held.
+ */
+static void wib_write_latch_locked(struct btrfs_wib *wib)
+{
+	struct btrfs_wib_disk_header *hdr = wib->block;
+	unsigned long flags;
+	int nr_errors;
+
+	lockdep_assert_held(&wib->commit_mutex);
+	if (le64_to_cpu(((struct btrfs_wib_disk_header *)wib->last)->magic) != BTRFS_WIB_MAGIC)
+		return;
+	memcpy(wib->block, wib->last, BTRFS_WIB_SLOT_SIZE);
+	wib_block_set_latched(wib->block, raid56_latched_now(wib));
+	if (!memcmp(wib->block + BTRFS_WIB_LATCH_OFFSET, wib->last + BTRFS_WIB_LATCH_OFFSET,
+		    sizeof(__le64)))
+		return;
+	spin_lock_irqsave(&wib->lock, flags);
+	hdr->seq = cpu_to_le64(++wib->snap_seq);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	btrfs_csum(wib->fs_info->csum_type, wib->block + BTRFS_CSUM_SIZE,
+		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
+	if (wib_write_all_devices(wib, &nr_errors) < 0)
+		return;
+	memcpy(wib->last, wib->block, BTRFS_WIB_SLOT_SIZE);
+	wib->last_ok = nr_errors == 0;
+}
+
+/*
+ * The latched alerts changed (a new one, or an acknowledgment): put them in the
+ * log now, not with whatever block comes next -- on an idle filesystem that may
+ * be none before a crash, and after a commit that failed none at all.  A
+ * filesystem a failed commit made read-only is written all the same, nothing
+ * else being written there any more; a frozen one is not, nor one mounted or
+ * remounted read-only: the next block a read-write mount writes carries them.
+ */
+static void wib_latch_work(struct work_struct *work)
+{
+	struct btrfs_wib *wib = container_of(work, struct btrfs_wib, latch_work);
+	struct super_block *sb = wib->fs_info->sb;
+
+	if (!READ_ONCE(wib->enabled) || sb->s_writers.frozen != SB_UNFROZEN ||
+	    (sb_rdonly(sb) && !BTRFS_FS_ERROR(wib->fs_info)))
+		return;
+	mutex_lock(&wib->commit_mutex);
+	wib_write_latch_locked(wib);
+	mutex_unlock(&wib->commit_mutex);
+}
+
+/*
  * The filesystem is being unmounted, its last transaction committed and its
  * repairs stopped (close_ctree()): no write is in flight any more.  The log
  * may still list some in flight, though, and nothing drops them but a flush
@@ -5744,6 +5843,8 @@ void btrfs_wib_unmount(struct btrfs_fs_info *fs_info)
 	}
 	if (stray)
 		wib_persist_all_slots_locked(wib, 1);
+	/* An acknowledgment the log does not have yet: see wib_latch_work(). */
+	wib_write_latch_locked(wib);
 	mutex_unlock(&wib->commit_mutex);
 }
 
@@ -6265,6 +6366,76 @@ static const char * const raid56_health_names[] = {
 };
 
 /*
+ * Testing only: keep the latched alerts in memory only, as before
+ * BTRFS_WIB_LATCH_OFFSET -- a remount or a crash forgets them unacknowledged,
+ * and raid56_health reads ok again.  The negative control for
+ * uml/alert_latch.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool latch_volatile;
+module_param_named(raid56_wf_latch_volatile, latch_volatile, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_latch_volatile,
+		 "Keep the raid56 alerts that wait for an acknowledgment in memory only, so that a remount or a crash forgets them (testing only: restores the old behaviour)");
+#else
+static const bool latch_volatile;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_latch_volatile(void)
+{
+	return READ_ONCE(latch_volatile);
+}
+#endif
+
+/* The latched alerts nobody has acknowledged, for the log to keep. */
+static u32 raid56_latched_now(struct btrfs_wib *wib)
+{
+	unsigned long flags;
+	u32 latched;
+
+	if (READ_ONCE(latch_volatile))
+		return 0;
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	latched = wib->alert_latched & BTRFS_RAID56_LATCHED_EVENTS;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	return latched;
+}
+
+/*
+ * The newest log block carries alerts an earlier mount latched and nobody
+ * acknowledged (BTRFS_WIB_LATCH_OFFSET): they stand as they did then, the
+ * state failing, until someone does.  Their explanations went with that
+ * mount's kernel log, so say here what they are; an event that happens again
+ * is explained again.
+ */
+static void raid56_latch_restore(struct btrfs_wib *wib, u32 latched)
+{
+	struct btrfs_fs_info *fs_info = wib->fs_info;
+	char names[256] = "";
+	unsigned long flags;
+	int len = 0;
+
+	latched &= BTRFS_RAID56_LATCHED_EVENTS;
+	if (!latched || READ_ONCE(latch_volatile))
+		return;
+	for (int i = 0; i < BTRFS_RAID56_NR_EVENTS; i++)
+		if (latched & BIT(i))
+			len += scnprintf(names + len, sizeof(names) - len, " %s",
+					 raid56_event_names[i]);
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched |= latched;
+	wib->alert_latch_seq++;
+	wib->alert_failing = true;
+	wib->alert_announce = true;
+	wib->last_event = __ffs(latched);
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	if (!btrfs_is_testing(fs_info))
+		btrfs_warn(fs_info,
+"raid56: alerts an earlier mount raised that nobody acknowledged:%s -- that mount's kernel log explained them, and the same messages come again if they happen again. Deal with them as raid56_health's action line says, then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'",
+			   names, fs_info->fs_devices->fsid);
+}
+
+/*
  * Testing only: explain a stripe a write may have torn as before
  * raid56_alert_scrub_decides() -- read_unrecovered blames the mount's
  * recovery and promises that a scrub makes the reads work again, which no
@@ -6607,6 +6778,9 @@ static void raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event 
 	if (ev != BTRFS_RAID56_EV_STALE && ev != BTRFS_RAID56_EV_REPAIR_DROPPED)
 		wib->alert_failing = true;
 	if (BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS) {
+		/* A new one goes to the log at once: see wib_latch_work(). */
+		if (!(wib->alert_latched & BIT(ev)) && !wib->alert_stopped)
+			queue_work(system_wq, &wib->latch_work);
 		wib->alert_latched |= BIT(ev);
 		wib->alert_latch_seq++;
 	}
@@ -6823,6 +6997,7 @@ static void raid56_alert_stop(struct btrfs_wib *wib)
 	wib->alert_stopped = true;
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 	cancel_delayed_work_sync(&wib->alert_work);
+	cancel_work_sync(&wib->latch_work);
 }
 
 void btrfs_raid56_alert_stop(struct btrfs_fs_info *fs_info)
@@ -6984,6 +7159,9 @@ int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 s
 	wib->alert_latched = 0;
 	/* If it happens again, it is explained again. */
 	wib->alert_seen &= ~was;
+	/* And a mount after a crash must not show it again: see wib_latch_work(). */
+	if (was && !wib->alert_stopped)
+		queue_work(system_wq, &wib->latch_work);
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 	if (was)
 		btrfs_info(fs_info, "raid56: alerts acknowledged");
@@ -7034,6 +7212,7 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	atomic_set(&wib->repairs_inflight, 0);
 	spin_lock_init(&wib->alert_lock);
 	INIT_DELAYED_WORK(&wib->alert_work, raid56_alert_work);
+	INIT_WORK(&wib->latch_work, wib_latch_work);
 	wib->health = BTRFS_RAID56_HEALTH_OK;
 	fs_info->wib = wib;
 	/*
@@ -7241,6 +7420,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	unsigned int nr_valid = 0;
 	unsigned int nr_unmarked = 0;
 	unsigned int nofs_flag;
+	u32 latched = 0;
 	void *buf;
 	int ret = 0;
 
@@ -7326,6 +7506,9 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		if (ret < 0)
 			goto out;
 		nr_unmarked += nr;
+		/* The alerts as the newest block has them, as the stale marks. */
+		if (newest)
+			latched |= btrfs_wib_block_latched(buf);
 	}
 out:
 	mutex_unlock(&fs_devices->device_list_mutex);
@@ -7335,6 +7518,7 @@ out:
 		return ret;
 
 	btrfs_wib_finalize_pending(wib);
+	raid56_latch_restore(wib, latched);
 
 	/* Continue the sequence. */
 	wib->seq = max_seq;

@@ -18,7 +18,8 @@
 #   r2       raid56_wf_admit_narrow=1: the mount goes read-write and the write
 #            is made, but the commit that would acknowledge it cannot write the
 #            log: it fails, read-only, with log_commit_failed, and the fsync
-#            reports it
+#            reports it; the log keeps the alert, and raid56_health still shows
+#            it unacknowledged once every device is back
 #   control  raid56_wf_admit_narrow=1 and raid56_wf_commit_keeps_previous=1:
 #            the commit keeps the previous block and goes on; the write is
 #            acknowledged with its name only in memory, and once every device
@@ -141,7 +142,7 @@ read -r f_regs f_ref f_ack f_ro f_lcf f_rlf <<<"$(res fixed deg)"
 read -r r_regs r_ref r_ack r_ro r_lcf r_rlf <<<"$(res r2 deg)"
 read -r c_regs c_ref c_ack c_ro c_lcf c_rlf <<<"$(res control deg)"
 read -r f_got f_bad _ <<<"$(res fixed final)"
-read -r r_got r_bad _ <<<"$(res r2 final)"
+read -r r_got r_bad r_unack <<<"$(res r2 final)"
 read -r c_got c_bad _ <<<"$(res control final)"
 echo "  regions listed at the degraded mount: fixed $f_regs, r2 $r_regs, control $c_regs"
 echo "  degraded read-write mount refused: fixed $f_ref, r2 $r_ref, control $c_ref"
@@ -199,7 +200,13 @@ grep -aq "a transaction commit FAILED and the filesystem is now read-only" \
 	$T/umltest/cf-r2/log.degraded ||
 	{ echo "RESULT: FAIL -- r2: no log_commit_failed explanation"; exit 1; }
 case $r_got in A|C) ;; *) echo "RESULT: FAIL -- r2: the target block reads $r_got"; exit 1;; esac
+case ",$r_unack," in *,log_commit_failed,*) ;; *)
+	echo "RESULT: FAIL -- r2: after the reboot raid56_health shows $r_unack unacknowledged,"
+	echo "        not log_commit_failed"
+	exit 1;;
+esac
 echo "RESULT: PASS -- with $f_regs regions listed, the degraded read-write mount was refused"
 echo "        (recovery_log_full) and nothing read wrong; admitted as before, the commit that"
-echo "        could not write the name failed, read-only, log_commit_failed, fsync EIO;"
+echo "        could not write the name failed, read-only, log_commit_failed, fsync EIO, and"
+echo "        the alert stood after the reboot;"
 echo "        control: acknowledged with the name only in memory, read back $c_got (K3)"

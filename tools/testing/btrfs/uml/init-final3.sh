@@ -2381,6 +2381,87 @@ alert)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+alert_latch)
+	# Does an alert nobody has acknowledged survive a crash and a remount?
+	# RAID5 data, RAID1C3 metadata, four devices (device-mapper in the
+	# first boot).
+	# PHASE=raise: the log slots of three devices fail every write, and a
+	# write fails before it reaches a disk (log_write_failed, latched); they
+	# are healed, a second write goes through -- its record's block carries
+	# the alert -- and the machine stops without syncing.
+	# PHASE=check: mounted, raid56_health read; unmounted and mounted again,
+	# read again; acknowledged, read again, and the machine stops without
+	# syncing or unmounting.
+	# PHASE=final: mounted, read once more.
+	# Fixed, the alert stands after the crash and the remount, and is gone
+	# after the ack and the crash that follows it.  CONTROL=1 sets
+	# raid56_wf_latch_volatile=1: the log does not keep it, and the mount
+	# after the crash reads none.
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_volatile 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_volatile=1"
+	}
+	unack() {
+		local h=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		sed -n 's/^unacknowledged //p' $h | tr ' ' ,
+	}
+	crash() {	# no sync of the filesystem under test, only of the results
+		sync -f $RES $T/umltest/al.$TAG.* 2>/dev/null
+		echo o > /proc/sysrq-trigger
+		sleep 60
+	}
+	case "$PHASE" in
+	raise)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		for i in 0 1 2; do dm_error_writes_range $i $((512 * 1024)) 8192; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_heal $i; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=100 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w2=ok || w2=eio
+		sleep 2
+		u=$(unack)
+		log "AL raise: first write $w1, second $w2, unacknowledged $u"
+		echo "$w1 $w2 $u" > $T/umltest/al.$TAG.raise
+		crash
+		;;
+	check)
+		do_mount $OPTS $MNTDEV
+		u1=$(unack)
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount $OPTS $MNTDEV
+		u2=$(unack)
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		st=$(sed -n 's/^state //p' $H)
+		act=$(sed -n 's/^action //p' $H | tr ' ' _)
+		kmsg "alerts an earlier mount raised" 1
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 3
+		u3=$(unack)
+		log "AL check: after the crash $u1, after a remount $u2 (state $st, action $act)," \
+		    "after the ack $u3"
+		echo "$u1 $u2 $u3 $st" > $T/umltest/al.$TAG.check
+		crash
+		;;
+	final)
+		do_mount $OPTS $MNTDEV
+		u4=$(unack)
+		log "AL final: after the ack and a crash $u4"
+		echo "$u4" > $T/umltest/al.$TAG.final
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
+	esac
+	;;
 alert_read)
 	# A read whose rebuild needs a column the log records stale, because
 	# another device of the same row is gone.  It used to come back WRONG

@@ -1784,6 +1784,93 @@ out:
 	return ret;
 }
 
+/*
+ * The latched alerts nobody has acknowledged ride in every block the log
+ * builds, where its entries leave them room (BTRFS_WIB_LATCH_OFFSET): a mount
+ * after a crash takes them back.  The block stays one every kernel with the
+ * log reads as it did -- valid, the same entries -- and a narrow block of
+ * BTRFS_WIB_MAX_ENTRIES_V1 regions has no room.  Under
+ * raid56_wf_latch_volatile=1 no block carries them, as before.
+ */
+static int test_latch_block(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u32 latched = BIT(BTRFS_RAID56_EV_COMMIT_FAILED) | BIT(BTRFS_RAID56_EV_DROPPED);
+	const u32 want = btrfs_wib_latch_volatile() ? 0 : latched;
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6600;
+	unsigned long flags;
+	void *block;
+	int ret = -EINVAL;
+
+	block = kzalloc(BTRFS_WIB_SLOT_SIZE, GFP_KERNEL);
+	if (!block)
+		return -ENOMEM;
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched = latched;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+
+	if (btrfs_wib_build_block(wib, block, 1, NULL) ||
+	    !btrfs_wib_block_valid(fs_info, block) || btrfs_wib_block_latched(block) != want) {
+		test_err("an empty block carries alerts 0x%x, expected 0x%x",
+			 btrfs_wib_block_latched(block), want);
+		goto out;
+	}
+	/* Wide. */
+	btrfs_wib_add_sticky(fs_info, base * BTRFS_WIB_ENTRY_SIZE, blk);
+	btrfs_wib_mark_stale(fs_info, base * BTRFS_WIB_ENTRY_SIZE, blk);
+	if (btrfs_wib_build_block(wib, block, 2, NULL) ||
+	    !(le64_to_cpu(((struct btrfs_wib_disk_header *)block)->flags) &
+	      BTRFS_WIB_FLAG_STALE) ||
+	    !btrfs_wib_block_valid(fs_info, block) || btrfs_wib_block_latched(block) != want ||
+	    check_block_entry(block, 0, base * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+		test_err("a wide block carries alerts 0x%x, expected 0x%x",
+			 btrfs_wib_block_latched(block), want);
+		goto out;
+	}
+	btrfs_wib_clear_sticky(fs_info, base * BTRFS_WIB_ENTRY_SIZE, blk);
+	/* Narrow, one region short of full, then full. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+		const u32 room = i + 1 < BTRFS_WIB_MAX_ENTRIES_V1 ? want : 0;
+
+		put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1);
+		if (i < BTRFS_WIB_MAX_ENTRIES_V1 - 2)
+			continue;
+		if (btrfs_wib_build_block(wib, block, 3 + i, NULL) ||
+		    !btrfs_wib_block_valid(fs_info, block) ||
+		    block_nr_entries(block) != i + 1 || btrfs_wib_block_latched(block) != room ||
+		    check_block_entry(block, i, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+			test_err("a narrow block of %u regions carries alerts 0x%x", i + 1,
+				 btrfs_wib_block_latched(block));
+			goto out;
+		}
+	}
+	/* Acknowledged. */
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched = 0;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	if (btrfs_wib_build_block(wib, block, 200, NULL) || btrfs_wib_block_latched(block)) {
+		test_err("an acknowledged alert is still carried");
+		goto out;
+	}
+	ret = 0;
+out:
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched = 0;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	btrfs_wib_commit_prepare(fs_info);
+	if (btrfs_wib_commit(fs_info, true) && !ret)
+		ret = -EIO;
+	if (!ret && (block_nr_entries(wib->last) != 0 || btrfs_wib_any_stale(fs_info))) {
+		test_err("log not empty after the latch test");
+		ret = -EINVAL;
+	}
+	kfree(block);
+	return ret;
+}
+
 /* Forget the repairs asked for so far: none runs here (see btrfs_test_raid56_wib()). */
 static void clear_repairs(struct btrfs_wib *wib)
 {
@@ -5371,6 +5458,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);
+	if (ret)
+		goto out;
+	ret = test_latch_block(fs_info);
 	if (ret)
 		goto out;
 	ret = test_torn_spent_last(fs_info);

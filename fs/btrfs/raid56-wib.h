@@ -248,6 +248,26 @@ struct btrfs_wib_disk_header {
 /* "TORNMARK" in little endian. */
 #define BTRFS_WIB_TORN_MARKING		0x4b52414d4e524f54ULL
 
+/*
+ * The eight bytes before the trailer: the latched alerts nobody has
+ * acknowledged yet (BTRFS_RAID56_LATCHED_EVENTS in raid56-wib.c), bit N for
+ * event N of enum btrfs_raid56_event in the low half, BTRFS_WIB_LATCH_MAGIC in
+ * the high half.  A mount takes them back from the newest block, so that
+ * raid56_health goes on showing them after an unmount, a crash, or a commit
+ * that failed, until someone acknowledges them.
+ *
+ * Only where the entries leave them free: in every wide block (82 entries
+ * end 16 bytes short of them), in a narrow one while it lists fewer than
+ * BTRFS_WIB_MAX_ENTRIES_V1 regions (the last entry's @error lies there).  Not
+ * a header field, for the reason the trailer is not: a kernel that does not
+ * know them reads @nr_entries entries and never looks here, and
+ * btrfs_wib_block_valid() checks nothing past them but the checksum, which
+ * covers them all the same.  The event numbers only ever grow at the end.
+ */
+#define BTRFS_WIB_LATCH_OFFSET		(BTRFS_WIB_TRAILER_OFFSET - sizeof(__le64))
+/* "LTCH" in little endian. */
+#define BTRFS_WIB_LATCH_MAGIC		0x4843544cU
+
 /* In-memory entry, mirrors the on-disk one. */
 struct btrfs_wib_entry {
 	u64 bytenr;
@@ -855,6 +875,8 @@ struct btrfs_wib {
 	char last_name[BTRFS_RAID56_ALERT_NAME];
 	struct btrfs_raid56_alert_dev alert_devs[BTRFS_RAID56_ALERT_DEVS];
 	struct delayed_work alert_work;
+	/* Writes @alert_latched to the log when it changes: wib_latch_work(). */
+	struct work_struct latch_work;
 };
 
 void btrfs_raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event ev,
@@ -895,6 +917,8 @@ bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
 bool btrfs_wib_admits_narrow(void);
+bool btrfs_wib_latch_volatile(void);
+u32 btrfs_wib_block_latched(const void *block);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_wib_unrecovered_as_ambiguous(void);
