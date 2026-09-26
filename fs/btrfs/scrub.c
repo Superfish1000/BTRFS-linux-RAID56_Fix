@@ -275,6 +275,12 @@ struct scrub_ctx {
 	 * the chunk's content stable for it; see scrub_replace_copies_column().
 	 */
 	bool			raid56_whole_column;
+	/*
+	 * User scrub of a RAID5/6 chunk: the transaction every write into it
+	 * belongs to at the latest.  Set once per chunk by
+	 * scrub_raid56_see_writes(); 0 for every other scrub.
+	 */
+	u64			raid56_seen_gen;
 	u64			write_pointer;
 
 	struct mutex            wr_lock;
@@ -3721,6 +3727,19 @@ MODULE_PARM_DESC(raid56_scrub_empty_keeps_record,
 static const bool empty_keeps_record;
 #endif
 
+/*
+ * Does the write-intent log record a write into the full stripe at
+ * @full_stripe_start that the commit root this scrub reads may not show?  See
+ * scrub_raid56_see_writes().  The commit root cannot change under the caller:
+ * a transaction commit waits for every running scrub to pause.
+ */
+static bool scrub_raid56_unseen(struct scrub_ctx *sctx, u64 full_stripe_start,
+				u64 len)
+{
+	return sctx->raid56_seen_gen > btrfs_get_last_trans_committed(sctx->fs_info) &&
+	       btrfs_wib_recorded(sctx->fs_info, full_stripe_start, len);
+}
+
 static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 				      struct btrfs_device *scrub_dev,
 				      struct btrfs_block_group *bg,
@@ -3764,6 +3783,21 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		return 0;
 	}
 	spin_unlock(&bg->lock);
+
+	/*
+	 * A failed write the log records here may have put data where the
+	 * commit root has free space.  Deciding from it would regenerate the
+	 * parity from the stale column and retire the record; leave the stripe
+	 * as it is, record and all, for a scrub that sees the write.
+	 */
+	if (regen_parity && scrub_raid56_unseen(sctx, full_stripe_start, fstripe_len)) {
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu left untouched: the write-intent log records a write into it that the committed tree this scrub reads may not show yet -- keeping the record rather than regenerating the parity from what may be a stale column",
+			      full_stripe_start);
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_SCRUB_UNCOMMITTED,
+				   full_stripe_start, NULL, 0);
+		return 0;
+	}
 
 	/*
 	 * For data stripe search, we cannot reuse the same extent/csum paths,
@@ -4379,6 +4413,66 @@ static int finish_extent_writes_for_zoned(struct btrfs_root *root,
 	return finish_extent_writes(root, cache);
 }
 
+/*
+ * Testing only.  raid56_scrub_ignores_uncommitted=1: let a user scrub decide
+ * the full stripes of a RAID5/6 chunk from the commit root however recent
+ * their write-intent records are, as before scrub_raid56_see_writes().  The
+ * negative control for uml/scrub_uncommitted.sh.  raid56_scrub_no_commit=1:
+ * do not commit first, leaving the recorded stripes to the check that declines
+ * them (scrub_raid56_unseen()), which otherwise only a record made after the
+ * commit reaches; the decline arm of the same test.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool ignores_uncommitted;
+module_param_named(raid56_scrub_ignores_uncommitted, ignores_uncommitted, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_ignores_uncommitted,
+		 "Let a RAID5/6 scrub decide the full stripes the write-intent log records from a commit root that may not show the running transaction's writes into them, regenerating their parity and retiring their records (testing only: restores a known defect)");
+static bool scrub_no_commit;
+module_param_named(raid56_scrub_no_commit, scrub_no_commit, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_no_commit,
+		 "Do not commit before a RAID5/6 scrub of a chunk the write-intent log records writes in, so that it leaves the full stripes it cannot see those writes in untouched (testing only)");
+#else
+static const bool ignores_uncommitted;
+static const bool scrub_no_commit;
+#endif
+
+/*
+ * A user scrub looks extents up in the commit root, so to it a data column
+ * written since the last transaction commit is free space.  Where the
+ * write-intent log names such a column stale -- a device failed the write, and
+ * what was acknowledged is only in the parity -- it regenerated the parity from
+ * the stale column wherever a committed extent shares the row, and retired the
+ * record: the acknowledged data gone, with no error and no alert.
+ *
+ * So, with @cache read-only and nothing new to come into it, wait for every
+ * write already under way into it, as a device replace does
+ * (finish_extent_writes()): each has then joined the transaction it commits
+ * with, @raid56_seen_gen at the latest.  If the log records anything in @cache,
+ * commit: the commit root then shows all of it.  If not, a record made later --
+ * a repair whose write failed -- may still be about data the commit root does
+ * not show, and scrub_raid56_parity_stripe() leaves its stripe alone while the
+ * commit root is older than @raid56_seen_gen (scrub_raid56_unseen()).
+ */
+static int scrub_raid56_see_writes(struct scrub_ctx *sctx, struct btrfs_root *root,
+				   struct btrfs_block_group *cache)
+{
+	struct btrfs_fs_info *fs_info = cache->fs_info;
+
+	sctx->raid56_seen_gen = 0;
+	if (!(cache->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) || !fs_info->wib ||
+	    sctx->readonly || READ_ONCE(ignores_uncommitted))
+		return 0;
+
+	btrfs_wait_block_group_reservations(cache);
+	btrfs_wait_nocow_writers(cache);
+	btrfs_wait_ordered_roots(fs_info, U64_MAX, cache);
+	sctx->raid56_seen_gen = fs_info->generation;
+	if (READ_ONCE(scrub_no_commit) ||
+	    !btrfs_wib_recorded(fs_info, cache->start, cache->length))
+		return 0;
+	return btrfs_commit_current_transaction(root);
+}
+
 static noinline_for_stack
 int scrub_enumerate_chunks(struct scrub_ctx *sctx,
 			   struct btrfs_device *scrub_dev, u64 start, u64 end)
@@ -4578,6 +4672,16 @@ int scrub_enumerate_chunks(struct scrub_ctx *sctx,
 				btrfs_dec_block_group_ro(cache);
 				scrub_pause_off(fs_info);
 				btrfs_put_block_group(cache);
+				break;
+			}
+		}
+		if (!ret && !sctx->is_dev_replace) {
+			ret = scrub_raid56_see_writes(sctx, root, cache);
+			if (ret) {
+				btrfs_dec_block_group_ro(cache);
+				btrfs_unfreeze_block_group(cache);
+				btrfs_put_block_group(cache);
+				scrub_pause_off(fs_info);
 				break;
 			}
 		}

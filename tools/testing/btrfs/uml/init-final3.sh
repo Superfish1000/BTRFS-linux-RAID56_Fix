@@ -3871,6 +3871,118 @@ scrub_unrepaired_stop)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+scrub_uncommitted)
+	# Does a scrub decide a full stripe from a commit root that does not
+	# show the running transaction's write into it?
+	#
+	# RAID5 data over three devices (two data columns a full stripe),
+	# RAID1 metadata, nodatasum, commit=300 so that nothing commits on its
+	# own, and no repair queued on the fault (raid56_no_repair_on_fault).
+	# 64 KiB files of 'A', each committed, until one is column 0 of a full
+	# stripe F.  Then every IO to F's column 1 fails on its device while a
+	# 64 KiB file of 'B' is written there and fsync'd, which the tree log
+	# makes durable without a transaction commit: 'B' lands in the parity
+	# only, acknowledged, and the record names column 1 stale.  The device
+	# is healed, and 'btrfs scrub start -B' runs before anything commits.
+	# To the commit root column 1 is free, and column 0 holds a committed
+	# extent in every row.
+	#
+	#   SUS_ARM=commit   the scrub commits first, sees 'B' and rebuilds it
+	#                    onto the platter
+	#   SUS_ARM=decline  raid56_scrub_no_commit=1: the scrub leaves F as it
+	#                    is, with the scrub_uncommitted alert and the record
+	#                    kept, so 'B' reads back from the parity; a second
+	#                    scrub without the knob rebuilds it
+	#   SUS_ARM=control  raid56_scrub_ignores_uncommitted=1, the old
+	#                    behaviour: the parity is regenerated from the stale
+	#                    column and the record retired, and 'B' reads back
+	#                    as the old content, with no error
+	watchdog ${WATCH:-600}
+	dm_setup
+	set -- $DMDEVS
+	mkfs.btrfs -K -q -f -d raid5 -m raid1 $1 $2 $3 || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS,nossd,nodatasum,commit=300 $1
+	echo 1 > /sys/module/btrfs/parameters/raid56_no_repair_on_fault 2>/dev/null ||
+		log "NOREPAIR_KNOB_FAIL"
+	case ${SUS_ARM:-commit} in
+	decline) knob=raid56_scrub_no_commit;;
+	control) knob=raid56_scrub_ignores_uncommitted;;
+	*) knob=;;
+	esac
+	if [ -n "$knob" ]; then
+		echo 1 > /sys/module/btrfs/parameters/$knob 2>/dev/null || log "KNOB_FAIL $knob"
+		log "arm $SUS_ARM: $knob=1"
+	fi
+	C=$(python3 $T/umltest/raid56_chunks.py $1 2>&1)
+	echo "$C" | while read -r l; do log "chunk: $l"; done
+	read -r C1 C1LEN _ C1N S0 S1 S2 <<< "$(echo "$C" | awk '$3 ~ /DATA/ && $3 ~ /RAID5/ {print; exit}')"
+	[ "${C1N:-0}" = 3 ] || { log "LAYOUT_FAIL: no three-device RAID5 data chunk"; finish; }
+	ST=($S0 $S1 $S2)
+	lg() { filefrag -v -b4096 $1 2>/dev/null | awk '/^ *0:/ {gsub(/\.\./,"",$4); print $4 * 4096; exit}'; }
+	dd if=/dev/zero bs=64K count=1 status=none | tr '\000' 'A' > /tmp/A64
+	dd if=/dev/zero bs=64K count=1 status=none | tr '\000' 'B' > /tmp/B64
+	F=
+	for i in $(seq 0 7); do
+		cp /tmp/A64 $MNT/a$i; sync
+		l=$(lg $MNT/a$i)
+		[ -n "$l" ] && [ $(( (l - C1) % 131072 )) = 0 ] && { F=$l; break; }
+	done
+	[ -n "$F" ] || { log "LAYOUT_FAIL: no file at column 0 of a full stripe"; finish; }
+	N=$(( (F - C1) / 131072 ))
+	s() { echo ${ST[$(( (N + $1) % 3 ))]} | cut -d: -f$2; }	# column (2: P) field
+	D1=$(s 1 2); PH1=$(( $(s 1 3) + N * 65536 )); IDX1=${D1#/dev/mapper/d}
+	log "full stripe $F (number $N): column 1 on $D1 at $PH1, P on $(s 2 2)"
+	FSD=$(ls -d /sys/fs/btrfs/*-*-*/ 2>/dev/null | head -1)
+	H=${FSD}raid56_health
+	commits() { awk '$1 == "commits" {print $2}' ${FSD}commit_stats 2>/dev/null; }
+	hv() { awk -v k=$1 '$1 == k {print $2}' $H 2>/dev/null; }
+	c0=$(commits)
+	dm_bad_sectors $IDX1 $(seq $PH1 4096 $((PH1 + 61440)))
+	wrc=0
+	dd if=/tmp/B64 of=$MNT/b bs=64K count=1 conv=fsync status=none 2>/dev/null || wrc=1
+	dm_heal $IDX1
+	lb=$(lg $MNT/b)
+	marks=$(hv stale_marks)
+	c1=$(commits)
+	log "b at $lb (column 1: $((F + 65536))), write rc $wrc, stale marks $marks, commits since the write $((c1 - c0))"
+	[ "$lb" = $((F + 65536)) ] || { log "LAYOUT_FAIL: b is not column 1 of F"; finish; }
+	rb() {	# bytes of 'B' file b reads back as, or eio
+		echo 3 > /proc/sys/vm/drop_caches
+		if dd if=$MNT/b of=/tmp/b.read bs=64K count=1 status=none 2>/dev/null; then
+			tr -cd B < /tmp/b.read | wc -c
+		else
+			echo eio
+		fi
+	}
+	btrfs scrub start -B $MNT > /tmp/scrub.out 2>&1
+	src=$?
+	c2=$(commits)
+	log "scrub rc=$src: $(tr '\n' ' ' < /tmp/scrub.out | grep -o 'Error summary:.*' | cut -c1-160)"
+	sleep 2	# the alert work runs asynchronously
+	unc=$(hv scrub_uncommitted); marks2=$(hv stale_marks); state=$(hv state)
+	kmsg "left untouched|a scrub left|raid56:" 6
+	b1=$(rb)
+	if [ "${SUS_ARM:-commit}" = decline ]; then
+		echo 0 > /sys/module/btrfs/parameters/raid56_scrub_no_commit
+		btrfs scrub start -B $MNT > /tmp/scrub2.out 2>&1
+		log "second scrub rc=$?: $(tr '\n' ' ' < /tmp/scrub2.out | grep -o 'Error summary:.*' | cut -c1-160)"
+	fi
+	marks3=$(hv stale_marks)
+	umount $MNT || log "UMOUNT_FAIL"
+	pb=$(dd if=$D1 bs=4096 skip=$((PH1 / 4096)) count=16 iflag=direct status=none | tr -cd B | wc -c)
+	dm_scan
+	do_mount $OPTS,nossd $1
+	b2=$(rb)
+	umount $MNT || log "UMOUNT_FAIL"
+	out="wrc=$wrc commits_before=$((c1 - c0)) commits_scrub=$((c2 - c1)) marks=${marks:-?}"
+	out="$out uncommitted=${unc:-?} marks_scrubbed=${marks2:-?} state=${state:-?} b_scrubbed=$b1"
+	out="$out marks_end=${marks3:-?} platter_b=$pb b_remount=$b2 scrub_rc=$src"
+	log "SUU $out"
+	echo "$out" > $T/umltest/suu.$TAG
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 readd_flush_prep)
 	# A device that acknowledges writes into a cache it then loses, and says
 	# so the only way a device can: by failing the next cache flush.

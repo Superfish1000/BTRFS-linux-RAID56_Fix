@@ -4852,6 +4852,32 @@ int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 	return nr;
 }
 
+/*
+ * Does the log record a failed write, or one in flight, anywhere in
+ * [@logical, @logical + @len)?  For a scrub, which must not decide such a
+ * stripe from a commit root that may not show the write (see
+ * scrub_raid56_see_writes()).
+ */
+bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	bool ret = false;
+
+	if (!wib)
+		return false;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES && !ret; i++) {
+		const struct btrfs_wib_entry *e = &wib->entries[i];
+
+		ret = ((e->bitmap | e->sticky) &
+		       btrfs_wib_range_mask(e->bytenr, logical, len)) != 0;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return ret;
+}
+
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 {
 	unsigned long flags;
@@ -6037,6 +6063,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_REPLACE_ABORTED] = "replace_aborted",
 	[BTRFS_RAID56_EV_READ_UNRECOVERED] = "read_unrecovered",
 	[BTRFS_RAID56_EV_TORN_UNDECIDABLE] = "torn_undecidable",
+	[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED] = "scrub_uncommitted",
 };
 
 /*
@@ -6256,6 +6283,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 "raid56: full stripe %llu cannot be decided: a write into it may have been torn -- by a crash, or while a device did not confirm a cache flush -- and a data column it would have to rebuild, on a missing device or recorded stale, has no parity left over to check that rebuild. Its data without a checksum that needs the rebuild reads as EIO, and the mount's recovery records it so that writes into it fail too (if the log could not keep that, the message before this one says so). If a device is missing, bring it back and mount again. What stays undecided holds files that cannot be read back with certainty: find them ('btrfs inspect-internal logical-resolve %llu <mountpoint>' and the stripe's next addresses), delete them, run 'sync' and 'btrfs scrub start <mountpoint>', which then retires the record, and restore them from a backup. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, logical, fsid);
 		break;
+	case BTRFS_RAID56_EV_SCRUB_UNCOMMITTED:
+		btrfs_warn(fs_info,
+"raid56: a scrub left full stripe %llu untouched: the write-intent log records a failed write into it that the committed tree the scrub reads may not show yet, and regenerating its parity from that tree could have thrown away data acknowledged since the last commit. The record is kept, and a read of the stale data still rebuilds it from the parity. Run 'btrfs scrub start <mountpoint>' again: a scrub commits first where the log records a write into the block group. State: /sys/fs/btrfs/%pU/raid56_health",
+			   logical, fsid);
+		break;
 	case BTRFS_RAID56_EV_REPLACE_LOST:
 		btrfs_err(fs_info,
 "raid56: a device replace could neither copy nor rebuild part of full stripe %llu for the new device: the old device did not return it (or the write-intent log records it stale there) and the rest of the stripe could not rebuild it. The new device holds zeros there and the log records that column or parity stale, so nothing is read or rebuilt from the zeros: reads that need them fail with EIO rather than return wrong data, and data there is lost unless a device that failed a read comes back ('btrfs replace status' counts the sectors, 'btrfs inspect-internal logical-resolve <logical> <mountpoint>' names the files). If the record could not be kept the replace was aborted instead. State: /sys/fs/btrfs/%pU/raid56_health",
@@ -6376,8 +6408,9 @@ static void raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event 
 	first = !(wib->alert_seen & BIT(ev));
 	wib->alert_seen |= BIT(ev);
 	wib->alert_pending[ev]++;
-	/* Notices: redundancy lost, nothing failed. */
-	if (ev != BTRFS_RAID56_EV_STALE && ev != BTRFS_RAID56_EV_REPAIR_DROPPED)
+	/* Notices: redundancy lost or not restored yet, nothing failed. */
+	if (ev != BTRFS_RAID56_EV_STALE && ev != BTRFS_RAID56_EV_REPAIR_DROPPED &&
+	    ev != BTRFS_RAID56_EV_SCRUB_UNCOMMITTED)
 		wib->alert_failing = true;
 	if (BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS) {
 		wib->alert_latched |= BIT(ev);
@@ -6531,7 +6564,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu full stripes a scrub left to the next one; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -6550,6 +6583,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_REPLACE_ABORTED],
 			   pending[BTRFS_RAID56_EV_READ_UNRECOVERED],
 			   pending[BTRFS_RAID56_EV_TORN_UNDECIDABLE],
+			   pending[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {

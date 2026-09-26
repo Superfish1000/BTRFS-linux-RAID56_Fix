@@ -25,9 +25,11 @@ struct btrfs_io_context;
  * What a user has to be told about.  See btrfs_raid56_alert().
  *
  * STALE is a notice: a device failed a write the parity covered, so that
- * stripe has lost its redundancy until it is repaired.  Every other event
- * means a write failed, a repair was abandoned or the log lost track of
- * something -- the filesystem is FAILING until nothing is recorded any more.
+ * stripe has lost its redundancy until it is repaired.  So are
+ * REPAIR_DROPPED and SCRUB_UNCOMMITTED: a repair that has yet to happen.
+ * Every other event means a write failed, a repair was abandoned or the log
+ * lost track of something -- the filesystem is FAILING until nothing is
+ * recorded any more.
  */
 enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_STALE,		/* a device failed a write within tolerance */
@@ -48,6 +50,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_REPLACE_ABORTED, /* a replace could not record what it lost: it fails */
 	BTRFS_RAID56_EV_READ_UNRECOVERED, /* read refused: its parity may be torn, unchecked */
 	BTRFS_RAID56_EV_TORN_UNDECIDABLE, /* a torn stripe the recovery or a scrub cannot decide */
+	BTRFS_RAID56_EV_SCRUB_UNCOMMITTED, /* a scrub left a stripe newer than its tree */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -1045,6 +1048,7 @@ bool btrfs_wib_readd_refuses(struct btrfs_wib *wib, u64 logical, u64 len);
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 		       struct btrfs_wib_entry *out);
