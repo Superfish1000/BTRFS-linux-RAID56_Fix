@@ -68,6 +68,10 @@
  *
  *  - A RMW proceeds to its writes only after a commit whose snapshot
  *    contained its stripe completed on enough devices (btrfs_wib_mark()).
+ *    Its write-back of what it proved wrong goes out before that, with FUA
+ *    and at the value the parity describes (rmw_repair_first()): what an
+ *    error record names stale, which it goes on naming until the write-back
+ *    landed, or a sector that failed its checksum.
  *  - A stripe is dropped from a snapshot only after btrfs_wib_done(), i.e.
  *    after all its writes completed at the device level, and only after a
  *    flush of every device that every device confirmed, which pushes those
