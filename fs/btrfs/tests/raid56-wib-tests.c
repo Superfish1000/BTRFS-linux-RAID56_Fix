@@ -1834,6 +1834,32 @@ out:
 }
 
 /*
+ * A commit that meets a failed flush's readd it cannot complete -- still owed
+ * (WIB_READD_WAIT), or taking records back without the device's name or not
+ * at all -- fails, and every commit after it (@readd_refused in struct
+ * btrfs_wib), unless raid56_wf_readd_acks_unnamed=1, under which it goes on
+ * as it did.  Check that @ret, the commit's or a persist's, says so, and let
+ * the test go on from the log as the readd left it.
+ */
+static int readd_refused(struct btrfs_wib *wib, int ret, const char *what)
+{
+	if (btrfs_wib_readd_acks_unnamed()) {
+		if (wib->readd_refused) {
+			test_err("%s: refused although raid56_wf_readd_acks_unnamed is set", what);
+			return -EINVAL;
+		}
+		return ret;
+	}
+	if (ret != -EIO || !wib->readd_refused) {
+		test_err("%s: returned %d, refused %d; expected the commit to fail",
+			 what, ret, wib->readd_refused);
+		return -EINVAL;
+	}
+	WRITE_ONCE(wib->readd_refused, false);
+	return 0;
+}
+
+/*
  * A device that did not confirm a flush may have lost what it acknowledged,
  * and no later flush brings that back.  So the stripes the last block lists
  * must stay on disk until the in-memory set has taken them back -- not only
@@ -1912,6 +1938,8 @@ static int test_readd_keeps_records(struct btrfs_fs_info *fs_info)
 	/* A device does not confirm the barrier. */
 	btrfs_wib_commit_prepare(fs_info);
 	ret = btrfs_wib_commit(fs_info, false);
+	if (!legacy)
+		ret = readd_refused(wib, ret, "the commit whose flush failed, the readd owed");
 	if (ret)
 		goto out;
 	if (btrfs_wib_block_drops(saved, wib->last)) {
@@ -2008,7 +2036,9 @@ static int test_readd_keeps_records(struct btrfs_fs_info *fs_info)
 				goto out;
 			}
 		}
-		if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]) != unnamed0 ||
+		/* Only the refused commit's, which met the readd owed. */
+		if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]) !=
+		    unnamed0 + !btrfs_wib_readd_acks_unnamed() ||
 		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) != dropped0) {
 			test_err("an alert for a readd that neither lost a record nor left a device unnamed");
 			ret = -EINVAL;
@@ -2039,14 +2069,17 @@ out:
 /*
  * An owed readd whose room writes in flight hold for BTRFS_WIB_READD_WAIT --
  * stuck on a device, since no new write takes any more of it -- stops waiting
- * for them: it takes back what fits and loses the rest, loudly, rather than
- * fail every recorded write for as long as they are stuck.  With
- * raid56_wf_readd_admits_new=1 it waits on, as it did.
+ * for them: it takes back what fits, and refuses every commit from there
+ * rather than acknowledge what it could not keep (raid56_wf_readd_acks_unnamed=1
+ * loses the rest loudly and goes on, as it did).  The transaction commit that
+ * met the readd owed failed already.  With raid56_wf_readd_admits_new=1 it
+ * waits on, as it did.
  */
 static int test_readd_wait_bounded(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+	const u64 unflushed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
 	const bool admits_new = btrfs_wib_readd_admits_new();
 	const u64 done_base = 3400;
 	const u64 busy_base = 3600;
@@ -2079,7 +2112,8 @@ static int test_readd_wait_bounded(struct btrfs_fs_info *fs_info)
 		return ret;
 	}
 	btrfs_wib_commit_prepare(fs_info);
-	ret = btrfs_wib_commit(fs_info, false);
+	ret = readd_refused(wib, btrfs_wib_commit(fs_info, false),
+			    "the commit whose flush failed, the readd owed");
 	if (ret)
 		return ret;
 	if (!wib->readd_owed) {
@@ -2108,6 +2142,8 @@ static int test_readd_wait_bounded(struct btrfs_fs_info *fs_info)
 		}
 		test_msg("raid56_wf_readd_admits_new is set: the readd waits on, as expected");
 	} else {
+		/* It gives up: what does not fit is not recorded, and nothing commits. */
+		ret = readd_refused(wib, ret, "the persist once the readd stopped waiting");
 		if (ret || wib->readd_owed) {
 			test_err("the readd still waits past its bound: persist %d owed %d",
 				 ret, wib->readd_owed);
@@ -2118,8 +2154,15 @@ static int test_readd_wait_bounded(struct btrfs_fs_info *fs_info)
 				 kept, nr);
 			return -EINVAL;
 		}
-		if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) != dropped0 + 1) {
-			test_err("records were lost, and nothing said so");
+		if (btrfs_wib_readd_acks_unnamed() ?
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) != dropped0 + 1 :
+		    /* And the commit's, which met it owed. */
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]) !=
+		    unflushed0 + 2 ||
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) != dropped0) {
+			test_err("records were not kept, and the alert said %s",
+				 btrfs_wib_readd_acks_unnamed() ? "nothing" :
+				 "otherwise than log_flush_unnamed");
 			return -EINVAL;
 		}
 	}
@@ -2165,6 +2208,7 @@ static int test_readd_busy_region(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+	const u64 unflushed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
 	const bool admits = btrfs_wib_readd_admits_busy();
 	const u64 done_base = 4400;
 	const u32 nr = BTRFS_WIB_MAX_ENTRIES_V1;
@@ -2202,7 +2246,8 @@ static int test_readd_busy_region(struct btrfs_fs_info *fs_info)
 		return ret;
 	}
 	btrfs_wib_commit_prepare(fs_info);
-	ret = btrfs_wib_commit(fs_info, false);
+	ret = readd_refused(wib, btrfs_wib_commit(fs_info, false),
+			    "the commit whose flush failed, the readd owed");
 	if (ret)
 		goto out;
 	ret = -EINVAL;
@@ -2244,6 +2289,8 @@ static int test_readd_busy_region(struct btrfs_fs_info *fs_info)
 	wib->readd_until = jiffies - 1;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	ret = btrfs_wib_persist_now(fs_info);
+	if (admits)
+		ret = readd_refused(wib, ret, "the persist once the readd stopped waiting");
 	if (ret || wib->readd_owed) {
 		test_err("the readd still waits past its bound: persist %d owed %d", ret,
 			 wib->readd_owed);
@@ -2260,7 +2307,10 @@ static int test_readd_busy_region(struct btrfs_fs_info *fs_info)
 	ret = -EINVAL;
 	if (admits) {
 		if (kept == nr ||
-		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) == dropped0) {
+		    atomic64_read(&wib->stat_alert[btrfs_wib_readd_acks_unnamed() ?
+						   BTRFS_RAID56_EV_DROPPED :
+						   BTRFS_RAID56_EV_LOG_UNFLUSHED]) ==
+		    (btrfs_wib_readd_acks_unnamed() ? dropped0 : unflushed0)) {
 			test_err("raid56_wf_readd_admits_busy is set, yet nothing was lost (kept %u of %u): the test is blind",
 				 kept, nr);
 			goto out;
@@ -2932,11 +2982,13 @@ mark_failed:
 
 /*
  * More regions than the wide layout describes, all of them with a name: the
- * records have to come back without the names, and the log has to go on
- * working.  Planned against the in-memory set alone, the readd named what fit
- * in the wide layout, owed the rest, and then could never write the union
- * with the last block again: every commit and every write failed until
- * unmount.
+ * records have to come back without the names, marked possibly torn -- and
+ * the commit fails, since nothing on disk would say which device holds what
+ * the flush may have lost (raid56_wf_readd_acks_unnamed=1 lets it go on, as
+ * it did).  From the set it leaves, the log has to go on working.  Planned
+ * against the in-memory set alone, the readd named what fit in the wide
+ * layout, owed the rest, and then could never write the union with the last
+ * block again: every commit and every write failed until unmount.
  */
 static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 {
@@ -2958,6 +3010,8 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 	memcpy(saved, wib->last, BTRFS_WIB_SLOT_SIZE);
 
 	ret = readd_commit_failed(rig);
+	if (!legacy)
+		ret = readd_refused(wib, ret, "the commit that could not name the device");
 	if (ret)
 		goto out;
 	ret = -EINVAL;
@@ -3092,6 +3146,8 @@ static int readd_names_wait(struct readd_rig *rig, bool legacy)
 	}
 
 	ret = readd_commit_failed(rig);
+	if (!legacy)
+		ret = readd_refused(wib, ret, "the commit whose flush failed, the readd owed");
 	if (ret)
 		goto out;
 	ret = -EINVAL;
@@ -3147,9 +3203,10 @@ out:
 
 /*
  * The set is wide already, and the last block lists more than a wide block
- * describes: no layout will ever hold both.  Take back what fits, lose the rest
- * loudly, and keep working -- owing a readd that can never complete would stop
- * every write for good.  What it took back names a member, so a write into a
+ * describes: no layout will ever hold both.  Take back what fits and refuse
+ * the commit, loudly (raid56_wf_readd_acks_unnamed=1 loses the rest and goes
+ * on, as it did) -- owing a readd that can never complete would stop every
+ * write for good.  What it took back names a member, so a write into a
  * region the log does not hold waits for a repair or a scrub to retire one
  * (see wib_evict_sticky()); a write into one it holds goes ahead.
  */
@@ -3158,6 +3215,7 @@ static int readd_names_lose(struct readd_rig *rig, bool legacy)
 	struct btrfs_fs_info *fs_info = rig->fs_info;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+	const u64 unflushed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
 	const u64 first = 10;
 	const u64 nr = 100;
 	const u64 k_stale = 150;
@@ -3170,6 +3228,8 @@ static int readd_names_lose(struct readd_rig *rig, bool legacy)
 	btrfs_wib_mark_stale(fs_info, readd_region(k_stale), BTRFS_WIB_BLOCK_SIZE);
 
 	ret = readd_commit_failed(rig);
+	if (!legacy)
+		ret = readd_refused(wib, ret, "the commit that could not keep every record");
 	if (ret)
 		return ret;
 	if (wib->readd_owed) {
@@ -3197,8 +3257,11 @@ static int readd_names_lose(struct readd_rig *rig, bool legacy)
 		}
 		test_msg("raid56_wf_no_readd_name is set: %u of %llu regions lost, as expected",
 			 (u32)(nr - kept), nr);
-	} else if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) == dropped0) {
-		test_err("records were lost, and nothing said so");
+	} else if (atomic64_read(&wib->stat_alert[btrfs_wib_readd_acks_unnamed() ?
+						  BTRFS_RAID56_EV_DROPPED :
+						  BTRFS_RAID56_EV_LOG_UNFLUSHED]) ==
+		   (btrfs_wib_readd_acks_unnamed() ? dropped0 : unflushed0)) {
+		test_err("records were not kept, and nothing said so");
 		return -EINVAL;
 	}
 	if (!legacy) {

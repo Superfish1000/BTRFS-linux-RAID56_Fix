@@ -3,7 +3,7 @@
 # Do the records a failed flush leaves wedge the write-intent log once it is
 # full of them, with every device there?
 #
-#   flush_wedge.sh <kernel> [named|torn|busy]
+#   flush_wedge.sh <kernel> [named|torn|busy|unnamed]
 #
 # See flush_wedge in init-final3.sh.  RAID5 data, RAID1 metadata, four
 # devices.  While device 1 drops writes, one block per region is overwritten
@@ -35,11 +35,20 @@
 #              record is spent, every write succeeds
 #     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
 #              each spends one at once (sticky_evicted, record_dropped)
+#   torn and busy set raid56_wf_readd_acks_unnamed=1 in both arms: the
+#   default refuses the commit that would leave such a log (unnamed).
+#   unnamed (CUR-4)  165 regions, as torn: too many to name device 1 in
+#     fixed    the commit whose barrier failed fails instead (read-only), with
+#              the log_flush_unnamed alert: the overwrites are never
+#              acknowledged, and each block reads back as written or as it was
+#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
+#              overwrites device 1 dropped read back as the block was before
+#              the acknowledged write, with no error
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy]}
+KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed]}
 PLAN=${2:-named}
-case $PLAN in named|torn|busy) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in named|torn|busy|unnamed) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OPTS=rw,commit=600
 # More RMW workers than the three one CPU gets, or no more than three writes
 # are ever recorded at once (rmw_workers).
@@ -79,9 +88,9 @@ for a in fixed control; do
 done
 res() { cat $T/umltest/fw.fw-$PLAN-$1 2>/dev/null || echo "?"; }
 read -r f_acked f_fl f_named f_torn f_queued f_rok f_ok f_eio f_rdok f_rdeio f_rdbad f_stale f_full f_drop \
-	f_commit f_secs f_scrubbed <<<"$(res fixed)"
+	f_commit f_secs f_scrubbed f_fsync f_ro f_rold f_unn <<<"$(res fixed)"
 read -r c_acked c_fl c_named c_torn c_queued c_rok c_ok c_eio c_rdok c_rdeio c_rdbad c_stale c_full c_drop \
-	c_commit c_secs c_scrubbed <<<"$(res control)"
+	c_commit c_secs c_scrubbed c_fsync c_ro c_rold c_unn <<<"$(res control)"
 case "$f_acked$c_acked" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
@@ -132,6 +141,34 @@ echo "  new writes ok/eio: fixed $f_ok/$f_eio (${f_secs}s), control $c_ok/$c_eio
      "log_full $f_full/$c_full, record_dropped $f_drop/$c_drop"
 echo "  read back ok/eio/bad of acknowledged: fixed $f_rdok/$f_rdeio/$f_rdbad of $f_acked," \
      "control $c_rdok/$c_rdeio/$c_rdbad of $c_acked"
+if [ $PLAN = unnamed ]; then
+	echo "  the commit whose barrier failed: went on fixed $f_fsync control $c_fsync, read-only" \
+	     "fixed $f_ro control $c_ro; log_flush_unnamed fixed $f_unn control $c_unn;" \
+	     "blocks read back as before the write: fixed $f_rold control $c_rold"
+	if [ "${c_torn:-0}" = 0 ] || [ "${c_fsync:-0}" != 1 ] || [ "${c_rold:-0}" = 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control did not acknowledge an unnamed flush loss that reads"
+		echo "        back old (torn_blocks $c_torn, commit went on $c_fsync, old $c_rold)"
+		exit 2
+	fi
+	if [ "${f_fsync:-1}" != 0 ] || [ "${f_ro:-0}" != 1 ]; then
+		echo "RESULT: FAIL -- the commit that could not name device 1 went on (sync $f_fsync, ro $f_ro)"
+		exit 1
+	fi
+	if [ "${f_unn:-0}" = 0 ] || [ "${f_drop:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- log_flush_unnamed $f_unn, record_dropped $f_drop"; exit 1
+	fi
+	if [ $(( ${f_rdbad:-0} - ${f_rold:-0} )) != 0 ]; then
+		echo "RESULT: FAIL -- $(( f_rdbad - f_rold )) block(s) read back as neither the write nor the old content"
+		exit 1
+	fi
+	grep -aq "every transaction commit from here FAILS and the filesystem goes read-only" \
+		$T/umltest/fw-$PLAN-fixed/log ||
+		{ echo "RESULT: FAIL -- the log_flush_unnamed explanation does not say the commit failed"; exit 1; }
+	echo "RESULT: PASS -- the commit that could not name device 1 failed, read-only, with the alert:"
+	echo "        nothing acknowledged the overwrites ($f_rold read back as before, $f_rdok as written);"
+	echo "        control: the commit went on and $c_rold acknowledged block(s) read back old, no error"
+	exit 0
+fi
 if [ $PLAN = named ]; then
 	if [ "${f_named:-0}" = 0 ] || [ "${f_torn:-0}" != 0 ]; then
 		echo "RESULT: INCONCLUSIVE -- the readd did not name the device (stale_marks $f_named, torn_blocks $f_torn)"

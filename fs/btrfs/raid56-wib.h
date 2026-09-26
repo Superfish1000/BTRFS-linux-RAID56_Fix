@@ -629,10 +629,24 @@ struct btrfs_wib {
 	 * @readd_owed_failed says which devices those stripes have to name
 	 * when it does.  Never a state the log cannot leave: no write takes
 	 * more of the room meanwhile (@readd_admit_last), and when finishing
-	 * writes cannot make it, the readd does what fits instead.
+	 * writes cannot make it, the readd refuses instead (@readd_refused).
 	 */
 	bool readd_owed;
 	struct btrfs_wib_flush_failed readd_owed_failed;
+	/*
+	 * A failed flush's readd could not keep a record naming the device in
+	 * every stripe the flush covered -- no block holds them all with the
+	 * names (WIB_READD_UNNAMED), or not even without them (WIB_READD_LOSE,
+	 * or an owed readd that waited its bound out) -- or a transaction
+	 * commit came while it was owed.  A commit that went on would
+	 * acknowledge writes the device may have lost with nothing on disk
+	 * saying which copy is stale.  So from here on no block is written:
+	 * the one on the devices lists every such stripe, the next mount's
+	 * recovery checks them, and every commit fails -- a transaction
+	 * aborts, and the filesystem goes read-only.  For the mount; set under
+	 * @commit_mutex, read anywhere.
+	 */
+	bool readd_refused;
 	/*
 	 * Under @lock, set with @readd_owed (wib_readd_set_owed()).  Every
 	 * write into a region the last block does not list adds one more that
@@ -860,6 +874,7 @@ bool btrfs_wib_finished_stay_inflight(void);
 bool btrfs_wib_remount_ro_keeps_inflight(void);
 bool btrfs_wib_readd_disowns_all(void);
 bool btrfs_wib_readd_admits_busy(void);
+bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);

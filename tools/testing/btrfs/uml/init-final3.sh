@@ -4198,6 +4198,14 @@ torn_readd_prep)
 			log "CONTROL_KNOB_FAIL"
 		log "control: the possibly-torn mark is not written to the log"
 	}
+	# The readd pair checks what the records a readd that cannot name the
+	# device leaves say after a crash: raid56_wf_readd_acks_unnamed=1 lets
+	# the commit go on and leave them.  The default refuses that commit
+	# (flush_wedge unnamed).
+	case "${CONTROL:-0}" in 0|1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+	esac
 	case "${CONTROL:-0}" in 2|3|4)
 		{ echo 1 > /sys/module/btrfs/parameters/raid56_wf_no_readd_name &&
 		  echo 1 > /sys/module/btrfs/parameters/raid56_wf_log_unmarked; } 2>/dev/null ||
@@ -4580,6 +4588,15 @@ flush_wedge)
 	#     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
 	#              each spends a possibly torn record at once (sticky_evicted,
 	#              record_dropped)
+	#   torn and busy run with raid56_wf_readd_acks_unnamed=1 in both arms:
+	#   the default leaves no such log, as unnamed shows.
+	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
+	#     fixed    the commit whose barrier failed fails instead, with the
+	#              log_flush_unnamed alert, and the filesystem goes read-only:
+	#              nothing acknowledges the overwrites
+	#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
+	#              overwrites FAIL dropped read back as the block was before,
+	#              with no error
 	watchdog ${WATCH:-900}
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -4591,12 +4608,20 @@ flush_wedge)
 	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
 	      FW_REGIONS=${FW_REGIONS:-164};;
+	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-165};;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
 	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
 		echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null || log "CONTROL_KNOB_FAIL"
 		log "control: $k=1"
 	done
+	# torn and busy check what a log full of records that only say a write
+	# may have been torn does: both arms let the readd that cannot name the
+	# device leave them, which unnamed shows the default refuses.
+	case "$PLAN" in torn|busy)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+	esac
 	FW_FRESH=${FW_FRESH:-20}; FW_BUSY=${FW_BUSY:-8}
 	nrows=$((FW_REGIONS + FW_FRESH + 40))
 	[ "$PLAN" = busy ] && nrows=$((nrows + 4 * FW_BUSY + 8))
@@ -4648,6 +4673,8 @@ flush_wedge)
 	dm_error_writes $FAIL; log "device $FAIL fails writes and flushes"
 	touch $MNT/marker
 	sync
+	btrfs filesystem sync $MNT >/dev/null 2>&1 && fsync_ok=1 || fsync_ok=0
+	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 	fl=$(btrfs device stats $MNT 2>/dev/null | awk '/flush_io_errs/ {s += $2} END {print s + 0}')
 	named=$(hv stale_marks); torn=$(wv torn_blocks); queued=$(wv repair_queued)
 	stale1=$(hv device_write_failed)
@@ -4657,7 +4684,7 @@ flush_wedge)
 	sync
 	log "FW after the readd: stale_marks=$named torn_blocks=$torn repair_queued=$queued" \
 	    "device_write_failed $stale0 -> $stale1 log_flush_unnamed=$(hv log_flush_unnamed)" \
-	    "sticky_blocks=$(wv sticky_blocks)"
+	    "sticky_blocks=$(wv sticky_blocks) commit_ok=$fsync_ok read_only=$ro"
 	# Until every repair asked for has run: they retry on a doubling delay
 	# while the device still failed.
 	t=0
@@ -4727,12 +4754,19 @@ flush_wedge)
 	sync
 	# Every overwritten block, cold.
 	echo 3 > /proc/sys/vm/drop_caches
-	rok=0; reio=0; rbad=0
+	rok=0; reio=0; rbad=0; rold=0
 	while read -r b; do
 		if dd if=$MNT/nocow of=$T/umltest/blk.$TAG bs=4096 skip=$b count=1 status=none \
 		      iflag=direct 2>/dev/null; then
-			[ "$(tr -cd B < $T/umltest/blk.$TAG | wc -c)" = 4096 ] &&
-				rok=$((rok + 1)) || { rbad=$((rbad + 1)); log "FW_READ_BAD $b"; }
+			if [ "$(tr -cd B < $T/umltest/blk.$TAG | wc -c)" = 4096 ]; then
+				rok=$((rok + 1))
+			else
+				rbad=$((rbad + 1)); log "FW_READ_BAD $b"
+				# What the block held before the write: the
+				# file was preallocated, never written.
+				[ "$(tr -d '\000' < $T/umltest/blk.$TAG | wc -c)" = 0 ] &&
+					rold=$((rold + 1))
+			fi
 		else
 			reio=$((reio + 1))
 		fi
@@ -4758,7 +4792,8 @@ flush_wedge)
 	fi
 	echo "$acked $fl ${named:-0} ${torn:-0} ${queued:-0} $(wv repair_ok) $fok $feio $rok $reio" \
 	     "$rbad $(( ${stale1:-0} - ${stale0:-0} )) $(hv log_full) $(hv record_dropped)" \
-	     "$([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs $scrubbed" > $T/umltest/fw.$TAG
+	     "$([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs $scrubbed $fsync_ok $ro" \
+	     "$rold $(hv log_flush_unnamed)" > $T/umltest/fw.$TAG
 	rm -f $BB $T/umltest/blk.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null

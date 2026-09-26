@@ -70,7 +70,9 @@
 #               P, 'C's, with no error
 #               Both arms raid56_wf_evict_stage0=1: the order checked is the
 #               one stage 0 spent such records in; the default spends none,
-#               see flush_wedge.sh torn.
+#               see flush_wedge.sh torn.  And raid56_wf_readd_acks_unnamed=1:
+#               the default refuses the commit that cannot name the device
+#               (flush_wedge.sh unnamed), and leaves no such records.
 #   misspar     RAID6, four devices: the same torn write, then a read-write
 #               mount without the stripe's Q device.  The recovery
 #               regenerates P from the data and keeps the stripe recorded
@@ -233,9 +235,10 @@ for s in $SCEN; do
 		arm $s fixed
 		arm $s control btrfs.raid56_rmw_trusts_torn=1;;
 	evict)
-		arm evict fixed btrfs.raid56_wf_evict_stage0=1
+		arm evict fixed btrfs.raid56_wf_evict_stage0=1 \
+			btrfs.raid56_wf_readd_acks_unnamed=1
 		arm evict control btrfs.raid56_wf_evict_stage0=1 \
-			btrfs.raid56_wf_kept_torn_in_order=1;;
+			btrfs.raid56_wf_readd_acks_unnamed=1 btrfs.raid56_wf_kept_torn_in_order=1;;
 	misspar)
 		arm misspar fixed
 		arm misspar control btrfs.raid56_wf_missing_parity_keeps_torn=1;;

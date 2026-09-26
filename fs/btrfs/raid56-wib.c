@@ -2076,6 +2076,15 @@ static const bool name_unwritten;
  * filesystem (close_ctree()) -- so the next mount takes their stripes for
  * possibly torn.  The negative control for the remount arm of
  * uml/recover_scrub.sh.
+ *
+ * raid56_wf_readd_acks_unnamed=1: a failed flush's readd that cannot keep a
+ * record naming the device in every stripe it covered takes them back without
+ * the names (WIB_READD_UNNAMED) or loses what it has no room for
+ * (WIB_READD_LOSE, or a WAIT that ran out), and the commit goes on -- as
+ * before @readd_refused: what the device may have lost is acknowledged with
+ * nothing on disk saying which copy is stale.  So does a transaction commit
+ * while the readd is owed.  The negative control for the unnamed arm of
+ * uml/flush_wedge.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2114,6 +2123,10 @@ static bool remount_ro_keeps_inflight;
 module_param_named(raid56_wf_remount_ro_keeps_inflight, remount_ro_keeps_inflight, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_remount_ro_keeps_inflight,
 		 "Leave the write-intent log listing in flight the writes that finished before a remount read-only, so the next mount takes their stripes for possibly torn (testing only: restores a known defect)");
+static bool readd_acks_unnamed;
+module_param_named(raid56_wf_readd_acks_unnamed, readd_acks_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_readd_acks_unnamed,
+		 "Let a failed flush's readd keep without the device's name, or lose, the stripes the write-intent log has no room to name it in, and let the commit go on (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2124,6 +2137,7 @@ static const bool readd_disowns_all;
 static const bool readd_admits_busy;
 static const bool readd_says_each;
 static const bool remount_ro_keeps_inflight;
+static const bool readd_acks_unnamed;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2176,6 +2190,11 @@ bool btrfs_wib_readd_disowns_all(void)
 bool btrfs_wib_readd_admits_busy(void)
 {
 	return READ_ONCE(readd_admits_busy);
+}
+
+bool btrfs_wib_readd_acks_unnamed(void)
+{
+	return READ_ONCE(readd_acks_unnamed);
 }
 #endif
 
@@ -2932,6 +2951,7 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 	bool naming = false;
 	bool identified;
 	bool gave_up;
+	bool refuse;
 	bool name;
 	u32 nr_union;
 	u32 nr_perm;
@@ -3198,6 +3218,16 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 		e->gen = max(e->gen, fs_info->generation);
 	}
 	wib->readd_landed = plan != WIB_READD_WAIT;
+	/*
+	 * A name this readd could not put on, or a record it had no room for,
+	 * is a write the device may have lost that nothing on disk will say
+	 * is stale once the commit goes on: refuse it, and every commit after
+	 * it (@readd_refused).  What was taken back stays in the set, for the
+	 * reads until the unmount.
+	 */
+	refuse = (nr_unnamed || nr_lost) && !READ_ONCE(readd_acks_unnamed);
+	if (refuse)
+		WRITE_ONCE(wib->readd_refused, true);
 	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (nr_readded)
@@ -3206,9 +3236,9 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 	 * Say so, as a write that failed on the device would have: the
 	 * stripes have lost their redundancy until the repairs asked for here
 	 * land.  Only for names this readd added; any others were announced
-	 * when they were made.
+	 * when they were made.  Not once refused: nothing lands any more.
 	 */
-	if (plan != WIB_READD_WAIT && !READ_ONCE(readd_no_repair)) {
+	if (plan != WIB_READD_WAIT && !refuse && !READ_ONCE(readd_no_repair)) {
 		const u64 first = wib_readd_queue_repairs(wib, onr);
 
 		if (nr_named)
@@ -3220,12 +3250,16 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 		memset(&wib->readd_owed_failed, 0, sizeof(wib->readd_owed_failed));
 
 	/* Latched, both: someone has to look, and acknowledge. */
-	if (nr_unnamed)
+	if (nr_unnamed || refuse)
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
-	if (nr_lost)
+	if (nr_lost && !refuse)
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_DROPPED, 0, NULL, 0);
 	if (btrfs_is_testing(fs_info))
 		return !wib->readd_owed;
+	if (refuse)
+		btrfs_err(fs_info,
+	"raid56 write-intent log: %s did not confirm a flush, and the log cannot keep a record naming it in every stripe it covered (%u names it has no room for, %u blocks not kept at all): no commit goes on from here, the filesystem goes read-only rather than acknowledge writes that device may have lost",
+			  who, nr_unnamed, nr_lost);
 	if (nr_named)
 		btrfs_warn_rl(fs_info,
 	"raid56 write-intent log: keeping %u stripes recorded whose data %s did not confirm is flushed, and marking its column or parity stale in %u",
@@ -3234,7 +3268,7 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 		btrfs_warn_rl(fs_info,
 	"raid56 write-intent log: keeping %u stripes recorded, a device did not confirm their data is flushed",
 			      nr_readded);
-	if (nr_unnamed)
+	if (nr_unnamed && !refuse)
 		btrfs_err_rl(fs_info,
 	"raid56 write-intent log: %s did not confirm a flush, and the log is too full to say so in %u of the stripes it keeps recorded: data without checksums there may read back an older version",
 			     who, nr_unnamed);
@@ -3242,7 +3276,7 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 		btrfs_err_rl(fs_info,
 	"raid56 write-intent log: writes in flight held the room for the records a failed flush kept for %u s; not waiting for them any longer",
 			     jiffies_to_msecs(BTRFS_WIB_READD_WAIT) / 1000);
-	if (nr_lost)
+	if (nr_lost && !refuse)
 		btrfs_err_rl(fs_info,
 	"raid56 write-intent log full, %u stripes whose data %s did not confirm is flushed are not recorded any more, run scrub",
 			     nr_lost, who);
@@ -3298,6 +3332,9 @@ static int wib_write_block_locked(struct btrfs_wib *wib, u64 seq, const void *ba
 
 	lockdep_assert_held(&wib->commit_mutex);
 
+	/* After a refused readd, the block on the devices stays: @readd_refused. */
+	if (READ_ONCE(wib->readd_refused))
+		return -EIO;
 	/* Whoever writes it, this block may satisfy a mark. */
 	if (!READ_ONCE(snapshot_misses_marks))
 		wib_fold_prepared_locked(wib);
@@ -5671,6 +5708,19 @@ static int wib_write_final_locked(struct btrfs_wib *wib, bool flushed)
 }
 
 /*
+ * A commit after a refused readd (@readd_refused in struct btrfs_wib): it
+ * would acknowledge writes a device may have lost that the log cannot name.
+ * The caller aborts the transaction; the log_flush_unnamed alert says why.
+ */
+static int wib_commit_refused(struct btrfs_fs_info *fs_info)
+{
+	if (!btrfs_is_testing(fs_info))
+		btrfs_err_rl(fs_info,
+	"raid56 write-intent log: failing the transaction commit: a device did not confirm a flush and the log cannot record what it may have lost, see the log_flush_unnamed alert");
+	return -EIO;
+}
+
+/*
  * Called at transaction commit (and log commit) time, after the device
  * barriers and before the superblocks are written.  Persists the current
  * in-flight set, dropping stripes that finished before the snapshot taken
@@ -5732,6 +5782,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	}
 	if (!enabled)
 		return 0;
+	if (READ_ONCE(wib->readd_refused))
+		return wib_commit_refused(fs_info);
 
 	if (disable) {
 		/*
@@ -5757,6 +5809,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	"raid56 write-intent log: could not write the final log block, the next mount will scrub the stripes the previous one listed");
 			if (!btrfs_is_testing(fs_info))
 				btrfs_info(fs_info, "raid56 write-intent log disabled");
+			if (READ_ONCE(wib->readd_refused))
+				return wib_commit_refused(fs_info);
 			return 0;
 		}
 		wib->disable_armed = !flag_written;
@@ -5782,7 +5836,19 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	wib->prepared_valid = false;
 	ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed, false,
 			      timed);
+	/*
+	 * Still owed: the records a failed flush kept are not in the block yet,
+	 * the names they need not on disk, and the writes they stand for would
+	 * be acknowledged all the same.  The readd waits for writes in flight
+	 * and this commit cannot: refuse it (@readd_refused).
+	 */
+	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed)) {
+		WRITE_ONCE(wib->readd_refused, true);
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
+	}
 	mutex_unlock(&wib->commit_mutex);
+	if (READ_ONCE(wib->readd_refused))
+		return wib_commit_refused(fs_info);
 	if (ret == -ENOSPC) {
 		/*
 		 * Not even the union fits; the devices keep their current
@@ -6201,8 +6267,14 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 			  logical, who, fsid);
 		break;
 	case BTRFS_RAID56_EV_LOG_UNFLUSHED:
-		btrfs_err(fs_info,
+		if (READ_ONCE(readd_acks_unnamed)) {
+			btrfs_err(fs_info,
 "raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log has more of those stripes than it can hold while naming that device in them. It keeps them recorded, but not which device is stale: data without checksums there may read back an older version, with no error, and a scrub cannot tell which side to trust. Find the device (btrfs device stats <mountpoint>: flush_io_errs), fix or replace it ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+				  fsid);
+			break;
+		}
+		btrfs_err(fs_info,
+"raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log cannot keep a record naming that device in every stripe the flush covered -- more of them than a log block holds, or writes in flight still holding the room. Rather than acknowledge those writes with nothing on disk saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only; the log on the devices still lists every one of those stripes, and data written since the last commit may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs) and fix it, unmount and mount again (-o degraded if you pulled it): the mount's recovery checks every stripe the log lists. Replace the device if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_UNRECOVERED:
