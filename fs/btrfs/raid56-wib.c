@@ -668,6 +668,12 @@ MODULE_PARM_DESC(raid56_wf_torn_unevictable,
  * btrfs_wib_entry) in table order with those a failed flush left -- first,
  * since the recovery adds them first.  The negative control for the evict
  * arm of uml/torn_present.sh.
+ *
+ * raid56_wf_admit_narrow=1: a log with nothing stale admits writes against
+ * what the narrow layout describes, as before wib_admit_max(), and a device
+ * replace's mark may leave the set more than a wide block describes -- so the
+ * first record naming a member can leave the log unable to write a block at
+ * all.  The negative control for uml/commit_full.sh.
  */
 static bool torn_spent_eagerly;
 module_param_named(raid56_wf_torn_spent_eagerly, torn_spent_eagerly, bool, 0644);
@@ -677,6 +683,10 @@ static bool kept_torn_in_order;
 module_param_named(raid56_wf_kept_torn_in_order, kept_torn_in_order, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_kept_torn_in_order,
 		 "Let a full write-intent log spend the records the mount's recovery kept possibly torn in table order with those a failed flush left (testing only: restores a known defect)");
+static bool admit_narrow;
+module_param_named(raid56_wf_admit_narrow, admit_narrow, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_admit_narrow,
+		 "Admit writes into a write-intent log with nothing stale against the narrow layout, so that the first record naming a member can leave more regions than a log block describes (testing only: restores a known defect)");
 #else
 static const bool evict_naming;
 static const bool keep_naming_degraded;
@@ -686,6 +696,7 @@ static const bool replace_keeps_added_only;
 static const bool torn_unevictable;
 static const bool torn_spent_eagerly;
 static const bool kept_torn_in_order;
+static const bool admit_narrow;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -728,6 +739,11 @@ bool btrfs_wib_torn_spent_eagerly(void)
 bool btrfs_wib_kept_torn_in_order(void)
 {
 	return READ_ONCE(kept_torn_in_order);
+}
+
+bool btrfs_wib_admits_narrow(void)
+{
+	return READ_ONCE(admit_narrow);
 }
 #endif
 
@@ -993,6 +1009,57 @@ static void wib_enforce_capacity_locked(struct btrfs_wib *wib)
 }
 
 /*
+ * How many regions a write may leave the log holding: what a WIDE block
+ * describes, whatever the layout of the moment.
+ *
+ * wib_live_max() says what the next block can describe, and a set that fits
+ * it now does not fit it a moment later: any write admitted may fail and name
+ * a member, and that record makes every block wide.
+ * wib_enforce_capacity_locked() then spends what may be spent -- and with
+ * every record naming a member, saying a write may have been torn or holding
+ * a verdict, nothing may.  A set of more regions than a wide block describes,
+ * admitted against the narrow layout, was then one no block could describe:
+ * btrfs_wib_commit() kept the previous block and let the transaction commit,
+ * the new names existed only in memory, and after a crash the mount rebuilt
+ * the parity from the column they named stale.  So a write is admitted only
+ * while what it leaves that may not be spent fits the wide layout; the records
+ * that may be (wib_evictable()) count as room, and stay until the layout, or
+ * the table, needs their slot.  raid56_wf_admit_narrow=1 admits against the
+ * layout of the moment, as before.
+ */
+static u32 wib_admit_max(const struct btrfs_wib *wib)
+{
+	if (READ_ONCE(admit_narrow))
+		return wib_live_max(wib);
+	return BTRFS_WIB_MAX_ENTRIES;
+}
+
+/*
+ * May @e name a member without leaving a set no block describes?  Naming one
+ * makes every block wide, and wib_enforce_capacity_locked() gets the set there
+ * only by spending what wib_evictable() allows.  wib_admit_max() keeps a
+ * write's name from ever needing more; this is for the marks that are not a
+ * write's, a device replace's (btrfs_wib_replace_mark_stale()), whose record
+ * others may have been admitted against while nothing named it yet.  Caller
+ * holds wib->lock.
+ */
+static bool wib_names_fit_locked(struct btrfs_wib *wib, const struct btrfs_wib_entry *e)
+{
+	u32 kept = 0;
+
+	if (READ_ONCE(admit_narrow))
+		return true;
+	wib_policy_locked(wib);
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
+		const struct btrfs_wib_entry *o = &wib->entries[i];
+
+		if (wib_entry_used(o) && (o == e || !wib_evictable(wib, o, true)))
+			kept++;
+	}
+	return kept <= BTRFS_WIB_MAX_ENTRIES;
+}
+
+/*
  * Find the entry for @bytenr, or claim a free one, evicting a sticky-only
  * entry if @evict and nothing is free.  NULL if the log is full.
  */
@@ -1057,7 +1124,7 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 
 	lockdep_assert_held(&wib->lock);
 
-	const u32 max = wib_live_max(wib);
+	const u32 max = wib_admit_max(wib);
 	u32 live = 0, evictable = 0;
 
 	*needed = 0;
@@ -1076,11 +1143,11 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 			evictable++;
 	}
 	/*
-	 * Free table slots are not the measure: a slot the current layout
-	 * cannot describe is not room.  Evicting @evictable entries leaves
-	 * @live - @evictable in use, so @max - @live + @evictable is what can
-	 * still be admitted -- and it is negative, meaning nothing, when the
-	 * set is already over the limit because a stale bit halved it.
+	 * Free table slots are not the measure: a slot a wide block cannot
+	 * describe is not room (wib_admit_max()).  Evicting @evictable entries
+	 * leaves @live - @evictable in use, so @max - @live + @evictable is
+	 * what can still be admitted -- and it is negative, meaning nothing,
+	 * when the set is already over the limit.
 	 */
 	if (max + evictable > live)
 		*avail = max + evictable - live;
@@ -2100,6 +2167,13 @@ static const bool name_unwritten;
  * nothing on disk saying which copy is stale.  So does a transaction commit
  * while the readd is owed.  The negative control for the unnamed arm of
  * uml/flush_wedge.sh.
+ *
+ * raid56_wf_commit_keeps_previous=1: a transaction commit that cannot write
+ * the log -- the set is more than a block describes, or too few devices took
+ * the block -- keeps the previous block on the devices and goes on, as before
+ * wib_commit_failed(): the records only the set holds are acknowledged with
+ * nothing on disk.  The negative control for the r2 arm of
+ * uml/commit_full.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2142,6 +2216,10 @@ static bool readd_acks_unnamed;
 module_param_named(raid56_wf_readd_acks_unnamed, readd_acks_unnamed, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_readd_acks_unnamed,
 		 "Let a failed flush's readd keep without the device's name, or lose, the stripes the write-intent log has no room to name it in, and let the commit go on (testing only: restores a known defect)");
+static bool commit_keeps_previous;
+module_param_named(raid56_wf_commit_keeps_previous, commit_keeps_previous, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_commit_keeps_previous,
+		 "Let a transaction commit that cannot write the write-intent log keep the previous log block and go on (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2153,6 +2231,7 @@ static const bool readd_admits_busy;
 static const bool readd_says_each;
 static const bool remount_ro_keeps_inflight;
 static const bool readd_acks_unnamed;
+static const bool commit_keeps_previous;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2210,6 +2289,11 @@ bool btrfs_wib_readd_admits_busy(void)
 bool btrfs_wib_readd_acks_unnamed(void)
 {
 	return READ_ONCE(readd_acks_unnamed);
+}
+
+bool btrfs_wib_commit_keeps_previous(void)
+{
+	return READ_ONCE(commit_keeps_previous);
 }
 #endif
 
@@ -3969,7 +4053,9 @@ bool btrfs_wib_persisting(struct btrfs_fs_info *fs_info)
  * the column stale first (scrub_replace_record_lost()); the full stripe must be
  * recorded already (btrfs_wib_try_add_sticky()).  Returns whether the column is
  * recorded stale afterwards: marking can make the log shrink to fit, and a
- * record that did not survive that is no record.
+ * record that did not survive that is no record -- nor is one that would leave
+ * the log more than a block describes, which is not made
+ * (wib_names_fit_locked()).
  *
  * The log records whole columns, so the mark is not only about the zeros:
  * every sector of the column without a checksum is read through a rebuild
@@ -4010,8 +4096,13 @@ bool btrfs_wib_replace_mark_stale(struct btrfs_fs_info *fs_info, u64 logical,
 
 	spin_lock_irqsave(&wib->lock, flags);
 	e = wib_find_entry(wib, cur);
-	/* Only where the stripe is recorded, as btrfs_wib_mark_stale(). */
-	if (e && (e->sticky & mask)) {
+	/*
+	 * Only where the stripe is recorded, as btrfs_wib_mark_stale(), and
+	 * only if the set can still be written with the mark: a mark no block
+	 * can hold is only in memory, and the zeros would be read as data after
+	 * a crash.
+	 */
+	if (e && (e->sticky & mask) && wib_names_fit_locked(wib, e)) {
 		const u64 add = mask & ~e->stale;
 
 		if (add) {
@@ -4056,7 +4147,7 @@ bool btrfs_wib_replace_mark_parity(struct btrfs_fs_info *fs_info,
 
 	spin_lock_irqsave(&wib->lock, flags);
 	e = wib_find_entry(wib, cur);
-	if (e) {
+	if (e && wib_names_fit_locked(wib, e)) {
 		const u64 add = mask & ~e->stale_par;
 
 		wib_set_stale_par(wib, e, e->stale_par | mask);
@@ -5481,8 +5572,14 @@ void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info)
 		return;
 	mutex_lock(&wib->commit_mutex);
 	ret = btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
-	ASSERT(ret == 0);
-	wib->prepared_valid = true;
+	/*
+	 * A set no block describes leaves @prepared zeroed, which as a snapshot
+	 * says nothing was in flight: the commit would drop what finished after
+	 * it with no flush covering it.  The commit drops nothing then, and one
+	 * whose set still does not fit fails (wib_commit_failed()) -- unless
+	 * raid56_wf_commit_keeps_previous=1.
+	 */
+	wib->prepared_valid = ret == 0 || READ_ONCE(commit_keeps_previous);
 	mutex_unlock(&wib->commit_mutex);
 }
 
@@ -5743,12 +5840,39 @@ static int wib_commit_refused(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * A transaction commit could not write the log (@err): the set is more than a
+ * block describes (-ENOSPC), or too few devices took the block.  The devices
+ * keep the previous block, which lists every stripe that may be in flight but
+ * not the records the set gained since -- the names of the members failed
+ * writes left stale, above all -- and a commit that went on would acknowledge
+ * those writes with nothing on disk saying which copy is stale.  The caller
+ * aborts the transaction, and the filesystem goes read-only; the
+ * log_commit_failed alert says why.  -EIO, as for a device that failed: the
+ * abort is explained, not a bug to dump a stack for.
+ */
+static int wib_commit_failed(struct btrfs_fs_info *fs_info, int err)
+{
+	if (!btrfs_is_testing(fs_info)) {
+		if (err == -ENOSPC)
+			btrfs_err(fs_info,
+	"raid56 write-intent log: failing the transaction commit: the log records more regions than a log block describes, and the records it gained since the last block would be acknowledged with nothing on disk");
+		else
+			btrfs_err(fs_info,
+	"raid56 write-intent log: failing the transaction commit: the log block did not reach enough devices (%pe), and the records it gained since the last block would be acknowledged with nothing on disk",
+				  ERR_PTR(err));
+	}
+	btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_COMMIT_FAILED, 0, NULL, 0);
+	return -EIO;
+}
+
+/*
  * Called at transaction commit (and log commit) time, after the device
  * barriers and before the superblocks are written.  Persists the current
  * in-flight set, dropping stripes that finished before the snapshot taken
  * by btrfs_wib_commit_prepare() (@flushed: every device confirmed the
  * barrier), handles an enable requested from a context that could not do
- * IO itself, and a pending disable.
+ * IO itself, and a pending disable.  Fails, and the transaction aborts, when
+ * the set cannot be written (wib_commit_failed(), wib_commit_refused()).
  */
 int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 {
@@ -5757,7 +5881,9 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	bool enabled;
 	bool enable;
 	bool disable;
+	bool barrier_failed = !flushed;
 	bool timed;
+	bool owed;
 	u64 seq;
 	int ret;
 
@@ -5850,14 +5976,27 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
 	timed = wib->prepared_valid;
 	if (!timed) {
-		/* No snapshot before the flush: don't trust it, drop nothing. */
-		ret = btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
-		ASSERT(ret == 0);
+		/*
+		 * No snapshot before the flush: don't trust it, drop nothing.
+		 * A set no block describes fails below.
+		 */
+		btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
 		flushed = false;
 	}
 	wib->prepared_valid = false;
 	ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed, false,
 			      timed);
+	/*
+	 * Not even the union with the snapshot fits.  The set alone may: drop
+	 * against a snapshot taken now, behind a flush of its own, as a mark's
+	 * commit does (wib_commit_locked()).  Not while a readd is owed: the
+	 * union is what it waits to fit.  Nor after a failed barrier with
+	 * raid56_wf_no_readd_name=1: that readd took back only what fitted, and
+	 * a flush now does not bring back what the failed one may have lost.
+	 */
+	if (ret == -ENOSPC && !wib->readd_owed && !READ_ONCE(commit_keeps_previous) &&
+	    !(barrier_failed && READ_ONCE(readd_legacy)))
+		ret = wib_flush_and_drop_locked(wib, seq, false);
 	/*
 	 * Still owed: the records a failed flush kept are not in the block yet,
 	 * the names they need not on disk, and the writes they stand for would
@@ -5868,9 +6007,14 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		WRITE_ONCE(wib->readd_refused, true);
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
 	}
+	owed = wib->readd_owed;
 	mutex_unlock(&wib->commit_mutex);
 	if (READ_ONCE(wib->readd_refused))
 		return wib_commit_refused(fs_info);
+	/* Owed, the readd refuses the commit itself, as above, or lets it go on. */
+	if (ret < 0 && !owed && !READ_ONCE(commit_keeps_previous))
+		return wib_commit_failed(fs_info, ret);
+	/* raid56_wf_commit_keeps_previous=1: the commit goes on, as it did. */
 	if (ret == -ENOSPC) {
 		/*
 		 * Not even the union fits; the devices keep their current
@@ -5880,11 +6024,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 			      "raid56 write-intent log: block full, keeping the previous one");
 	} else if (ret < 0) {
 		/*
-		 * A failed lazy commit only means that stale entries remain on
-		 * the devices that didn't get the new block; recovery is a
-		 * superset then, which is safe.  RMWs waiting for their own
-		 * record retry the commit and fail on their own if it keeps
-		 * failing.  Nothing to abort the transaction for.
+		 * Taken for a failed lazy commit, which only leaves stale
+		 * entries on the devices that didn't get the new block.
 		 */
 		btrfs_warn_rl(fs_info,
 			      "raid56 write-intent log: lazy commit failed: %d", ret);
@@ -6092,6 +6233,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_READ_UNRECOVERED] = "read_unrecovered",
 	[BTRFS_RAID56_EV_TORN_UNDECIDABLE] = "torn_undecidable",
 	[BTRFS_RAID56_EV_RECOVERY_FULL] = "recovery_log_full",
+	[BTRFS_RAID56_EV_COMMIT_FAILED] = "log_commit_failed",
 };
 
 /*
@@ -6113,7 +6255,8 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 					 BIT(BTRFS_RAID56_EV_LOG_UNFLUSHED) |	\
 					 BIT(BTRFS_RAID56_EV_REPLACE_DROPPED) |	\
 					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED) |	\
-					 BIT(BTRFS_RAID56_EV_RECOVERY_FULL))
+					 BIT(BTRFS_RAID56_EV_RECOVERY_FULL) |	\
+					 BIT(BTRFS_RAID56_EV_COMMIT_FAILED))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -6344,6 +6487,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		btrfs_err(fs_info,
 "raid56: the mount's recovery of the write-intent log could not keep the record of full stripe %llu: it has more stripes to keep recorded than the log holds, and dropping one could let data without a checksum there read back old, or as a rebuild nothing checked, with no error. So the filesystem is NOT made writable: a first mount fails, a remount stays read-only, and the log on the devices stays as it was. Mount it read-only (-o ro, with -o degraded if a device is missing) to read the data: what the log cannot vouch for reads as EIO. If a device was missing only at this mount -- present when the filesystem last ran -- bring it back and mount again: with every device there the recovery decides those stripes and keeps fewer. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  logical, fsid);
+		break;
+	case BTRFS_RAID56_EV_COMMIT_FAILED:
+		btrfs_err(fs_info,
+"raid56: a transaction commit FAILED and the filesystem is now read-only, because the write-intent log could not be written: it records more regions than a log block describes, or too few devices took the block (the message before this one says which). Going on would have acknowledged writes whose records -- which copy of a stripe a failed write left stale -- exist only in memory, and after a crash the old data would have read back with no error. What was written since the last commit is not acknowledged (fsync returned an error), and the log on the devices still lists every stripe the next mount's recovery has to check. Unmount and mount again (-o degraded if a device is missing); if a device keeps failing writes, replace it ('btrfs replace start <devid> <new device> <mountpoint>') and run 'btrfs scrub start <mountpoint>'. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+			  fsid);
 		break;
 	case BTRFS_RAID56_EV_REPLACE_ABORTED:
 		btrfs_err(fs_info,
@@ -6610,7 +6758,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep, %llu commits that could not write the log; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -6630,6 +6778,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_READ_UNRECOVERED],
 			   pending[BTRFS_RAID56_EV_TORN_UNDECIDABLE],
 			   pending[BTRFS_RAID56_EV_RECOVERY_FULL],
+			   pending[BTRFS_RAID56_EV_COMMIT_FAILED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {

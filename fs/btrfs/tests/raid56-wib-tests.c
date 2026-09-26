@@ -53,6 +53,42 @@ static u32 block_nr_entries(const void *block)
 	return le32_to_cpu(((const struct btrfs_wib_disk_header *)block)->nr_entries);
 }
 
+/*
+ * How many regions writes may leave the log holding: what a wide block
+ * describes, or under raid56_wf_admit_narrow=1 what the layout of the moment
+ * does -- the narrow one while nothing is stale (wib_admit_max()).
+ */
+static u32 admit_cap(void)
+{
+	return btrfs_wib_admits_narrow() ? BTRFS_WIB_MAX_ENTRIES_V1 : BTRFS_WIB_MAX_ENTRIES;
+}
+
+/*
+ * Put a record of region @bytenr straight into the table -- @bitmap in flight,
+ * @sticky failed -- without a write's admission (wib_admit_max()): as a failed
+ * flush's readd or the mount's recovery puts one there, or as writes admitted
+ * under raid56_wf_admit_narrow=1 leave the set.  NULL if the table is full.
+ */
+static struct btrfs_wib_entry *put_entry(struct btrfs_wib *wib, u64 bytenr, u64 bitmap,
+					 u64 sticky)
+{
+	struct btrfs_wib_entry *e = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES && !e; i++) {
+		if (wib->entries[i].bitmap | wib->entries[i].sticky)
+			continue;
+		e = &wib->entries[i];
+		memset(e, 0, sizeof(*e));
+		e->bytenr = bytenr;
+		e->bitmap = bitmap;
+		e->sticky = sticky;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return e;
+}
+
 static int test_range_mask(void)
 {
 	const u64 base = 3 * BTRFS_WIB_ENTRY_SIZE;
@@ -931,10 +967,11 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 straddling = 50 * BTRFS_WIB_ENTRY_SIZE + 63 * BTRFS_WIB_BLOCK_SIZE;
+	u64 flushes0;
 	int ret;
 
-	/* Fill every entry with a distinct region. */
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+	/* Fill every entry a write may take with a distinct region. */
+	for (u64 i = 0; i < admit_cap(); i++) {
 		ret = btrfs_wib_mark(fs_info, (i + 100) * BTRFS_WIB_ENTRY_SIZE,
 				     BTRFS_WIB_BLOCK_SIZE);
 		if (ret) {
@@ -1009,16 +1046,36 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	 */
 	btrfs_wib_done(fs_info, straddling, 2 * BTRFS_WIB_BLOCK_SIZE, false);
 	btrfs_wib_done(fs_info, 100 * BTRFS_WIB_ENTRY_SIZE + SZ_1M, BTRFS_WIB_BLOCK_SIZE, false);
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
+	for (u64 i = 0; i < admit_cap(); i++)
 		btrfs_wib_done(fs_info, (i + 100) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
+	/*
+	 * Dropped by a commit, then written and finished one after the other:
+	 * more regions than writes may hold at once, and as many as the block
+	 * lists.
+	 */
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		return ret;
+	for (u64 i = 0; block_nr_entries(wib->last) < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+		ret = btrfs_wib_mark(fs_info, (i + 400) * BTRFS_WIB_ENTRY_SIZE,
+				     BTRFS_WIB_BLOCK_SIZE);
+		if (ret) {
+			test_err("mark %llu filling the on-disk block failed: %d", i, ret);
+			return ret;
+		}
+		btrfs_wib_done(fs_info, (i + 400) * BTRFS_WIB_ENTRY_SIZE,
+			       BTRFS_WIB_BLOCK_SIZE, false);
+	}
+	flushes0 = atomic64_read(&wib->stat_commit_flushes);
 	ret = btrfs_wib_mark(fs_info, 0, BTRFS_WIB_BLOCK_SIZE);
 	if (ret) {
 		test_err("mark with a full on-disk block failed: %d", ret);
 		return ret;
 	}
 	if (block_nr_entries(wib->last) != 1 ||
-	    atomic64_read(&wib->stat_commit_flushes) == 0) {
+	    atomic64_read(&wib->stat_commit_flushes) == flushes0) {
 		test_err("mark-time commit did not drop finished stripes when the block was full (%u entries)",
 			 block_nr_entries(wib->last));
 		return -EINVAL;
@@ -1087,7 +1144,7 @@ static int test_sticky(struct btrfs_fs_info *fs_info)
 
 	/* Sticky entries are evicted when the log is full. */
 	btrfs_wib_add_sticky(fs_info, stripe, 3 * BTRFS_WIB_BLOCK_SIZE);
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+	for (u64 i = 0; i < admit_cap(); i++) {
 		ret = btrfs_wib_mark(fs_info, (i + 300) * BTRFS_WIB_ENTRY_SIZE,
 				     BTRFS_WIB_BLOCK_SIZE);
 		if (ret) {
@@ -1095,13 +1152,23 @@ static int test_sticky(struct btrfs_fs_info *fs_info)
 			return ret;
 		}
 	}
+	/*
+	 * Admitted against a wide block (wib_admit_max()), the writes count the
+	 * record as room without taking its slot; it goes once one of them fails
+	 * and names a member, which makes the block wide.
+	 */
+	if (!btrfs_wib_admits_narrow()) {
+		btrfs_wib_done(fs_info, 300 * BTRFS_WIB_ENTRY_SIZE, BTRFS_WIB_BLOCK_SIZE, true);
+		btrfs_wib_mark_stale(fs_info, 300 * BTRFS_WIB_ENTRY_SIZE, BTRFS_WIB_BLOCK_SIZE);
+	}
 	if (atomic64_read(&wib->stat_sticky_evicted) != 1) {
 		test_err("sticky entry not evicted");
 		return -EINVAL;
 	}
-	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
+	for (u64 i = 0; i < admit_cap(); i++)
 		btrfs_wib_done(fs_info, (i + 300) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
+	btrfs_wib_clear_sticky(fs_info, 300 * BTRFS_WIB_ENTRY_SIZE, BTRFS_WIB_BLOCK_SIZE);
 	btrfs_wib_commit_prepare(fs_info);
 	ret = btrfs_wib_commit(fs_info, true);
 	if (ret)
@@ -1536,6 +1603,187 @@ out:
 	return ret;
 }
 
+/*
+ * A write is admitted only while the set it leaves fits a wide block
+ * (wib_admit_max()): any write may fail and name a member, which makes every
+ * block wide, and with nothing left to spend no block could describe the set.
+ * Under raid56_wf_admit_narrow=1 the narrow layout's regions are admitted, and
+ * once they all fail and name a member the transaction commit cannot write the
+ * log: it fails (wib_commit_failed()), or under
+ * raid56_wf_commit_keeps_previous=1 keeps the previous block and goes on with
+ * the names in memory only.  A device replace's mark is refused where it
+ * would leave such a set (wib_names_fit_locked()), and made under
+ * raid56_wf_admit_narrow=1.
+ */
+static int test_admit_wide(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool narrow = btrfs_wib_admits_narrow();
+	const bool keeps = btrfs_wib_commit_keeps_previous();
+	const u64 failed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]);
+	const u32 want = narrow ? BTRFS_WIB_MAX_ENTRIES_V1 : BTRFS_WIB_MAX_ENTRIES;
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6000;
+	const u64 target = 6300ULL * BTRFS_WIB_ENTRY_SIZE;
+	u32 admitted = 0;
+	unsigned long flags;
+	bool marked;
+	int ret = -EINVAL;
+	int cret;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the admission test");
+		return 0;
+	}
+	/* Writes in flight into as many regions as are admitted. */
+	spin_lock_irqsave(&wib->lock, flags);
+	while (admitted < BTRFS_WIB_MAX_ENTRIES_V1 &&
+	       !btrfs_wib_try_mark(wib, (base + admitted) * BTRFS_WIB_ENTRY_SIZE, blk))
+		admitted++;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (admitted != want) {
+		test_err("%u regions admitted, expected %u", admitted, want);
+		goto out;
+	}
+	/* Every one of them fails on a device, which its record names. */
+	for (u32 i = 0; i < admitted; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, true);
+		btrfs_wib_mark_stale(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (!narrow) {
+		if (cret || block_nr_entries(wib->last) != admitted ||
+		    !(le64_to_cpu(((struct btrfs_wib_disk_header *)wib->last)->flags) &
+		      BTRFS_WIB_FLAG_STALE)) {
+			test_err("the names of every write admitted did not reach the block: commit %d, %u regions",
+				 cret, block_nr_entries(wib->last));
+			goto out;
+		}
+	} else if (keeps) {
+		if (cret ||
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]) != failed0) {
+			test_err("raid56_wf_commit_keeps_previous is set, yet the commit failed: %d",
+				 cret);
+			goto out;
+		}
+		test_msg("raid56_wf_admit_narrow and raid56_wf_commit_keeps_previous are set: %u names only in memory, the commit went on, as expected",
+			 admitted);
+	} else {
+		if (cret != -EIO ||
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]) != failed0 + 1) {
+			test_err("a commit that could not write %u names returned %d", admitted,
+				 cret);
+			goto out;
+		}
+		test_msg("raid56_wf_admit_narrow is set: %u names do not fit a block, and the commit failed, as expected",
+			 admitted);
+	}
+	for (u32 i = 0; i < admitted; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+
+	/*
+	 * A replace's mark on a set of as many writes in flight as a wide block
+	 * holds, which it would take past that.
+	 */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++)
+		put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0x1, 0);
+	put_entry(wib, target, 0, 0x1);
+	marked = btrfs_wib_replace_mark_stale(fs_info, target, true);
+	marked |= btrfs_wib_replace_mark_parity(fs_info, target, 0, true);
+	if (marked != narrow || (!narrow && btrfs_wib_any_stale(fs_info))) {
+		test_err("a replace's mark past what a block holds was %s",
+			 marked ? "made" : "refused");
+		goto out;
+	}
+	ret = 0;
+out:
+	btrfs_wib_replace_end(fs_info, false);
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	btrfs_wib_clear_sticky(fs_info, target, blk);
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (!ret && (cret || block_nr_entries(wib->last) != 0 || btrfs_wib_any_stale(fs_info))) {
+		test_err("log not empty after the admission test: commit %d, %u regions",
+			 cret, block_nr_entries(wib->last));
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
+ * A transaction commit that cannot write the log fails, so that the
+ * transaction aborts (wib_commit_failed()): here more regions name a member
+ * than a wide block describes -- no write is admitted into that
+ * (wib_admit_max()), a name racing an admission may leave it -- and going on
+ * would acknowledge names nothing on disk carries.  Under
+ * raid56_wf_commit_keeps_previous=1 the commit keeps the previous block and
+ * goes on, as it did.
+ */
+static int test_commit_fails_full(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool keeps = btrfs_wib_commit_keeps_previous();
+	const u64 failed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]);
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6400;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int cret;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the commit-full test");
+		return 0;
+	}
+	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++) {
+		struct btrfs_wib_entry *e = put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+						      0, 0x1);
+
+		if (!e) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+		spin_lock_irqsave(&wib->lock, flags);
+		e->stale = 0x1;
+		atomic_inc(&wib->nr_stale);
+		spin_unlock_irqrestore(&wib->lock, flags);
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (keeps) {
+		if (cret ||
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]) != failed0) {
+			test_err("raid56_wf_commit_keeps_previous is set, yet the commit returned %d",
+				 cret);
+			goto out;
+		}
+		test_msg("raid56_wf_commit_keeps_previous is set: the commit that could not write the log went on, as expected");
+	} else if (cret != -EIO ||
+		   atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]) != failed0 + 1) {
+		test_err("a commit that could not write the log returned %d", cret);
+		goto out;
+	}
+	if (block_error(wib->last, (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE)) {
+		test_err("a block the log cannot describe was written");
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (!ret && (cret || block_nr_entries(wib->last) != 0 || btrfs_wib_any_stale(fs_info))) {
+		test_err("log not empty after the commit-full test: commit %d, %u regions",
+			 cret, block_nr_entries(wib->last));
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
 /* Forget the repairs asked for so far: none runs here (see btrfs_test_raid56_wib()). */
 static void clear_repairs(struct btrfs_wib *wib)
 {
@@ -1549,8 +1797,10 @@ static void clear_repairs(struct btrfs_wib *wib)
  * failed flush that could not name the device leaves -- with every device
  * there.  No repair retires one and no write finishing does: the log spends
  * the vague records, and then keeps them, failing the write at once, until a
- * scrub retires them.  Stage 0 spent them last, with the alert
- * (raid56_wf_evict_stage0=1), which raid56_wf_torn_unevictable=1 narrows back.
+ * scrub retires them.  More of them than a wide block holds admit no write at
+ * all (wib_admit_max()), unless raid56_wf_admit_narrow=1.  Stage 0 spent them
+ * last, with the alert (raid56_wf_evict_stage0=1), which
+ * raid56_wf_torn_unevictable=1 narrows back.
  */
 static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 {
@@ -1589,6 +1839,20 @@ static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 
 	/* The vague record goes first. */
 	ret = btrfs_wib_mark(fs_info, fresh, BTRFS_WIB_BLOCK_SIZE);
+	if (keep && !btrfs_wib_admits_narrow()) {
+		/*
+		 * More records that may not be spent than a wide block holds: no
+		 * write is admitted (wib_admit_max()), and nothing is spent.
+		 */
+		if (ret != -EIO || !find_live_entry(wib, vague) ||
+		    atomic64_read(&wib->stat_sticky_evicted) != evicted0) {
+			test_err("a log holding %u possibly torn records admitted a write (%d) or spent a record",
+				 nr - 1, ret);
+			return -EINVAL;
+		}
+		test_msg("more possibly torn records than a wide block holds: no write admitted, nothing spent, as expected");
+		goto out;
+	}
 	if (ret) {
 		test_err("mark with a vague record to spend failed: %d", ret);
 		return ret;
@@ -1633,6 +1897,8 @@ static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 		test_msg("raid56_wf_evict_stage0 or raid56_evict_naming is set: a possibly torn record spent, with the alert, as expected");
 	}
 
+out:
+	btrfs_wib_clear_sticky(fs_info, vague, BTRFS_WIB_BLOCK_SIZE);
 	for (u32 i = 0; i < nr; i++)
 		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
 				       BTRFS_WIB_BLOCK_SIZE);
@@ -1669,7 +1935,8 @@ static void wib_done_later_fn(struct work_struct *work)
  * flight into a region the log holds a record of frees nothing, though: with
  * only that one, stage 0 (raid56_wf_evict_stage0=1) spent a record at once
  * rather than wait a minute for nothing.  Records that only say a write may
- * have been torn are not spent now, and that write waits its bound out.
+ * have been torn are not spent now, and more of them than a wide block holds
+ * admit no write (wib_admit_max()).
  */
 static int test_torn_waits_for_write(struct btrfs_fs_info *fs_info)
 {
@@ -1706,6 +1973,16 @@ static int test_torn_waits_for_write(struct btrfs_fs_info *fs_info)
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 	ret = btrfs_wib_mark(fs_info, flying, BTRFS_WIB_BLOCK_SIZE);
+	/* More that may not be spent than a wide block holds (wib_admit_max()). */
+	if (!btrfs_wib_admits_narrow() && !spendable && !btrfs_wib_evicts_naming()) {
+		if (ret != -EIO || atomic64_read(&wib->stat_sticky_evicted) != evicted0) {
+			test_err("a log holding %u possibly torn records admitted a write (%d) or spent a record",
+				 nr - 1, ret);
+			return -EINVAL;
+		}
+		test_msg("more possibly torn records than a wide block holds: no write admitted, as expected");
+		goto out;
+	}
 	if (ret) {
 		test_err("mark into the last free slot failed: %d", ret);
 		return ret;
@@ -1922,6 +2199,23 @@ static int readd_refused(struct btrfs_wib *wib, int ret, const char *what)
 }
 
 /*
+ * The same commit with raid56_wf_no_readd_name=1: the old readd took back what
+ * fitted, the union with the last block does not fit, and the commit fails
+ * rather than drop the rest -- raid56_wf_commit_keeps_previous=1 keeps the
+ * previous block and goes on, as it did.
+ */
+static int legacy_union_failed(int ret, const char *what)
+{
+	if (btrfs_wib_commit_keeps_previous())
+		return ret;
+	if (ret != -EIO) {
+		test_err("%s returned %d, expected -EIO", what, ret);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
  * A device that did not confirm a flush may have lost what it acknowledged,
  * and no later flush brings that back.  So the stripes the last block lists
  * must stay on disk until the in-memory set has taken them back -- not only
@@ -1974,10 +2268,9 @@ static int test_readd_keeps_records(struct btrfs_fs_info *fs_info)
 			test_err("mark %u failed: %d", i, ret);
 			goto out;
 		}
-	}
-	for (u32 i = 0; i < nr; i++)
 		btrfs_wib_done(fs_info, (done_base + i) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
+	}
 	if (block_nr_entries(wib->last) != nr) {
 		test_err("the log lists %u regions, expected %u",
 			 block_nr_entries(wib->last), nr);
@@ -1986,12 +2279,19 @@ static int test_readd_keeps_records(struct btrfs_fs_info *fs_info)
 	}
 	memcpy(saved, wib->last, BTRFS_WIB_SLOT_SIZE);
 
-	/* Writes in flight fill the set, with no commit of their own. */
+	/*
+	 * Writes in flight fill the set, with no commit of their own: as many
+	 * as are admitted, the rest put in as they were before
+	 * wib_admit_max().
+	 */
 	spin_lock_irqsave(&wib->lock, flags);
-	for (u32 i = 0; i < nr && !ret; i++)
+	for (u32 i = 0; i < min(nr, admit_cap()) && !ret; i++)
 		ret = btrfs_wib_try_mark(wib, (busy_base + i) * BTRFS_WIB_ENTRY_SIZE,
 					 BTRFS_WIB_BLOCK_SIZE);
 	spin_unlock_irqrestore(&wib->lock, flags);
+	for (u32 i = admit_cap(); i < nr && !ret; i++)
+		if (!put_entry(wib, (busy_base + i) * BTRFS_WIB_ENTRY_SIZE, 0x1, 0))
+			ret = -ENOSPC;
 	if (ret) {
 		test_err("in-flight mark failed: %d", ret);
 		goto out;
@@ -2002,6 +2302,8 @@ static int test_readd_keeps_records(struct btrfs_fs_info *fs_info)
 	ret = btrfs_wib_commit(fs_info, false);
 	if (!legacy)
 		ret = readd_refused(wib, ret, "the commit whose flush failed, the readd owed");
+	else
+		ret = legacy_union_failed(ret, "the commit whose flush failed");
 	if (ret)
 		goto out;
 	if (btrfs_wib_block_drops(saved, wib->last)) {
@@ -2164,11 +2466,15 @@ static int test_readd_wait_bounded(struct btrfs_fs_info *fs_info)
 		btrfs_wib_done(fs_info, (done_base + i) * BTRFS_WIB_ENTRY_SIZE,
 			       BTRFS_WIB_BLOCK_SIZE, false);
 	}
+	/* As many as are admitted, the rest as before wib_admit_max(). */
 	spin_lock_irqsave(&wib->lock, flags);
-	for (u32 i = 0; i < nr && !ret; i++)
+	for (u32 i = 0; i < min(nr, admit_cap()) && !ret; i++)
 		ret = btrfs_wib_try_mark(wib, (busy_base + i) * BTRFS_WIB_ENTRY_SIZE,
 					 BTRFS_WIB_BLOCK_SIZE);
 	spin_unlock_irqrestore(&wib->lock, flags);
+	for (u32 i = admit_cap(); i < nr && !ret; i++)
+		if (!put_entry(wib, (busy_base + i) * BTRFS_WIB_ENTRY_SIZE, 0x1, 0))
+			ret = -ENOSPC;
 	if (ret) {
 		test_err("in-flight mark failed: %d", ret);
 		return ret;
@@ -3050,7 +3356,9 @@ mark_failed:
  * it did).  From the set it leaves, the log has to go on working.  Planned
  * against the in-memory set alone, the readd named what fit in the wide
  * layout, owed the rest, and then could never write the union with the last
- * block again: every commit and every write failed until unmount.
+ * block again: every commit and every write failed until unmount.  Going on
+ * working includes refusing new writes while the records that may not be
+ * spent are more than a wide block holds (wib_admit_max()).
  */
 static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 {
@@ -3060,6 +3368,7 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 	const bool marks_off = btrfs_wib_all_records_torn();
 	const u64 first = 10;
 	const u64 nr = 100;
+	bool refused;
 	void *saved;
 	int ret;
 
@@ -3123,13 +3432,23 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 		}
 	}
 
-	/* And the log goes on: a new write, a repair's persist, a commit. */
+	/*
+	 * And the log goes on: a new write -- refused where the records that
+	 * may not be spent are more than a wide block holds (wib_admit_max()) --
+	 * a repair's persist, a commit.
+	 */
+	refused = !btrfs_wib_admits_narrow() && !legacy && !marks_off &&
+		  !btrfs_wib_evicts_naming() &&
+		  (btrfs_wib_torn_unevictable() || !btrfs_wib_evicts_stage0());
 	ret = btrfs_wib_mark(fs_info, readd_region(first + nr), READD_STRIPE_LEN);
-	if (ret) {
-		test_err("a new write after the failed flush failed to mark: %d", ret);
+	if (ret != (refused ? -EIO : 0)) {
+		test_err("a new write after the failed flush returned %d, expected %d", ret,
+			 refused ? -EIO : 0);
+		ret = -EINVAL;
 		goto out;
 	}
-	btrfs_wib_done(fs_info, readd_region(first + nr), READD_STRIPE_LEN, false);
+	if (!refused)
+		btrfs_wib_done(fs_info, readd_region(first + nr), READD_STRIPE_LEN, false);
 	ret = btrfs_wib_persist_now(fs_info);
 	if (ret) {
 		test_err("persist_now after the failed flush returned %d", ret);
@@ -3198,10 +3517,16 @@ static int readd_names_wait(struct readd_rig *rig, bool legacy)
 	if (ret)
 		goto out;
 	memcpy(saved, wib->last, BTRFS_WIB_SLOT_SIZE);
+	/* As many as are admitted, the rest as before wib_admit_max(). */
 	spin_lock_irqsave(&wib->lock, flags);
-	for (u64 k = busy; k < busy + nr_busy && !ret; k++)
+	for (u64 k = busy; k < busy + min_t(u64, nr_busy, admit_cap()) && !ret; k++)
 		ret = btrfs_wib_try_mark(wib, readd_region(k), READD_STRIPE_LEN);
 	spin_unlock_irqrestore(&wib->lock, flags);
+	for (u64 k = busy + admit_cap(); k < busy + nr_busy && !ret; k++)
+		if (!put_entry(wib, readd_region(k),
+			       btrfs_wib_range_mask(readd_region(k), readd_region(k),
+						    READD_STRIPE_LEN), 0))
+			ret = -ENOSPC;
 	if (ret) {
 		test_err("in-flight mark failed: %d", ret);
 		goto out;
@@ -3210,6 +3535,8 @@ static int readd_names_wait(struct readd_rig *rig, bool legacy)
 	ret = readd_commit_failed(rig);
 	if (!legacy)
 		ret = readd_refused(wib, ret, "the commit whose flush failed, the readd owed");
+	else
+		ret = legacy_union_failed(ret, "the commit whose flush failed");
 	if (ret)
 		goto out;
 	ret = -EINVAL;
@@ -3292,6 +3619,8 @@ static int readd_names_lose(struct readd_rig *rig, bool legacy)
 	ret = readd_commit_failed(rig);
 	if (!legacy)
 		ret = readd_refused(wib, ret, "the commit that could not keep every record");
+	else
+		ret = legacy_union_failed(ret, "the commit that could not keep every record");
 	if (ret)
 		return ret;
 	if (wib->readd_owed) {
@@ -3809,7 +4138,9 @@ static int test_replace_marks(struct btrfs_fs_info *fs_info)
  * them.  That is the write hole, reopened by an accounting mistake.
  *
  * So the live set is capped at what the current layout can express, and going
- * stale spends records to get back under it.
+ * stale spends records to get back under it.  A write is admitted only while
+ * the set fits a wide block (wib_admit_max()), but a failed flush's readd takes
+ * back what the last block lists, as many as a narrow block describes.
  */
 static int test_capacity_follows_layout(struct btrfs_fs_info *fs_info)
 {
@@ -3826,10 +4157,9 @@ static int test_capacity_follows_layout(struct btrfs_fs_info *fs_info)
 	if (!block)
 		return -ENOMEM;
 
-	/* Fill past the wide maximum with records nothing has named. */
+	/* Fill past the wide maximum with records nothing has named, as a readd does. */
 	for (u32 i = 0; i < narrow; i++)
-		btrfs_wib_add_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
-				     BTRFS_WIB_BLOCK_SIZE);
+		put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1);
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
 		if (wib->entries[i].bitmap | wib->entries[i].sticky)
 			live++;
@@ -3901,9 +4231,11 @@ out:
 /*
  * The mount's verdict on a possibly torn stripe it cannot decide
  * (btrfs_wib_mark_suspect_parity()) is a stale parity in memory and the
- * stripe's torn mark on disk: it does not halve the log.  More such stripes
- * than a wide block holds all stay listed, in a narrow block, as in flight.
- * A block something else makes wide carries the verdict too, and a parity mark
+ * stripe's torn mark on disk: it does not halve the log.  Such stripes stay
+ * listed in a narrow block, as in flight -- as many as a wide block holds, which
+ * is all a recovery keeps (wib_admit_max()), or more under
+ * raid56_wf_admit_narrow=1.  A block something else makes wide carries the
+ * verdict too, and a parity mark
  * any other writer sets is its own.  Under raid56_wf_suspect_as_stale=1, or a
  * knob that leaves no torn mark to fall back on, the verdict counts as stale
  * and a log with no device missing keeps what a wide block holds.
@@ -3914,7 +4246,9 @@ static int test_suspect_narrow(struct btrfs_fs_info *fs_info)
 	const bool widens = btrfs_wib_suspect_as_stale() ||
 			    btrfs_wib_torn_no_persist() ||
 			    btrfs_wib_all_records_torn();
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES + 4;
+	/* No more than a wide block holds is kept (wib_admit_max()), room for one more. */
+	const u32 nr = btrfs_wib_admits_narrow() ? BTRFS_WIB_MAX_ENTRIES + 4 :
+						   BTRFS_WIB_MAX_ENTRIES - 1;
 	const u64 base = 3200;
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	const u64 len = 3 * blk;
@@ -4130,13 +4464,17 @@ out:
  * Released with them, they became ordinary stale parities -- every block wide
  * at once, and a log holding more of them than a wide block describes could no
  * longer be written, with nothing to make it fit.  Under
- * raid56_wf_replace_end_clears_verdicts=1 the block does not build.
+ * raid56_wf_replace_end_clears_verdicts=1 no verdict is left, and the block
+ * does not build -- where the recovery kept more than a wide block holds,
+ * which only raid56_wf_admit_narrow=1 lets it.
  */
 static int test_suspect_replace_end(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	const bool clears = btrfs_wib_replace_end_clears_verdicts();
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES + 4;
+	/* Past what a wide block holds only when admitted against the narrow one. */
+	const bool over = btrfs_wib_admits_narrow();
+	const u32 nr = over ? BTRFS_WIB_MAX_ENTRIES + 4 : BTRFS_WIB_MAX_ENTRIES;
 	const u64 base = 3600;
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	const u64 len = 3 * blk;
@@ -4172,14 +4510,15 @@ static int test_suspect_replace_end(struct btrfs_fs_info *fs_info)
 	}
 	ret = btrfs_wib_build_block(wib, block, 1, NULL);
 	if (clears) {
-		if (ret != -ENOSPC || verdicts) {
+		/* No more than a wide block holds: they fit it all the same. */
+		if (ret != (over ? -ENOSPC : 0) || verdicts) {
 			test_err("raid56_wf_replace_end_clears_verdicts is set, yet %u verdicts are left and the block built with %d: the test is blind",
 				 verdicts, ret);
 			ret = -EINVAL;
 			goto out;
 		}
-		test_msg("raid56_wf_replace_end_clears_verdicts is set: no verdict left, %u regions do not fit a block, as expected",
-			 live);
+		test_msg("raid56_wf_replace_end_clears_verdicts is set: no verdict left, %u regions %s a block, as expected",
+			 live, over ? "do not fit" : "still fit");
 		ret = 0;
 		goto out;
 	}
@@ -5026,6 +5365,12 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_recovery_full(fs_info);
+	if (ret)
+		goto out;
+	ret = test_admit_wide(fs_info);
+	if (ret)
+		goto out;
+	ret = test_commit_fails_full(fs_info);
 	if (ret)
 		goto out;
 	ret = test_torn_spent_last(fs_info);

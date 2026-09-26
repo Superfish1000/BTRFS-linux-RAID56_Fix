@@ -49,6 +49,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_READ_UNRECOVERED, /* read refused: its parity may be torn, unchecked */
 	BTRFS_RAID56_EV_TORN_UNDECIDABLE, /* a torn stripe the recovery or a scrub cannot decide */
 	BTRFS_RAID56_EV_RECOVERY_FULL,	/* the mount's recovery could not keep a record */
+	BTRFS_RAID56_EV_COMMIT_FAILED,	/* a commit could not write the log: read-only */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -889,9 +890,11 @@ bool btrfs_wib_remount_ro_keeps_inflight(void);
 bool btrfs_wib_readd_disowns_all(void);
 bool btrfs_wib_readd_admits_busy(void);
 bool btrfs_wib_readd_acks_unnamed(void);
+bool btrfs_wib_commit_keeps_previous(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
+bool btrfs_wib_admits_narrow(void);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_wib_unrecovered_as_ambiguous(void);

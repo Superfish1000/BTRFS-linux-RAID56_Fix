@@ -16,9 +16,10 @@
 #     fixed    the verdicts stay: the writes into new regions that follow
 #              succeed, spending other records, and every row reads EIO
 #     control  raid56_wf_replace_end_clears_verdicts=1: the replace's end
-#              turns them into ordinary stale parities, the log no longer
-#              fits a block ("block full"), writes fail until records are
-#              spent, and the ones spent are the verdicts: rows read wrong
+#              turns them into ordinary stale parities and the log no longer
+#              fits a block: writes into new regions fail (wib_admit_max());
+#              before that, writes failed until records were spent, the ones
+#              spent were the verdicts, and rows read wrong ("block full")
 #   remount  a few writes make the log block wide (it carries the verdicts as
 #            stale parities), unmount, mount degraded again
 #     fixed    the reloaded verdicts are spent last: the writes into new

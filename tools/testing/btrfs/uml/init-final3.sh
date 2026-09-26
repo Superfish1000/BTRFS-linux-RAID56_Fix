@@ -2744,6 +2744,198 @@ flakey)
 	log "NO_CRASH"
 	finish
 	;;
+commit_full)
+	# K3: a log that lists more regions than a wide block describes, then a
+	# record that names a member, which makes every block wide.
+	#
+	# PHASE=prep: RAID5 data, RAID1C3 metadata, four devices.  A nodatacow
+	# file of 'A' is committed; then CF_REGIONS blocks, one per 4 MiB
+	# region, are overwritten in place with 'B' (O_DIRECT, no fsync, no
+	# commit): the log lists every one of them in flight, more than a wide
+	# block describes, and the machine stops without syncing.  CF_TARGET is
+	# a block in a region of its own, in a column on device OMITTED.
+	# PHASE=degraded: OMITTED left out, mounted rw,degraded.  Each listed
+	# stripe has a column there and may have been torn, so the recovery
+	# keeps every one of them (verdicts, torn marks: narrow records).
+	#   CONTROL=0: it keeps no more than a wide block holds
+	#     (wib_admit_max()): the read-write mount fails with
+	#     recovery_log_full, and nothing is written.
+	#   CONTROL=1 (raid56_wf_admit_narrow=1) and 2 (as well
+	#     raid56_wf_commit_keeps_previous=1): it keeps them all and mounts
+	#     read-write; 'C' is written into the target block (O_DIRECT, fsync):
+	#     its column is on the missing device, so the record names it, and
+	#     the set no longer fits any block.  1: the commit fails, read-only,
+	#     log_commit_failed, and the fsync reports it.  2: the commit keeps
+	#     the previous block and goes on: 'C' is acknowledged, its name only
+	#     in memory.
+	# PHASE=final: every device, rw.  The recovery rebuilds what the log on
+	# disk lists in flight from the data as it is on disk: the target block
+	# must read what was acknowledged ('C' where it was, else 'A' or 'C').
+	# PHASE=logio: see below.
+	watchdog ${WATCH:-1500}
+	CF_REGIONS=${CF_REGIONS:-100}
+	CF_STRIDE=$(( 23 * NOCOW_FS_BLOCKS ))
+	cf_knobs() {
+		[ "${CONTROL:-0}" -ge 1 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_admit_narrow 2>/dev/null ||
+				log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_admit_narrow=1"
+		}
+		[ "${CONTROL:-0}" = 2 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_commit_keeps_previous \
+				2>/dev/null || log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_commit_keeps_previous=1"
+		}
+	}
+	cf_blk() {	# file-block -> A | B | C | eio | other
+		if dd if=$MNT/nocow of=/tmp/blk.cf bs=4096 count=1 skip=$1 iflag=direct \
+		      status=none 2>/dev/null; then
+			for c in A B C; do
+				[ "$(tr -cd $c < /tmp/blk.cf | wc -c)" = 4096 ] &&
+					{ echo $c; return; }
+			done
+			echo other
+		else
+			echo eio
+		fi
+	}
+	cf_knobs
+	case "$PHASE" in
+	logio)
+		# PLAN=logio: a write goes through, its record on disk; then the
+		# log slots of three devices of four fail every IO, and nothing
+		# else does -- not the flushes, so the barriers of the transaction
+		# commit that drops the finished record succeed, and only its log
+		# block does not reach enough devices.  CONTROL=2: it goes on, as
+		# the lazy commit it was taken for.
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.cf
+		dd if=/tmp/cblock.cf of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w=ok || w=eio
+		for i in 0 1 2; do dm_bad_sectors $i $((512 * 1024)) $((516 * 1024)); done
+		log "the log slots of devices 0 1 2 fail every IO"
+		touch $MNT/marker
+		sync && c=ok || c=fail
+		btrfs filesystem sync $MNT >/dev/null 2>&1 || c=fail
+		ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		kmsg "failing the transaction commit|commit FAILED|lazy commit failed" 4
+		log "CF logio: write $w commit $c ro=$ro" \
+		    "log_write_failed=$(sed -n 's/^log_write_failed //p' $H)" \
+		    "log_commit_failed=$(sed -n 's/^log_commit_failed //p' $H)"
+		echo "$w $c $ro $(sed -n 's/^log_commit_failed //p' $H)" > $T/umltest/cf-logio.$TAG
+		for i in 0 1 2; do dm_heal $i; done
+		umount $MNT || log "UMOUNT_FAIL"
+		dmsetup remove_all 2>/dev/null
+		finish
+		;;
+	prep)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		mb=$(( (CF_REGIONS + 16) * CF_STRIDE * 4096 / 1048576 + 2 ))
+		dd if=/dev/zero bs=1M count=$mb status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 $CF_STRIDE \
+			$(( CF_REGIONS + 16 )) region > $T/umltest/cf.rows.$TAG 2>&1
+		# The target: past the fill and one row clear of it, its block in
+		# a column on OMITTED.
+		tgt=$(awk -v n=$CF_REGIONS -v o=$OMITTED '$1 > n && $3 >= 0 && NF > 5 {
+			split($(6 + $3), m, ":"); if (m[2] == o) { print $2; exit } }' \
+			$T/umltest/cf.rows.$TAG)
+		n=$(awk -v n=$CF_REGIONS '$1 < n && $3 >= 0' $T/umltest/cf.rows.$TAG | wc -l)
+		[ -n "$tgt" ] && [ "$n" = "$CF_REGIONS" ] || {
+			log "LAYOUT_FAIL target '$tgt', $n rows:" \
+			    "$(head -2 $T/umltest/cf.rows.$TAG | tr '\n' ' ')"
+			finish
+		}
+		echo $tgt > $T/umltest/cf.target.$TAG
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.cf
+		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		acked=0
+		for i in $(seq 0 $((CF_REGIONS - 1))); do
+			dd if=/tmp/bblock.cf of=$MNT/nocow bs=4096 seek=$((i * CF_STRIDE)) count=1 \
+			   oflag=direct conv=notrunc status=none 2>/dev/null && acked=$((acked + 1))
+		done
+		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		stats "after the overwrites"
+		log "CF_PREP overwrites=$acked of $CF_REGIONS target=$tgt" \
+		    "commits $commits0 -> $commits1"
+		echo "$acked $([ "$commits0" = "$commits1" ] && echo 0 || echo 1)" \
+			> $T/umltest/cf-prep.$TAG
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)" &&
+			log "KERNEL_SPLAT"
+		dmesg | grep -E "possible circular|lockdep" && log "KERNEL_SPLAT"
+		# The crash: no sync of the filesystem under test, only of the
+		# results on the host's.
+		sync -f $RES $T/umltest/cf-prep.$TAG $T/umltest/cf.target.$TAG
+		echo o > /proc/sysrq-trigger
+		sleep 60
+		;;
+	degraded)
+		tgt=$(cat $T/umltest/cf.target.$TAG)
+		refused=0; acked=-; ro=0
+		if ! mount -o $OPTS,degraded $MNTDEV $MNT; then
+			refused=1
+			log "CF_RW_REFUSED: the read-write mount failed"
+			kmsg "could not keep the record|recovery stopped" 2
+			do_mount ro,degraded $MNTDEV
+		fi
+		regs=$(dmesg | sed -n 's/.*valid blocks found, \([0-9]*\) regions.*/\1/p' | tail -1)
+		allow_nodatacow
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		kept=$(awk '$1 == "sticky_blocks" {print $2}' $W 2>/dev/null)
+		if [ $refused = 0 ]; then
+			dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.cf
+			dd if=/tmp/cblock.cf of=$MNT/nocow bs=4096 seek=$tgt count=1 oflag=direct \
+			   conv=notrunc,fsync status=none 2>/dev/null && acked=1 || acked=0
+			grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+		fi
+		stats
+		kmsg "block full|failing the transaction commit|commit FAILED|Transaction aborted" 6
+		log "CF degraded: listed=${regs:-?} kept_blocks=${kept:-?} refused=$refused" \
+		    "target_acked=$acked ro=$ro" \
+		    "log_commit_failed=$(sed -n 's/^log_commit_failed //p' $H)" \
+		    "recovery_log_full=$(sed -n 's/^recovery_log_full //p' $H)" \
+		    "unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
+		echo "${regs:-?} $refused $acked $ro $(sed -n 's/^log_commit_failed //p' $H)" \
+		     "$(sed -n 's/^recovery_log_full //p' $H)" > $T/umltest/cf-deg.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
+	final)
+		tgt=$(cat $T/umltest/cf.target.$TAG)
+		do_mount $OPTS $MNTDEV
+		echo 3 > /proc/sys/vm/drop_caches
+		got=$(cf_blk $tgt)
+		fills=""
+		for i in $(seq 0 $((CF_REGIONS - 1))); do
+			v=$(cf_blk $((i * CF_STRIDE)))
+			case $v in A|B) ;; *) fills="$fills $i:$v";; esac
+		done
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		log "CF final: target reads $got," \
+		    "overwritten blocks read neither A nor B:[${fills:- none}]" \
+		    "unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
+		echo "$got $(echo $fills | wc -w) $(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)" \
+		     > $T/umltest/cf-final.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
+	esac
+	;;
 degraded_log_full)
 	# A full write-intent log with a device missing: does it refuse rather
 	# than spend the records that name stale data?
@@ -4615,7 +4807,9 @@ flush_wedge)
 	#              each spends a possibly torn record at once (sticky_evicted,
 	#              record_dropped)
 	#   torn and busy run with raid56_wf_readd_acks_unnamed=1 in both arms:
-	#   the default leaves no such log, as unnamed shows.
+	#   the default leaves no such log, as unnamed shows.  busy runs with
+	#   raid56_wf_admit_narrow=1 in both arms as well: the default admits no
+	#   write into a log holding more such records than a wide block does.
 	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
@@ -4643,11 +4837,18 @@ flush_wedge)
 	done
 	# torn and busy check what a log full of records that only say a write
 	# may have been torn does: both arms let the readd that cannot name the
-	# device leave them, which unnamed shows the default refuses.
+	# device leave them, which unnamed shows the default refuses.  And busy
+	# checks the wait for the one slot a write in flight frees in a log that
+	# holds 164 of them: both arms admit writes against the narrow layout,
+	# which the default does not (commit_full) -- it refuses them all.
 	case "$PLAN" in torn|busy)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 	esac
+	[ "$PLAN" = busy ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_admit_narrow 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+	}
 	FW_FRESH=${FW_FRESH:-20}; FW_BUSY=${FW_BUSY:-8}
 	nrows=$((FW_REGIONS + FW_FRESH + 40))
 	[ "$PLAN" = busy ] && nrows=$((nrows + 4 * FW_BUSY + 8))

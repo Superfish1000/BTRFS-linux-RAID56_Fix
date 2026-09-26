@@ -36,7 +36,10 @@
 #     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
 #              each spends one at once (sticky_evicted, record_dropped)
 #   torn and busy set raid56_wf_readd_acks_unnamed=1 in both arms: the
-#   default refuses the commit that would leave such a log (unnamed).
+#   default refuses the commit that would leave such a log (unnamed).  busy
+#   sets raid56_wf_admit_narrow=1 in both arms too: the default admits no
+#   write into a log holding more of those records than a wide block
+#   describes, and refuses all eight (commit_full.sh).
 #   unnamed (CUR-4)  165 regions, as torn: too many to name device 1 in
 #     fixed    the commit whose barrier failed fails instead (read-only), with
 #              the log_flush_unnamed alert: the overwrites are never

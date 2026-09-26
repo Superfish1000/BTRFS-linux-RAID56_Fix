@@ -1,0 +1,205 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# K3: can a write-intent log end up holding more regions than a log block
+# describes, and does a transaction commit then acknowledge names that exist
+# only in memory?
+#
+#   commit_full.sh <kernel> [full|logio]
+#
+# See commit_full in init-final3.sh.  RAID5 data, RAID1C3 metadata, four
+# devices.  A crash leaves the log listing 100 regions in flight; mounted with
+# a device left out (default 2), the recovery keeps every one of them, as
+# verdicts and torn marks, which a narrow block describes.  Then a write into
+# a new region whose column is on the missing device: its record names that
+# column, which makes every block wide, and a wide block describes 82 regions.
+#   fixed    the recovery keeps no more than a wide block holds
+#            (wib_admit_max()): the read-write mount fails with
+#            recovery_log_full, nothing is written, nothing reads wrong
+#   r2       raid56_wf_admit_narrow=1: the mount goes read-write and the write
+#            is made, but the commit that would acknowledge it cannot write the
+#            log: it fails, read-only, with log_commit_failed, and the fsync
+#            reports it
+#   control  raid56_wf_admit_narrow=1 and raid56_wf_commit_keeps_previous=1:
+#            the commit keeps the previous block and goes on; the write is
+#            acknowledged with its name only in memory, and once every device
+#            is back the recovery rebuilds the parity from the column the name
+#            said was stale: the block reads back as it was before the write,
+#            with no error
+# INCONCLUSIVE unless the log listed more than 82 regions at the degraded
+# mount and the control acknowledged the write and read it back old.
+#
+# logio: the log block does not reach enough devices -- a write goes
+# through, then the log slots of three of the four fail every IO, nothing
+# else does (the barriers succeed); the transaction commit that drops the
+# finished write's record cannot write the log
+#   fixed    it fails, read-only, with log_commit_failed
+#   control  raid56_wf_commit_keeps_previous=1: taken for a failed lazy
+#            commit, it goes on
+set -u
+T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
+KERNEL=${1:?usage: commit_full.sh <kernel> [full|logio]}
+PLAN=${2:-full}
+case $PLAN in full|logio) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+OMIT=2
+NDEV=4
+HERE=$(cd "$(dirname "$0")" && pwd)
+mkdir -p $T/umltest
+# Copied under a temporary name and renamed: a guest may be reading it.
+cp $HERE/init-final3.sh $T/umltest/init-cf.sh.$$ && mv -f $T/umltest/init-cf.sh.$$ $T/umltest/init-cf.sh
+cp $HERE/raid56_rows.py $T/umltest/raid56_rows.py.$$ &&
+	mv -f $T/umltest/raid56_rows.py.$$ $T/umltest/raid56_rows.py
+ulimit -c 0
+arm() {	# name control
+	local tag=cf-$1 control=$2
+	local D=$T/umltest/$tag
+	rm -rf $D; mkdir -p $D
+	rm -f $T/umltest/cf-prep.$tag $T/umltest/cf-deg.$tag $T/umltest/cf-final.$tag \
+	      $T/umltest/cf.rows.$tag $T/umltest/cf.target.$tag $T/umltest/results.$tag
+	for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; done
+	boot() {	# phase omit opts
+		local ubds="" mnt="" d
+		for d in $(seq 0 $((NDEV-1))); do
+			[ "$d" = "$2" ] && continue
+			ubds="$ubds ubd$d=$D/disk$d.img"
+			[ -n "$mnt" ] || mnt=/dev/ubd$(echo abcdefgh | cut -c$((d + 1)))
+		done
+		# log_buf_len: the recovery's messages about 100 stripes would push
+		# out the count of regions the log listed.
+		timeout 1800 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw log_buf_len=4M \
+			init=$T/umltest/init-cf.sh $ubds quiet con=null con0=fd:0,fd:1 \
+			BTRFS_TEST_DIR=$T MODE=commit_full OPTS=$3 PROFILE=raid5:raid1c3 TAG=$tag \
+			NDEV=$NDEV CONTROL=$control MNTDEV=$mnt OMITTED=$OMIT PHASE=$1 \
+			< /dev/null > $D/log.$1 2>&1
+		echo "boot $1 rc=$?" >> $D/log.boots
+	}
+	# commit=600: no transaction commit drops the overwrites' records
+	# before the crash (the guest checks and says so).
+	boot prep none rw,commit=600
+	boot degraded $OMIT rw
+	boot final none rw
+	rm -f $D/disk*.img
+}
+if [ $PLAN = logio ]; then
+	for a in fixed:0 control:2; do
+		tag=cf-logio-${a%%:*}; D=$T/umltest/$tag
+		rm -rf $D; mkdir -p $D; rm -f $T/umltest/cf-logio.$tag $T/umltest/results.$tag
+		ubds=""
+		for i in $(seq 0 $((NDEV-1))); do
+			truncate -s 1G $D/disk$i.img; ubds="$ubds ubd$i=$D/disk$i.img"
+		done
+		timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+			init=$T/umltest/init-cf.sh $ubds quiet con=null con0=fd:0,fd:1 \
+			BTRFS_TEST_DIR=$T MODE=commit_full OPTS=rw,commit=600 PROFILE=raid5:raid1c3 \
+			TAG=$tag NDEV=$NDEV CONTROL=${a##*:} PHASE=logio < /dev/null > $D/log 2>&1
+		rm -f $D/disk*.img
+		grep -ahE "control:|CF |KERNEL_SPLAT|WATCHDOG|MOUNT_FAIL|MKFS_FAIL|KNOB_FAIL|DM_RELOAD" \
+			$D/log | cut -c1-300 | sed "s/^/  [${a%%:*}] /"
+	done
+	read -r fw fc fro flcf <<<"$(cat $T/umltest/cf-logio.cf-logio-fixed 2>/dev/null || echo '? ? ? ?')"
+	read -r cw cc cro clcf <<<"$(cat $T/umltest/cf-logio.cf-logio-control 2>/dev/null || echo '? ? ? ?')"
+	echo "  write: fixed $fw, control $cw; commit: fixed $fc (read-only $fro, log_commit_failed $flcf)," \
+	     "control $cc (read-only $cro, log_commit_failed $clcf)"
+	case "$fw$cw$fc$cc" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/cf-logio-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-logio-*/log &&
+		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
+	if [ "$fw" != ok ] || [ "$cw" != ok ]; then
+		echo "RESULT: INCONCLUSIVE -- the write before the fault failed (fixed $fw, control $cw)"
+		exit 2
+	fi
+	if [ "$cc" != ok ] || [ "$cro" != 0 ] ||
+	   ! grep -aq "lazy commit failed" $T/umltest/cf-logio-control/log; then
+		echo "RESULT: INCONCLUSIVE -- the control's commit did not meet the failing log slots"
+		echo "        and go on (commit $cc, read-only $cro)"
+		exit 2
+	fi
+	if [ "$fc" != fail ] || [ "$fro" != 1 ] || [ "${flcf:-0}" -lt 1 ]; then
+		echo "RESULT: FAIL -- the commit whose log block reached too few devices went on"
+		echo "        (commit $fc, read-only $fro, log_commit_failed $flcf)"
+		exit 1
+	fi
+	grep -aq "a transaction commit FAILED and the filesystem is now read-only" \
+		$T/umltest/cf-logio-fixed/log ||
+		{ echo "RESULT: FAIL -- no log_commit_failed explanation"; exit 1; }
+	echo "RESULT: PASS -- the commit whose log block reached too few devices failed, read-only,"
+	echo "        with log_commit_failed; control: it went on"
+	exit 0
+fi
+arm fixed 0
+arm r2 1
+arm control 2
+SHOW="control:|CF_|CF |KERNEL_SPLAT|WATCHDOG|MOUNT_FAIL|MKFS_FAIL|LAYOUT_FAIL|KNOB_FAIL"
+SHOW="$SHOW|block full|failing the transaction commit|could not keep the record"
+for a in fixed r2 control; do
+	grep -ahE "$SHOW" $T/umltest/cf-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
+done
+res() { cat $T/umltest/cf-$2.cf-$1 2>/dev/null || echo "? ? ? ? ? ?"; }
+read -r f_ov f_commit <<<"$(res fixed prep)"
+read -r r_ov r_commit <<<"$(res r2 prep)"
+read -r c_ov c_commit <<<"$(res control prep)"
+read -r f_regs f_ref f_ack f_ro f_lcf f_rlf <<<"$(res fixed deg)"
+read -r r_regs r_ref r_ack r_ro r_lcf r_rlf <<<"$(res r2 deg)"
+read -r c_regs c_ref c_ack c_ro c_lcf c_rlf <<<"$(res control deg)"
+read -r f_got f_bad _ <<<"$(res fixed final)"
+read -r r_got r_bad _ <<<"$(res r2 final)"
+read -r c_got c_bad _ <<<"$(res control final)"
+echo "  regions listed at the degraded mount: fixed $f_regs, r2 $r_regs, control $c_regs"
+echo "  degraded read-write mount refused: fixed $f_ref, r2 $r_ref, control $c_ref"
+echo "  target write acknowledged: r2 $r_ack, control $c_ack; read-only after it: r2 $r_ro," \
+     "control $c_ro; log_commit_failed r2 $r_lcf, control $c_lcf"
+echo "  target block once every device is back: fixed $f_got, r2 $r_got, control $c_got;" \
+     "overwritten blocks read neither A nor B: $f_bad/$r_bad/$c_bad"
+case "$f_ov$r_ov$c_ov$f_regs$r_regs$c_regs$f_got$r_got$c_got" in
+*'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
+esac
+grep -lq KERNEL_SPLAT $T/umltest/cf-*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+grep -lq WATCHDOG $T/umltest/cf-*/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-*/log.* && {
+	echo "RESULT: INCONCLUSIVE -- a raid56_wf_* knob is not there"
+	echo "        (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2
+}
+if [ "$f_commit$r_commit$c_commit" != 000 ]; then
+	echo "RESULT: INCONCLUSIVE -- a transaction commit ran during the overwrites"; exit 2
+fi
+for n in $f_regs $r_regs $c_regs; do
+	[ "$n" -gt 82 ] || {
+		echo "RESULT: INCONCLUSIVE -- the log listed $n regions at a degraded mount, no more"
+		echo "        than a wide block describes (82)"; exit 2
+	}
+done
+if [ "$c_ref" != 0 ] || [ "$c_ack" != 1 ] || [ "$c_got" = C ]; then
+	echo "RESULT: INCONCLUSIVE -- the control did not mount read-write, acknowledge the write"
+	echo "        and read it back old (refused $c_ref, acknowledged $c_ack, reads $c_got):"
+	echo "        it did not reproduce K3"
+	exit 2
+fi
+bad=0
+for v in $f_bad $r_bad; do [ "$v" = 0 ] || bad=1; done
+[ $bad = 0 ] || { echo "RESULT: FAIL -- overwritten blocks read neither A nor B"; exit 1; }
+# The read-only mount after the refused one counts from zero: the refused
+# mount's alert is in its kernel log.
+if [ "$f_ref" != 1 ] ||
+   ! grep -aq "could not keep the record of full stripe" $T/umltest/cf-fixed/log.degraded; then
+	echo "RESULT: FAIL -- with more regions to keep than a wide block holds, the degraded"
+	echo "        read-write mount was not refused with recovery_log_full (refused $f_ref)"
+	exit 1
+fi
+case $f_got in A) ;; *) echo "RESULT: FAIL -- fixed: the target block reads $f_got, not A"; exit 1;; esac
+if [ "$r_ref" != 0 ]; then
+	echo "RESULT: INCONCLUSIVE -- r2: the degraded read-write mount was refused under"
+	echo "        raid56_wf_admit_narrow=1, so no commit met the full log"
+	exit 2
+fi
+if [ "$r_ack" != 0 ] || [ "$r_ro" != 1 ] || [ "${r_lcf:-0}" -lt 1 ]; then
+	echo "RESULT: FAIL -- r2: the commit that could not write the log did not fail it"
+	echo "        (acknowledged $r_ack, read-only $r_ro, log_commit_failed $r_lcf)"
+	exit 1
+fi
+grep -aq "a transaction commit FAILED and the filesystem is now read-only" \
+	$T/umltest/cf-r2/log.degraded ||
+	{ echo "RESULT: FAIL -- r2: no log_commit_failed explanation"; exit 1; }
+case $r_got in A|C) ;; *) echo "RESULT: FAIL -- r2: the target block reads $r_got"; exit 1;; esac
+echo "RESULT: PASS -- with $f_regs regions listed, the degraded read-write mount was refused"
+echo "        (recovery_log_full) and nothing read wrong; admitted as before, the commit that"
+echo "        could not write the name failed, read-only, log_commit_failed, fsync EIO;"
+echo "        control: acknowledged with the name only in memory, read back $c_got (K3)"
