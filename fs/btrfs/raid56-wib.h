@@ -51,6 +51,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_READ_UNRECOVERED, /* read refused: its parity may be torn, unchecked */
 	BTRFS_RAID56_EV_TORN_UNDECIDABLE, /* a torn stripe the recovery or a scrub cannot decide */
 	BTRFS_RAID56_EV_SCRUB_UNCOMMITTED, /* a scrub left a stripe newer than its tree */
+	BTRFS_RAID56_EV_FLUSH_UNLOGGED,	/* a failed flush left full stripe writes unnamed */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -491,6 +492,44 @@ struct btrfs_wib_written {
  */
 #define BTRFS_WIB_WRITTEN_SLOTS		(2 * BTRFS_WIB_NR_ENTRIES)
 
+/*
+ * In memory only.  The members of the blocks of region @bytenr, as struct
+ * btrfs_wib_written has them, that a full stripe written copy-on-write went
+ * to since the device holding each last confirmed a cache flush.  The log
+ * records no such write (rmw_rbio() in raid56.c): nothing references its
+ * extent before the transaction commit that follows it, whose barrier is
+ * what makes it durable.  A device that fails that barrier, or any flush
+ * before it, may have lost the write from its cache, and then only these say
+ * which member reads back old (wib_unlogged_name()).  @busy: such writes into
+ * the region issued and not completed yet; @epoch: @unlogged_epoch in struct
+ * btrfs_wib at the last one's issue or completion.  A flush every device
+ * confirmed forgets the region once its last write completed before the
+ * flush was issued (wib_unlogged_flushed()).  Protected by wib->lock.
+ */
+struct btrfs_wib_unlogged {
+	u64 bytenr;
+	u64 cols;
+	u64 par;
+	u64 epoch;
+	u32 busy;
+};
+
+/*
+ * Rows of unlogged records: a failed flush names a member in each region, and
+ * a block that names anything describes no more regions than this.
+ */
+#define BTRFS_WIB_UNLOGGED_SLOTS	BTRFS_WIB_NR_ENTRIES
+
+/*
+ * Under commit_mutex: what wib_unlogged_name() works out for the blocks @bits
+ * of region @bytenr.
+ */
+struct btrfs_wib_unlogged_names {
+	u64 bytenr;
+	u64 bits;
+	struct btrfs_wib_names names;
+};
+
 /* A region's in-flight bits in a snapshot block, see wib_load_snapbits(). */
 struct btrfs_wib_bits {
 	u64 bytenr;
@@ -691,6 +730,36 @@ struct btrfs_wib {
 	struct btrfs_wib_written *written;
 	bool written_unknown;
 	/*
+	 * BTRFS_WIB_UNLOGGED_SLOTS of them, see struct btrfs_wib_unlogged, and
+	 * @unlogged_names the scratch a failed flush names them from.  A write
+	 * into a region none has room for, or issued while the log is not
+	 * enabled, is counted in @unlogged_lost until it completes, and
+	 * @unlogged_lost_epoch is the epoch of the last such issue or
+	 * completion.  Each sets @unlogged_unknown: the log cannot say what a
+	 * failed flush lost of them, until a flush every device confirmed is
+	 * issued after all of them have completed.  @unlogged_epoch counts the
+	 * snapshots a flush is issued after, @prepared_epoch is the one
+	 * btrfs_wib_commit_prepare() took.  Under @lock.
+	 */
+	struct btrfs_wib_unlogged *unlogged;
+	struct btrfs_wib_unlogged_names *unlogged_names;
+	u64 unlogged_epoch;
+	u64 prepared_epoch;
+	u64 unlogged_lost_epoch;
+	u32 unlogged_lost;
+	bool unlogged_unknown;
+	/*
+	 * A failed flush left members of full stripes written copy-on-write
+	 * that the log could not name: it did not know them all
+	 * (@unlogged_unknown), or had no room for the names.  A commit that
+	 * went on would reference data the device may have lost, with nothing
+	 * saying which copy is stale, so every commit fails from here on: the
+	 * transaction aborts and the filesystem goes read-only (the
+	 * full_stripe_flush_unnamed alert).  For the mount; set under
+	 * @commit_mutex.
+	 */
+	bool unlogged_refused;
+	/*
 	 * Under @commit_mutex: the in-flight bits of the snapshot a flush was
 	 * issued after, sorted by region (wib_load_snapbits()), and how many.
 	 * BTRFS_WIB_NR_ENTRIES of them, allocated with the log.
@@ -842,6 +911,7 @@ bool btrfs_wib_evicts_naming(void);
 bool btrfs_wib_keeps_naming_degraded(void);
 bool btrfs_wib_readd_legacy(void);
 bool btrfs_wib_name_unwritten(void);
+bool btrfs_wib_full_stripe_unnamed(void);
 bool btrfs_wib_all_records_torn(void);
 bool btrfs_wib_torn_no_persist(void);
 bool btrfs_wib_log_unmarked(void);
@@ -912,6 +982,10 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_note_written(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
 			    int nr_data, u64 cols, u32 par, bool logged);
 void btrfs_wib_note_written_data(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+u64 btrfs_wib_note_full_stripe(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			       int nr_data, u64 cols, u32 par);
+void btrfs_wib_full_stripe_done(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+				int nr_data, u64 noted);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);

@@ -2285,6 +2285,214 @@ void btrfs_wib_note_written_data(struct btrfs_fs_info *fs_info, u64 logical, u64
 		btrfs_wib_note_written(fs_info, cur, 1, 0x1, 0, false);
 }
 
+/*
+ * Testing only: a failed flush names nothing of the full stripes written
+ * copy-on-write since the device last confirmed one, and never fails a commit
+ * for them (struct btrfs_wib_unlogged), as before the log kept track of those
+ * writes: the column the device lost reads back as it was, with no error.  The
+ * negative control for uml/fullstripe_flush.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool full_stripe_unnamed;
+module_param_named(raid56_wf_full_stripe_unnamed, full_stripe_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_full_stripe_unnamed,
+		 "Let a failed flush name nothing of the full stripes written copy-on-write since the device last confirmed one, and let the commit go on (testing only: restores a known defect)");
+#else
+static const bool full_stripe_unnamed;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_full_stripe_unnamed(void)
+{
+	return READ_ONCE(full_stripe_unnamed);
+}
+#endif
+
+static bool wib_unlogged_used(const struct btrfs_wib_unlogged *u)
+{
+	return u->busy || u->cols || u->par;
+}
+
+/* The unlogged record of region @bytenr, or NULL.  Caller holds wib->lock. */
+static struct btrfs_wib_unlogged *wib_unlogged_find(struct btrfs_wib *wib, u64 bytenr)
+{
+	lockdep_assert_held(&wib->lock);
+
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		struct btrfs_wib_unlogged *u = &wib->unlogged[i];
+
+		if (wib_unlogged_used(u) && u->bytenr == bytenr)
+			return u;
+	}
+	return NULL;
+}
+
+/* The unlogged record of region @bytenr, or a free one for it, or NULL. */
+static struct btrfs_wib_unlogged *wib_unlogged_get(struct btrfs_wib *wib, u64 bytenr)
+{
+	struct btrfs_wib_unlogged *free = NULL;
+
+	lockdep_assert_held(&wib->lock);
+
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		struct btrfs_wib_unlogged *u = &wib->unlogged[i];
+
+		if (!wib_unlogged_used(u)) {
+			if (!free)
+				free = u;
+			continue;
+		}
+		if (u->bytenr == bytenr)
+			return u;
+	}
+	if (free)
+		free->bytenr = bytenr;
+	return free;
+}
+
+/*
+ * A full stripe written copy-on-write is about to issue its bios without FUA,
+ * to the data columns in @cols and the parities in @par as for
+ * btrfs_wib_note_written(): keep them until a flush every device confirmed
+ * covers them (struct btrfs_wib_unlogged).  A region with no record to spare,
+ * and every region while the log is not enabled, is counted instead, and a
+ * failed flush then knows it cannot say what it lost (@unlogged_unknown).
+ * Return what btrfs_wib_full_stripe_done() is to be given once the bios have
+ * completed: bit i for the i-th region of the stripe, if its record counts the
+ * write.
+ */
+u64 btrfs_wib_note_full_stripe(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			       int nr_data, u64 cols, u32 par)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 end = full_stripe_start + ((u64)nr_data << BTRFS_WIB_BLOCK_SHIFT);
+	unsigned long flags;
+	u64 noted = 0;
+	int i = 0;
+
+	if (!wib)
+		return 0;
+
+	/* Parity p is addressed as the block of the stripe's start plus p. */
+	cols &= nr_data < 64 ? BIT_ULL(nr_data) - 1 : U64_MAX;
+	par &= 0x3;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u64 cur = wib_entry_bytenr(full_stripe_start); cur < end;
+	     cur += BTRFS_WIB_ENTRY_SIZE, i++) {
+		struct btrfs_wib_unlogged *u = NULL;
+		u64 c = cols;
+		u32 p = par;
+
+		/* A column past the 64th has no bit to be named by. */
+		if (wib->enabled && nr_data <= 64)
+			u = wib_unlogged_get(wib, cur);
+		if (!u) {
+			wib->unlogged_unknown = true;
+			wib->unlogged_lost++;
+			wib->unlogged_lost_epoch = wib->unlogged_epoch;
+			continue;
+		}
+		u->busy++;
+		u->epoch = wib->unlogged_epoch;
+		noted |= BIT_ULL(i);
+		while (c | p) {
+			const bool data = c != 0;
+			const int k = data ? __ffs64(c) : __ffs(p);
+			const u64 logical = full_stripe_start + ((u64)k << BTRFS_WIB_BLOCK_SHIFT);
+			const u64 bit = BIT_ULL((logical - cur) >> BTRFS_WIB_BLOCK_SHIFT);
+
+			if (data)
+				c &= ~BIT_ULL(k);
+			else
+				p &= ~BIT(k);
+			if (wib_entry_bytenr(logical) != cur)
+				continue;
+			if (data)
+				u->cols |= bit;
+			else
+				u->par |= bit;
+		}
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return noted;
+}
+
+/*
+ * The bios btrfs_wib_note_full_stripe() was told of have completed, retries
+ * included; @noted is what it returned.
+ */
+void btrfs_wib_full_stripe_done(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+				int nr_data, u64 noted)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 end = full_stripe_start + ((u64)nr_data << BTRFS_WIB_BLOCK_SHIFT);
+	unsigned long flags;
+	int i = 0;
+
+	if (!wib)
+		return;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u64 cur = wib_entry_bytenr(full_stripe_start); cur < end;
+	     cur += BTRFS_WIB_ENTRY_SIZE, i++) {
+		struct btrfs_wib_unlogged *u;
+
+		if (i < 64 && (noted & BIT_ULL(i))) {
+			/* A record something is busy in stays. */
+			u = wib_unlogged_find(wib, cur);
+			if (u && u->busy) {
+				u->busy--;
+				u->epoch = wib->unlogged_epoch;
+			}
+			continue;
+		}
+		if (wib->unlogged_lost)
+			wib->unlogged_lost--;
+		wib->unlogged_lost_epoch = wib->unlogged_epoch;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
+ * A flush is about to be issued.  What it makes durable, if every device
+ * confirms it, is every write that completed before now: return the epoch that
+ * says so to wib_unlogged_flushed().
+ */
+static u64 wib_unlogged_snap(struct btrfs_wib *wib)
+{
+	unsigned long flags;
+	u64 epoch;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	epoch = ++wib->unlogged_epoch;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return epoch;
+}
+
+/*
+ * Every device confirmed a flush issued after the snapshot of @epoch: a region
+ * whose writes had all completed by then is on stable media, forget it; one
+ * with a write since keeps what it has.  So do the writes no record kept.
+ */
+static void wib_unlogged_flushed(struct btrfs_wib *wib, u64 epoch)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		struct btrfs_wib_unlogged *u = &wib->unlogged[i];
+
+		if (!u->busy && u->epoch < epoch) {
+			u->cols = 0;
+			u->par = 0;
+		}
+	}
+	if (!wib->unlogged_lost && wib->unlogged_lost_epoch < epoch)
+		wib->unlogged_unknown = false;
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
 static int wib_bits_cmp(const void *a, const void *b)
 {
 	const struct btrfs_wib_bits *ba = a;
@@ -2389,22 +2597,78 @@ static void wib_written_reset_locked(struct btrfs_wib *wib)
 }
 
 /*
- * Which blocks of each entry of wib->last lie on a device in @failed, into
- * wib->readd_names[]: @stale where the block's data column is on one, and
- * @stale_par where the block is the p-th of its full stripe and parity p is on
- * one -- bit (b + p), the way the record addresses a parity.  Every block of
- * an entry belongs to exactly one full stripe, so both are a property of the
- * block alone and never spill into the next entry.
+ * Which of the blocks @bits of region @bytenr lie on a device in @failed, into
+ * @names: @stale where the block's data column is on one, and @stale_par where
+ * the block is the p-th of its full stripe and parity p is on one -- bit
+ * (b + p), the way the record addresses a parity.  Every block of a region
+ * belongs to exactly one full stripe, so both are a property of the block
+ * alone and never spill into the next region.
  *
  * The columns rotate by one device per full stripe, as btrfs_map_block() lays
  * them out: column c of the r-th full stripe of a chunk is on
  * map->stripes[(c + r) % num_stripes], the data columns first, then P and Q.
  *
  * Outside wib->lock, a spinlock held with interrupts off, and under
- * memalloc_nofs_save(), since this runs inside a transaction commit.
+ * memalloc_nofs_save(), since this runs inside a transaction commit.  @mapp
+ * carries the chunk map from one call to the next; the caller frees it.  A
+ * block whose chunk has gone is not named: nothing reads it through a record
+ * any more.
+ */
+static void wib_name_region(struct btrfs_fs_info *fs_info, struct btrfs_chunk_map **mapp,
+			    u64 bytenr, u64 bits,
+			    const struct btrfs_wib_flush_failed *failed,
+			    struct btrfs_wib_names *names)
+{
+	struct btrfs_chunk_map *map = *mapp;
+
+	while (bits) {
+		const int j = __ffs64(bits);
+		const u64 logical = bytenr + ((u64)j << BTRFS_WIB_BLOCK_SHIFT);
+		const struct btrfs_device *dev;
+		u32 stripe_nr, nr_data, rot, col;
+
+		bits &= bits - 1;
+		if (map && (logical < map->start ||
+			    logical >= map->start + map->chunk_len)) {
+			btrfs_free_chunk_map(map);
+			map = NULL;
+		}
+		if (!map) {
+			map = btrfs_find_chunk_map(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+			if (!map)
+				continue;
+		}
+		if (!(map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) || logical < map->start)
+			continue;
+		nr_data = nr_data_stripes(map);
+		stripe_nr = (logical - map->start) >> BTRFS_STRIPE_LEN_SHIFT;
+		rot = stripe_nr / nr_data;
+		col = stripe_nr % nr_data;
+
+		rcu_read_lock();
+		dev = map->stripes[(col + rot) % map->num_stripes].dev;
+		if (wib_flush_failed_dev(failed, dev)) {
+			names->stale |= BIT_ULL(j);
+			if (test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state))
+				names->absent |= BIT_ULL(j);
+		}
+		if (col < map->num_stripes - nr_data) {
+			dev = map->stripes[(nr_data + col + rot) % map->num_stripes].dev;
+			if (wib_flush_failed_dev(failed, dev)) {
+				names->stale_par |= BIT_ULL(j);
+				if (test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state))
+					names->absent |= BIT_ULL(j);
+			}
+		}
+		rcu_read_unlock();
+	}
+	*mapp = map;
+}
+
+/*
+ * wib_name_region() for each entry of wib->last, into wib->readd_names[].
  * wib->last is stable meanwhile: it only changes under commit_mutex, which the
- * caller holds.  A block whose chunk has gone is not named: nothing reads it
- * through this record any more.
+ * caller holds.
  */
 static void wib_name_devices(struct btrfs_wib *wib,
 			     const struct btrfs_wib_flush_failed *failed)
@@ -2424,53 +2688,11 @@ static void wib_name_devices(struct btrfs_wib *wib,
 
 	nofs_flag = memalloc_nofs_save();
 	for (u32 i = 0; i < onr; i++) {
-		struct btrfs_wib_names *names = &wib->readd_names[i];
 		struct btrfs_wib_entry old;
-		u64 bits;
 
 		btrfs_wib_read_entry(wib->last, i, &old);
-		bits = wib_entry_bits(&old);
-		while (bits) {
-			const int j = __ffs64(bits);
-			const u64 logical = old.bytenr + ((u64)j << BTRFS_WIB_BLOCK_SHIFT);
-			const struct btrfs_device *dev;
-			u32 stripe_nr, nr_data, rot, col;
-
-			bits &= bits - 1;
-			if (map && (logical < map->start ||
-				    logical >= map->start + map->chunk_len)) {
-				btrfs_free_chunk_map(map);
-				map = NULL;
-			}
-			if (!map) {
-				map = btrfs_find_chunk_map(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
-				if (!map)
-					continue;
-			}
-			if (!(map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) || logical < map->start)
-				continue;
-			nr_data = nr_data_stripes(map);
-			stripe_nr = (logical - map->start) >> BTRFS_STRIPE_LEN_SHIFT;
-			rot = stripe_nr / nr_data;
-			col = stripe_nr % nr_data;
-
-			rcu_read_lock();
-			dev = map->stripes[(col + rot) % map->num_stripes].dev;
-			if (wib_flush_failed_dev(failed, dev)) {
-				names->stale |= BIT_ULL(j);
-				if (test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state))
-					names->absent |= BIT_ULL(j);
-			}
-			if (col < map->num_stripes - nr_data) {
-				dev = map->stripes[(nr_data + col + rot) % map->num_stripes].dev;
-				if (wib_flush_failed_dev(failed, dev)) {
-					names->stale_par |= BIT_ULL(j);
-					if (test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state))
-						names->absent |= BIT_ULL(j);
-				}
-			}
-			rcu_read_unlock();
-		}
+		wib_name_region(fs_info, &map, old.bytenr, wib_entry_bits(&old), failed,
+				&wib->readd_names[i]);
 	}
 	if (map)
 		btrfs_free_chunk_map(map);
@@ -2704,6 +2926,49 @@ static void wib_readd_names(struct btrfs_wib *wib, u32 i, u64 bytenr, bool preci
 }
 
 /*
+ * Ask for a repair of the full stripe of each block @bits of region @bytenr,
+ * once for a run of blocks of the same stripe (@prev), and say in @first the
+ * first one asked for.  Outside wib->lock, under memalloc_nofs_save(); @mapp
+ * as for wib_name_region().
+ */
+static void wib_queue_repairs_region(struct btrfs_fs_info *fs_info,
+				     struct btrfs_chunk_map **mapp, u64 bytenr, u64 bits,
+				     u64 *prev, u64 *first)
+{
+	struct btrfs_chunk_map *map = *mapp;
+
+	while (bits) {
+		const u64 logical = bytenr + ((u64)__ffs64(bits) << BTRFS_WIB_BLOCK_SHIFT);
+		u64 full_stripe_len;
+		u64 start;
+
+		bits &= bits - 1;
+		if (map && (logical < map->start ||
+			    logical >= map->start + map->chunk_len)) {
+			btrfs_free_chunk_map(map);
+			map = NULL;
+		}
+		if (!map) {
+			map = btrfs_find_chunk_map(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+			if (!map)
+				continue;
+		}
+		if (!(map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) || logical < map->start)
+			continue;
+		full_stripe_len = (u64)nr_data_stripes(map) << BTRFS_STRIPE_LEN_SHIFT;
+		start = map->start + div64_u64(logical - map->start, full_stripe_len) *
+				     full_stripe_len;
+		if (start == *prev)
+			continue;
+		*prev = start;
+		if (!*first)
+			*first = start;
+		btrfs_raid56_queue_repair(fs_info, start, 0);
+	}
+	*mapp = map;
+}
+
+/*
  * Ask for a repair of every full stripe the readd just named a member of on a
  * device that is there (@repair in struct btrfs_wib_names).  A record naming a
  * member is not spent while every device is there (wib_may_evict_naming()),
@@ -2727,41 +2992,13 @@ static u64 wib_readd_queue_repairs(struct btrfs_wib *wib, u32 onr)
 
 	nofs_flag = memalloc_nofs_save();
 	for (u32 i = 0; i < onr; i++) {
-		u64 bits = wib->readd_names[i].repair;
 		struct btrfs_wib_entry old;
 
-		if (!bits)
+		if (!wib->readd_names[i].repair)
 			continue;
 		btrfs_wib_read_entry(wib->last, i, &old);
-		while (bits) {
-			const u64 logical = old.bytenr +
-					    ((u64)__ffs64(bits) << BTRFS_WIB_BLOCK_SHIFT);
-			u64 full_stripe_len;
-			u64 start;
-
-			bits &= bits - 1;
-			if (map && (logical < map->start ||
-				    logical >= map->start + map->chunk_len)) {
-				btrfs_free_chunk_map(map);
-				map = NULL;
-			}
-			if (!map) {
-				map = btrfs_find_chunk_map(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
-				if (!map)
-					continue;
-			}
-			if (!(map->type & BTRFS_BLOCK_GROUP_RAID56_MASK) || logical < map->start)
-				continue;
-			full_stripe_len = (u64)nr_data_stripes(map) << BTRFS_STRIPE_LEN_SHIFT;
-			start = map->start + div64_u64(logical - map->start, full_stripe_len) *
-					     full_stripe_len;
-			if (start == prev)
-				continue;
-			prev = start;
-			if (!first)
-				first = start;
-			btrfs_raid56_queue_repair(fs_info, start, 0);
-		}
+		wib_queue_repairs_region(fs_info, &map, old.bytenr, wib->readd_names[i].repair,
+					 &prev, &first);
 	}
 	if (map)
 		btrfs_free_chunk_map(map);
@@ -3243,6 +3480,177 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 }
 
 /*
+ * A flush failed on the devices in @failed, and wib_readd_dropped() has taken
+ * back what the log records.  A full stripe written copy-on-write since such a
+ * device last confirmed a flush may have lost its member there too, and
+ * nothing on disk says so: the log does not record those writes, and the
+ * transaction commit that references their extents goes on as long as the
+ * barrier failures are within what the filesystem tolerates.  Name those
+ * members, as the readd names what the log records (struct
+ * btrfs_wib_unlogged): a read rebuilds such a member from the parity the other
+ * devices flushed, and the repair asked for here puts it back.  A region whose
+ * writes had all completed before the snapshot of @epoch (0: the flush was not
+ * timed) is on stable media on every other device: forget the rest of it.
+ *
+ * All or nothing.  Where the log did not keep track of every such write
+ * (@unlogged_unknown), or the block written next cannot describe the names
+ * besides everything else it lists, no name is put on and every commit fails
+ * from here on (@unlogged_refused): the transaction that would reference what
+ * the device lost aborts, and the filesystem goes read-only, rather than
+ * acknowledge it with nothing saying which copy is stale.  commit_mutex held.
+ */
+static void wib_unlogged_name(struct btrfs_wib *wib,
+			      const struct btrfs_wib_flush_failed *failed, u64 epoch)
+{
+	struct btrfs_fs_info *fs_info = wib->fs_info;
+	struct btrfs_wib_unlogged_names *un = wib->unlogged_names;
+	const struct btrfs_wib_disk_header *oh = wib->last;
+	struct btrfs_chunk_map *map = NULL;
+	unsigned int nr_named = 0;
+	unsigned int nofs_flag;
+	unsigned long flags;
+	bool unknown;
+	bool refuse;
+	bool any = false;
+	bool was;
+	u64 first = 0;
+	u64 prev = 0;
+	u32 nr_new = 0;
+	u32 onr = 0;
+	u32 nr = 0;
+	u32 live;
+
+	lockdep_assert_held(&wib->commit_mutex);
+
+	if (READ_ONCE(full_stripe_unnamed) || !wib_flush_failed_any(failed))
+		return;
+	if (le64_to_cpu(oh->magic) == BTRFS_WIB_MAGIC)
+		onr = min(le32_to_cpu(oh->nr_entries), wib_block_max_entries(wib->last));
+
+	/* The regions, then their names: the chunk map is not walked under the lock. */
+	spin_lock_irqsave(&wib->lock, flags);
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		const struct btrfs_wib_unlogged *u = &wib->unlogged[i];
+
+		if (!(u->cols | u->par))
+			continue;
+		memset(&un[nr], 0, sizeof(un[nr]));
+		un[nr].bytenr = u->bytenr;
+		un[nr++].bits = u->cols | u->par;
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	nofs_flag = memalloc_nofs_save();
+	for (u32 i = 0; i < nr; i++)
+		wib_name_region(fs_info, &map, un[i].bytenr, un[i].bits, failed, &un[i].names);
+	memalloc_nofs_restore(nofs_flag);
+
+	spin_lock_irqsave(&wib->lock, flags);
+	was = wib->unlogged_refused;
+	unknown = wib->unlogged_unknown;
+	/*
+	 * The block written next lists the set and every region of the last
+	 * block, and a name makes it the wide layout.
+	 */
+	live = wib_live_count(wib);
+	for (u32 i = 0; i < onr; i++) {
+		struct btrfs_wib_entry old;
+
+		btrfs_wib_read_entry(wib->last, i, &old);
+		if (!wib_find_entry(wib, old.bytenr))
+			live++;
+	}
+	for (u32 i = 0; i < nr; i++) {
+		const struct btrfs_wib_unlogged *u = wib_unlogged_find(wib, un[i].bytenr);
+
+		if (!u || !((u->cols & un[i].names.stale) | (u->par & un[i].names.stale_par)))
+			continue;
+		any = true;
+		if (!wib_find_entry(wib, un[i].bytenr))
+			nr_new++;
+	}
+	refuse = unknown || (any && live + nr_new > BTRFS_WIB_MAX_ENTRIES);
+
+	for (u32 i = 0; !refuse && i < nr; i++) {
+		struct btrfs_wib_names *names = &un[i].names;
+		struct btrfs_wib_unlogged *u = wib_unlogged_find(wib, un[i].bytenr);
+		struct btrfs_wib_entry *e;
+		u64 nstale, npar, stale;
+
+		if (!u)
+			continue;
+		nstale = u->cols & names->stale;
+		npar = u->par & names->stale_par;
+		/* A member named needs its record no more, see wib_readd_dropped(). */
+		if (!u->busy && u->epoch < epoch) {
+			u->cols = 0;
+			u->par = 0;
+		} else {
+			u->cols &= ~nstale;
+			u->par &= ~npar;
+		}
+		if (!(nstale | npar))
+			continue;
+		e = wib_find_or_alloc_entry(wib, un[i].bytenr, false);
+		if (!e) {
+			/* Counted above: not reached. */
+			refuse = true;
+			break;
+		}
+		e->sticky |= nstale | npar;
+		/* Its own completion must not clear what the name says (@hold). */
+		if (u->busy) {
+			e->hold |= nstale;
+			e->hold_par |= npar;
+		}
+		wib_replace_disown(e, nstale, npar);
+		stale = nstale & ~e->stale;
+		e->stale |= stale;
+		atomic_add(hweight64(stale), &wib->nr_stale);
+		wib_set_stale_par(wib, e, e->stale_par | npar);
+		e->gen = max(e->gen, fs_info->generation);
+		names->repair = (nstale | npar) & ~names->absent;
+		nr_named += hweight64(nstale) + hweight64(npar);
+	}
+	if (refuse)
+		WRITE_ONCE(wib->unlogged_refused, true);
+	spin_unlock_irqrestore(&wib->lock, flags);
+
+	if (nr_named) {
+		nofs_flag = memalloc_nofs_save();
+		for (u32 i = 0; i < nr; i++)
+			if (un[i].names.repair)
+				wib_queue_repairs_region(fs_info, &map, un[i].bytenr,
+							 un[i].names.repair, &prev, &first);
+		memalloc_nofs_restore(nofs_flag);
+		raid56_alert_failed(fs_info, BTRFS_RAID56_EV_STALE, first, failed);
+	}
+	if (map)
+		btrfs_free_chunk_map(map);
+	/* Latched: someone has to look, and acknowledge. */
+	if (refuse && !was)
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_FLUSH_UNLOGGED, 0, NULL, 0);
+	if (btrfs_is_testing(fs_info))
+		return;
+	if (nr_named) {
+		char who[64];
+
+		wib_flush_failed_describe(failed, who, sizeof(who));
+		btrfs_warn_rl(fs_info,
+	"raid56 write-intent log: %s did not confirm a flush after full stripes were written copy-on-write, which the log does not record: marking %u of their columns or parities stale",
+			      who, nr_named);
+	}
+	if (refuse && !was) {
+		char who[64];
+
+		wib_flush_failed_describe(failed, who, sizeof(who));
+		btrfs_err(fs_info,
+	"raid56 write-intent log: %s did not confirm a flush after full stripes were written copy-on-write, and the log cannot name it in them (%s): no commit goes on from here, the filesystem goes read-only rather than acknowledge writes that device may have lost",
+			  who, unknown ? "it did not keep track of every such write" :
+					 "no room for the names");
+	}
+}
+
+/*
  * A transaction commit is between its snapshot and its barriers (or past
  * them), and a block is about to be written: add the current set to the
  * snapshot.  Uses wib->block as scratch.  commit_mutex must be held.
@@ -3378,11 +3786,12 @@ static const void *wib_readd_base(struct btrfs_wib *wib)
  *
  * @timed: the flush was issued after @snapshot was taken, so what it made
  * durable can be told from it (struct btrfs_wib_written).  Not so for a
- * snapshot taken without one before it (btrfs_wib_commit()).
+ * snapshot taken without one before it (btrfs_wib_commit()).  @epoch is
+ * wib_unlogged_snap() at @snapshot, for the writes the log does not record.
  */
 static int wib_drop_locked(struct btrfs_wib *wib, u64 seq, const void *snapshot,
 			   bool flushed, const struct btrfs_wib_flush_failed *failed,
-			   bool force, bool timed)
+			   bool force, bool timed, u64 epoch)
 {
 	unsigned long flags;
 	int ret;
@@ -3391,10 +3800,16 @@ static int wib_drop_locked(struct btrfs_wib *wib, u64 seq, const void *snapshot,
 
 	if (!flushed || wib->readd_owed) {
 		wib_readd_dropped(wib, flushed ? NULL : failed, timed ? snapshot : NULL);
+		if (!flushed)
+			wib_unlogged_name(wib, failed, timed ? epoch : 0);
+		else if (timed)
+			wib_unlogged_flushed(wib, epoch);
 		return wib_write_block_locked(wib, seq, wib_readd_base(wib), force);
 	}
-	if (timed)
+	if (timed) {
 		wib_written_flushed(wib, snapshot);
+		wib_unlogged_flushed(wib, epoch);
+	}
 	ret = wib_write_block_locked(wib, seq, snapshot, force);
 	/*
 	 * Nothing listed any more, so every write noted or not has been
@@ -3422,6 +3837,7 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 	lockdep_assert_held(&wib->commit_mutex);
 
 	for (int i = 0; i < 3 && ret == -ENOSPC; i++) {
+		const u64 epoch = wib_unlogged_snap(wib);
 		int flush;
 
 		/*
@@ -3455,7 +3871,7 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 			return ret;
 		flush = wib_flush_all_devices(wib, &wib->flush_failed);
 		ret = wib_drop_locked(wib, seq, wib->flushsnap, flush == 0,
-				      &wib->flush_failed, force, flush >= 0);
+				      &wib->flush_failed, force, flush >= 0, epoch);
 	}
 	return ret;
 }
@@ -5481,6 +5897,7 @@ void btrfs_wib_commit_prepare(struct btrfs_fs_info *fs_info)
 	if (!wib)
 		return;
 	mutex_lock(&wib->commit_mutex);
+	wib->prepared_epoch = wib_unlogged_snap(wib);
 	ret = btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
 	ASSERT(ret == 0);
 	wib->prepared_valid = true;
@@ -5532,11 +5949,12 @@ int btrfs_wib_persist_now(struct btrfs_fs_info *fs_info)
 	else
 		ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
 	if (ret == 0) {
+		const u64 epoch = wib_unlogged_snap(wib);
 		const int flush = wib_flush_all_devices(wib, &wib->flush_failed);
 
 		if (flush == 0) {
 			ret = wib_drop_locked(wib, seq, wib->flushsnap, true, NULL, true,
-					      true);
+					      true, epoch);
 		} else {
 			/*
 			 * Nothing is written, but only this flush knows which
@@ -5547,6 +5965,7 @@ int btrfs_wib_persist_now(struct btrfs_fs_info *fs_info)
 			if (!READ_ONCE(readd_legacy))
 				wib_readd_dropped(wib, &wib->flush_failed,
 						  flush > 0 ? wib->flushsnap : NULL);
+			wib_unlogged_name(wib, &wib->flush_failed, flush > 0 ? epoch : 0);
 			ret = -EIO;
 		}
 	}
@@ -5716,6 +6135,8 @@ static int wib_write_final_locked(struct btrfs_wib *wib, bool flushed)
 			wib_barrier_failed(wib->fs_info, &wib->flush_failed);
 			wib_readd_dropped(wib, &wib->flush_failed,
 					  wib->prepared_valid ? wib->prepared : NULL);
+			wib_unlogged_name(wib, &wib->flush_failed,
+					  wib->prepared_valid ? wib->prepared_epoch : 0);
 		}
 		spin_lock_irqsave(&wib->lock, flags);
 		wib->written_unknown = true;
@@ -5728,6 +6149,20 @@ static int wib_write_final_locked(struct btrfs_wib *wib, bool flushed)
 	wib_written_reset_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return ret;
+}
+
+/*
+ * A commit after a failed flush the log could not name full stripe writes in
+ * (@unlogged_refused in struct btrfs_wib): it would reference what the device
+ * may have lost.  The caller aborts the transaction; the
+ * full_stripe_flush_unnamed alert says why.
+ */
+static int wib_unlogged_refused(struct btrfs_fs_info *fs_info)
+{
+	if (!btrfs_is_testing(fs_info))
+		btrfs_err_rl(fs_info,
+	"raid56 write-intent log: failing the transaction commit: a device did not confirm a flush after full stripes were written copy-on-write and the log cannot name what it may have lost, see the full_stripe_flush_unnamed alert");
+	return -EIO;
 }
 
 /*
@@ -5751,6 +6186,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 
 	if (!wib)
 		return 0;
+	if (READ_ONCE(wib->unlogged_refused))
+		return wib_unlogged_refused(fs_info);
 
 	spin_lock_irqsave(&wib->lock, flags);
 	enabled = wib->enabled;
@@ -5778,6 +6215,9 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		spin_unlock_irqrestore(&wib->lock, flags);
 		if (ret)
 			return ret;
+		/* Its flush failed after full stripe writes it could not name. */
+		if (READ_ONCE(wib->unlogged_refused))
+			return wib_unlogged_refused(fs_info);
 		/*
 		 * A disable that arrived while the log was being written out
 		 * already cleared the flag from the in-memory superblock.
@@ -5817,6 +6257,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	"raid56 write-intent log: could not write the final log block, the next mount will scrub the stripes the previous one listed");
 			if (!btrfs_is_testing(fs_info))
 				btrfs_info(fs_info, "raid56 write-intent log disabled");
+			if (READ_ONCE(wib->unlogged_refused))
+				return wib_unlogged_refused(fs_info);
 			return 0;
 		}
 		wib->disable_armed = !flag_written;
@@ -5841,8 +6283,10 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	}
 	wib->prepared_valid = false;
 	ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed, false,
-			      timed);
+			      timed, wib->prepared_epoch);
 	mutex_unlock(&wib->commit_mutex);
+	if (READ_ONCE(wib->unlogged_refused))
+		return wib_unlogged_refused(fs_info);
 	if (ret == -ENOSPC) {
 		/*
 		 * Not even the union fits; the devices keep their current
@@ -6064,6 +6508,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_READ_UNRECOVERED] = "read_unrecovered",
 	[BTRFS_RAID56_EV_TORN_UNDECIDABLE] = "torn_undecidable",
 	[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED] = "scrub_uncommitted",
+	[BTRFS_RAID56_EV_FLUSH_UNLOGGED] = "full_stripe_flush_unnamed",
 };
 
 /*
@@ -6072,9 +6517,10 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
  * write that failed before it reached a disk, a record the log had to drop,
  * a read refused because the parities disagree, a device that failed a
  * flush and could not be named in the records it left (the records retire;
- * the name never existed), a replace failed because the log dropped one of
- * its records, or because it could not make one.  Ending the episode on "no
- * record" would turn the
+ * the name never existed) or in the full stripe writes the log does not
+ * record, a replace failed because the log dropped one of its records, or
+ * because it could not make one.  Ending the episode on "no record" would
+ * turn the
  * state back to ok the moment it went failing -- no poll() wake-up and no
  * uevent anyone could see.  They hold it failing until someone acknowledges
  * them: btrfs_raid56_health_ack().
@@ -6084,7 +6530,8 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 					 BIT(BTRFS_RAID56_EV_READ_PARITY) |	\
 					 BIT(BTRFS_RAID56_EV_LOG_UNFLUSHED) |	\
 					 BIT(BTRFS_RAID56_EV_REPLACE_DROPPED) |	\
-					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED))
+					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED) |	\
+					 BIT(BTRFS_RAID56_EV_FLUSH_UNLOGGED))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -6252,6 +6699,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 	case BTRFS_RAID56_EV_LOG_UNFLUSHED:
 		btrfs_err(fs_info,
 "raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log has more of those stripes than it can hold while naming that device in them. It keeps them recorded, but not which device is stale: data without checksums there may read back an older version, with no error, and a scrub cannot tell which side to trust. Find the device (btrfs device stats <mountpoint>: flush_io_errs), fix or replace it ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+			  fsid);
+		break;
+	case BTRFS_RAID56_EV_FLUSH_UNLOGGED:
+		btrfs_err(fs_info,
+"raid56: a device did not confirm a cache flush after full stripes were written copy-on-write, so data it acknowledged may never have reached its disk, and the write-intent log, which does not record such writes, cannot name that device in them: it lost track of some of them, or has no room for the names. Rather than commit a transaction that references data the device may have lost with nothing saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only: what was written since the last commit is not kept, and until the unmount data without checksums written since then may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs), unmount, fix it or pull it and mount again (-o degraded if you pulled it); replace it if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_UNRECOVERED:
@@ -6564,7 +7016,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu full stripes a scrub left to the next one; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu full stripes a scrub left to the next one, %llu failed flushes the log could not name full stripe writes in; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -6584,6 +7036,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_READ_UNRECOVERED],
 			   pending[BTRFS_RAID56_EV_TORN_UNDECIDABLE],
 			   pending[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED],
+			   pending[BTRFS_RAID56_EV_FLUSH_UNLOGGED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
@@ -6813,8 +7266,12 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	wib->written = kcalloc(BTRFS_WIB_WRITTEN_SLOTS, sizeof(*wib->written), GFP_KERNEL);
 	wib->snapbits = kcalloc(BTRFS_WIB_NR_ENTRIES, sizeof(*wib->snapbits), GFP_KERNEL);
 	wib->readd_last = kcalloc(BTRFS_WIB_NR_ENTRIES, sizeof(*wib->readd_last), GFP_KERNEL);
+	wib->unlogged = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged), GFP_KERNEL);
+	wib->unlogged_names = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged_names),
+				      GFP_KERNEL);
 	if (!wib->block || !wib->last || !wib->prepared || !wib->flushsnap ||
-	    !wib->readd_base || !wib->written || !wib->snapbits || !wib->readd_last) {
+	    !wib->readd_base || !wib->written || !wib->snapbits || !wib->readd_last ||
+	    !wib->unlogged || !wib->unlogged_names) {
 		free_page((unsigned long)wib->block);
 		free_page((unsigned long)wib->last);
 		free_page((unsigned long)wib->prepared);
@@ -6823,6 +7280,8 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 		kfree(wib->written);
 		kfree(wib->snapbits);
 		kfree(wib->readd_last);
+		kfree(wib->unlogged);
+		kfree(wib->unlogged_names);
 		kfree(wib);
 		return -ENOMEM;
 	}
@@ -6870,6 +7329,8 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 	kfree(wib->written);
 	kfree(wib->snapbits);
 	kfree(wib->readd_last);
+	kfree(wib->unlogged);
+	kfree(wib->unlogged_names);
 	kvfree(wib->pending);
 	kvfree(wib->pending_taken);
 	kfree(wib);

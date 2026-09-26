@@ -4650,9 +4650,13 @@ static const bool persist_fail_keeps_clear;
  * rmw_assemble_write_bios() picks them, whether or not its device is there to
  * take it; and every parity.  Phase A's write-backs are not among them: they
  * go with FUA, and no flush can take them back.
+ *
+ * A write the log does not record (@logged false: a full stripe written
+ * copy-on-write) is kept track of apart (btrfs_wib_note_full_stripe()) until
+ * rmw_rbio() says its bios have completed: return what that needs.
  */
-static void rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
-			     bool logged)
+static u64 rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
+			    bool logged)
 {
 	u64 cols = 0;
 	int sectornr;
@@ -4670,6 +4674,11 @@ static void rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 	btrfs_wib_note_written(rbio->bioc->fs_info, full_stripe_start, rbio->nr_data,
 			       cols, GENMASK(rbio->real_stripes - rbio->nr_data - 1, 0),
 			       logged);
+	if (logged)
+		return 0;
+	return btrfs_wib_note_full_stripe(rbio->bioc->fs_info, full_stripe_start,
+					  rbio->nr_data, cols,
+					  GENMASK(rbio->real_stripes - rbio->nr_data - 1, 0));
 }
 
 static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
@@ -4821,6 +4830,8 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	struct bio_list bio_list;
 	bool logged = false;
 	bool faulted = false;
+	/* What btrfs_wib_full_stripe_done() needs, see rmw_note_written(). */
+	u64 unlogged = 0;
 	/* Refused, and already reported as such. */
 	bool refused = false;
 	/* The data and parity were submitted: the record can be updated. */
@@ -4934,6 +4945,13 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 * these writes have completed and been flushed.  In-place writes
 	 * (nodatacow, prealloc) overwrite referenced sectors and are recorded
 	 * even when they cover the full stripe.
+	 *
+	 * That commit goes on with a device that failed its flush, though, as
+	 * long as the failures are within the tolerance, and that device may
+	 * have lost these writes from its cache: they are kept track of until
+	 * a flush every device confirmed covers them (rmw_note_written()), so
+	 * that a failed one can name what it may have lost, or fail the
+	 * commit where it cannot.
 	 */
 	if (!rbio_is_full(rbio) || test_bit(RBIO_INPLACE_BIT, &rbio->flags)) {
 		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
@@ -5005,7 +5023,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	/* We should have at least one bio assembled. */
 	ASSERT(bio_list_size(&bio_list));
 	phase_b = true;
-	rmw_note_written(rbio, full_stripe_start, logged);
+	unlogged = rmw_note_written(rbio, full_stripe_start, logged);
 	submit_write_bios(rbio, &bio_list);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
 
@@ -5020,6 +5038,9 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 * its redundancy, so it is worth one retry before accepting it.
 	 */
 	rmw_retry_failed_sectors(rbio);
+	if (!logged)
+		btrfs_wib_full_stripe_done(fs_info, full_stripe_start, rbio->nr_data,
+					   unlogged);
 
 	/* We may have more errors than our tolerance during the read. */
 	for (sectornr = 0; sectornr < rbio->stripe_nsectors; sectornr++) {
