@@ -1358,6 +1358,8 @@ static int btrfs_remount_rw(struct btrfs_fs_info *fs_info)
 
 static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
 {
+	int ret;
+
 	/*
 	 * This also happens on 'umount -rf' or on shutdown, when the
 	 * filesystem is busy.
@@ -1416,7 +1418,16 @@ static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
 	 */
 	btrfs_qgroup_wait_for_completion(fs_info, false);
 
-	return btrfs_commit_super(fs_info);
+	ret = btrfs_commit_super(fs_info);
+	if (ret)
+		return ret;
+	/*
+	 * Committed: have the RAID56 write-intent log stop listing in flight
+	 * the writes that finished, as close_ctree() does -- nothing writes
+	 * it again before a crash or a read-write mount reads it.
+	 */
+	btrfs_wib_remount_ro(fs_info);
+	return 0;
 }
 
 static void btrfs_ctx_to_info(struct btrfs_fs_info *fs_info, struct btrfs_fs_context *ctx)

@@ -90,6 +90,12 @@ struct btrfs_bio {
 	 */
 	bool is_scrub:1;
 
+	/*
+	 * A scrub read of sectors no extent holds: a RAID5/6 device replace
+	 * rebuilding the free sectors of a column.  See RBIO_READS_FREE_BIT.
+	 */
+	bool scrub_reads_free:1;
+
 	/* Whether the bio is coming from copy_remapped_data_io(). */
 	bool is_remap:1;
 

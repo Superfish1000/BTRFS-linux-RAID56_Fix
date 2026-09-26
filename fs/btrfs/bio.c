@@ -123,6 +123,7 @@ static struct btrfs_bio *btrfs_split_bio(struct btrfs_fs_info *fs_info,
 	bbio->csum_search_commit_root = orig_bbio->csum_search_commit_root;
 	bbio->can_use_append = orig_bbio->can_use_append;
 	bbio->is_scrub = orig_bbio->is_scrub;
+	bbio->scrub_reads_free = orig_bbio->scrub_reads_free;
 	bbio->is_remap = orig_bbio->is_remap;
 	bbio->async_csum = orig_bbio->async_csum;
 
@@ -1193,6 +1194,9 @@ int btrfs_repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 fileoff,
 		goto out_counter_dec;
 	}
 
+	/* Into the device's cache: a failed flush may take it (raid56-wib.c). */
+	if (btrfs_logical_is_raid56(fs_info, logical))
+		btrfs_wib_note_written_data(fs_info, logical, length);
 	bio = bio_alloc(smap.dev->bdev, nr_steps, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
 	bio->bi_iter.bi_sector = smap.physical >> SECTOR_SHIFT;
 	for (int i = 0; i < nr_steps; i++) {
@@ -1245,6 +1249,9 @@ void btrfs_submit_repair_write(struct btrfs_bio *bbio, int mirror_num, bool dev_
 	if (dev_replace) {
 		ASSERT(smap.dev == fs_info->dev_replace.srcdev);
 		smap.dev = fs_info->dev_replace.tgtdev;
+	} else if (btrfs_logical_is_raid56(fs_info, logical)) {
+		/* Into the device's cache: a failed flush may take it (raid56-wib.c). */
+		btrfs_wib_note_written_data(fs_info, logical, length);
 	}
 	btrfs_submit_bio(&bbio->bio, NULL, &smap, mirror_num);
 	return;

@@ -42,6 +42,12 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_LOG_WRITE,	/* write failed: the log could not be written */
 	BTRFS_RAID56_EV_REPAIR_DROPPED,	/* the repair queue was full: no automatic repair */
 	BTRFS_RAID56_EV_READ_PARITY,	/* read refused: the RAID6 parities disagree */
+	BTRFS_RAID56_EV_LOG_UNFLUSHED,	/* a failed flush left more to name than the log holds */
+	BTRFS_RAID56_EV_REPLACE_LOST,	/* a replace could neither copy nor rebuild a sector */
+	BTRFS_RAID56_EV_REPLACE_DROPPED, /* a full log dropped a replace's record: it fails */
+	BTRFS_RAID56_EV_REPLACE_ABORTED, /* a replace could not record what it lost: it fails */
+	BTRFS_RAID56_EV_READ_UNRECOVERED, /* read refused: its parity may be torn, unchecked */
+	BTRFS_RAID56_EV_TORN_UNDECIDABLE, /* a torn stripe the recovery or a scrub cannot decide */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -221,6 +227,25 @@ struct btrfs_wib_disk_header {
 #define BTRFS_WIB_FLAG_STALE		(1ULL << 0)
 #define BTRFS_WIB_FLAGS_SUPPORTED	BTRFS_WIB_FLAG_STALE
 
+/*
+ * The last eight bytes of a slot.  They lie past the entries of either layout
+ * (165 narrow ones leave 8 bytes, 82 wide ones 32) and inside the checksum.  A
+ * block whose writer marks the records that may hide a torn write (@torn in
+ * struct btrfs_wib_entry) carries BTRFS_WIB_TORN_MARKING there; one that does
+ * not may list such a write as a plain error record, and btrfs_wib_load()
+ * reads every error record of it as possibly torn.
+ *
+ * Not a header flag, nor a reserved field: btrfs_wib_block_valid() refuses
+ * both when it does not know them, in every kernel that has the log, and a
+ * refused log is one whose stripes are never recovered.  The kernels from
+ * before the mark zero the whole slot when they build a block and never look
+ * at these bytes, so they neither write the marker nor refuse a block that
+ * has it.
+ */
+#define BTRFS_WIB_TRAILER_OFFSET	(BTRFS_WIB_SLOT_SIZE - sizeof(__le64))
+/* "TORNMARK" in little endian. */
+#define BTRFS_WIB_TORN_MARKING		0x4b52414d4e524f54ULL
+
 /* In-memory entry, mirrors the on-disk one. */
 struct btrfs_wib_entry {
 	u64 bytenr;
@@ -273,6 +298,121 @@ struct btrfs_wib_entry {
 	u64 stale_par;
 	/* See @gen in the on-disk entry. */
 	u64 gen;
+	/*
+	 * In memory only.  The @stale (@hold) and @stale_par (@hold_par) bits
+	 * a failed flush named while the block had a write in flight
+	 * (wib_readd_dropped()).  That write may have landed part of itself
+	 * on the device before the flush failed, into the cache the device
+	 * then lost, and when it completes it clears the marks of every
+	 * column and parity it wrote (rmw_update_stale_data(),
+	 * rmw_update_stale_parity()) -- the very marks that say it may not
+	 * be there.  So those clears leave these bits alone.  A later write
+	 * of the stripe starts after the failed flush and releases them
+	 * (btrfs_wib_try_mark()); so does a write-back with FUA, which no
+	 * lost cache can take away (btrfs_wib_clear_stale(@durable)).
+	 */
+	u64 hold;
+	u64 hold_par;
+	/*
+	 * In memory only.  The @stale (@replace_stale) and @stale_par
+	 * (@replace_stale_par) bits a running device replace set for the
+	 * zeros it put on its target where it could neither copy nor rebuild
+	 * (btrfs_wib_replace_mark_stale(), btrfs_wib_replace_mark_parity()),
+	 * and that nothing else has set since.  They describe the target only,
+	 * which nothing reads until the replace finishes: until then the
+	 * queries leave them out (btrfs_wib_stale(), btrfs_wib_stripe_state()),
+	 * so the source goes on serving the column as it did.  A finished
+	 * replace hands them over as ordinary marks, an aborted one drops them
+	 * with its target (btrfs_wib_replace_end()).  Any other writer of the
+	 * same bit takes it over (wib_replace_disown()): that mark is about the
+	 * source too, and must be neither hidden nor dropped.
+	 */
+	u64 replace_stale;
+	u64 replace_stale_par;
+	/*
+	 * In memory only.  Every @stale (@replace_keep) and @stale_par
+	 * (@replace_keep_par) bit a running device replace recorded zeros on
+	 * its target under, the ones that were stale already included: a
+	 * column a degraded write named stale is the usual case, and
+	 * @replace_stale leaves it out, since that mark is not the replace's
+	 * to hide or drop.  The zeros are there all the same, and once the
+	 * target takes over only the mark says so.  So a full log spends these
+	 * as the replace's own (wib_entry_replace_owned()), and another writer
+	 * of the bit does not take them over: what it says about the source
+	 * does not take the zeros off the target.  A write that puts the
+	 * column right does, on the target too, and clears the bit with the
+	 * mark (btrfs_wib_clear_stale()); the rest go when the replace ends
+	 * (btrfs_wib_replace_end()).
+	 */
+	u64 replace_keep;
+	u64 replace_keep_par;
+	/*
+	 * Blocks of @sticky whose record may hide a torn write: a write went
+	 * to the member of a device that then failed a flush, and the record
+	 * could not name it (wib_readd_dropped() with no room for the names),
+	 * or the record was loaded with a write in flight and the mount could
+	 * not resolve it (btrfs_wib_recover()).  Such a stripe's parity may
+	 * not describe its data, which is what the rules for a write in
+	 * flight at mount exist for -- and without this a plain record, made
+	 * of in-flight bits the readd turned sticky, reads to the next mount
+	 * like a plain failed write, and gets none of them.
+	 *
+	 * Written to disk as in flight (@bitmap | @torn in the on-disk entry),
+	 * which costs no room and no format change, and which a kernel that
+	 * does not know the mark reads the conservative way.  A block from a
+	 * kernel that does not mark has no BTRFS_WIB_TORN_MARKING, and every
+	 * error record of it is loaded with @torn set (btrfs_wib_load_block()):
+	 * in @pending only, this field says that.  Kept here apart
+	 * from @bitmap, which means a write that will complete: in @bitmap it
+	 * would hold off eviction as a write in flight does, make a full log
+	 * wait for it, and be cleared by btrfs_wib_done().  Cleared only with
+	 * @sticky, where the stripe is rewritten or found consistent.
+	 */
+	u64 torn;
+	/*
+	 * In memory only.  The @torn bits the mount's recovery kept because it
+	 * could not decide the stripe (wib_keep_torn()): a sector there does
+	 * not read, say, so the refusal the mark stands for (recover_rbio()) is
+	 * in use now, where one a failed flush left matters only if a sector
+	 * fails later.  A full log with every device there spends them last of
+	 * the records that say no more than that a write may have been torn
+	 * (wib_evict_sticky()).  Cleared with @torn.
+	 */
+	u64 kept_torn;
+	/*
+	 * In memory only.  The @stale_par bits that are the mount's verdict on
+	 * a possibly torn stripe with a data column on a missing device, which
+	 * it could not decide (btrfs_wib_mark_suspect_parity()), and that
+	 * nothing else has set since.  In memory they are stale parities like
+	 * any other: a read of the column's unchecksummed sectors fails, a
+	 * write into the stripe is refused.  On disk they need not be: the
+	 * stripe is marked possibly torn, and the next mount reaches the same
+	 * verdict from that mark while the device is missing, or regenerates
+	 * the parity from the data once it is back, as it would with the
+	 * parities named.  So they do not make a block wide by themselves
+	 * (wib_entry_wide()); a block wide for another reason carries them.
+	 * A full log with a device missing spends them last
+	 * (wib_evict_sticky()).  Any other writer of the bit takes it over
+	 * (wib_replace_disown()).
+	 */
+	u64 suspect_par;
+	/*
+	 * In memory only.  The @stale_par bits a recovery found recorded on a
+	 * possibly torn stripe with a data column on a missing device, which
+	 * leave it more unknown columns than usable parities
+	 * (btrfs_wib_keep_prior_verdict()): an earlier mount's verdict, which
+	 * a block wide for another reason carried as the stale parity it is
+	 * in memory and which reloads as one -- or a parity a write left
+	 * stale; the block cannot say which.  This mount cannot reach the
+	 * verdict again (the stale parity keeps the recovery from classifying
+	 * the stripe), and either way the mark is all that keeps a read of the
+	 * column's unchecksummed data from a rebuild out of that parity.  So a
+	 * full log with a device missing spends it last, as a verdict
+	 * (wib_entry_verdict()); unlike @suspect_par it counts as stale for the
+	 * layout (wib_entry_wide()), since a stale parity must reach the next
+	 * mount named.  Any other writer of the bit takes it over.
+	 */
+	u64 prior_par;
 };
 
 /* Full stripes that can wait for a repair at once; see btrfs_raid56_queue_repair(). */
@@ -282,6 +422,76 @@ struct btrfs_wib_repair_slot {
 	u64 logical;
 	unsigned long due;
 	u8 tries;
+};
+
+/*
+ * The devices that did not confirm the cache flush a drop from the log was
+ * going to rely on: the transaction commit's barrier (BTRFS_DEV_STATE_FLUSH_FAILED)
+ * or the log's own flush (wib_flush_all_devices()).  See wib_readd_dropped().
+ */
+#define BTRFS_WIB_FLUSH_FAILED_MAX	16
+
+struct btrfs_wib_flush_failed {
+	unsigned int nr;
+	/* More failed than @devid holds: every device counts as failed. */
+	bool overflow;
+	u64 devid[BTRFS_WIB_FLUSH_FAILED_MAX];
+};
+
+/*
+ * What wib_name_devices() found for one entry of the last block: the blocks
+ * whose data column (@stale) or parity (@stale_par, addressed as the record
+ * addresses it) lies on a device that did not confirm a flush, and those of
+ * them on a device the mount could not find (@absent).  @repair: the blocks
+ * the readd then named, on a device that is there, whose full stripes it asks
+ * to have repaired (wib_readd_queue_repairs()).  @landed: the blocks the entry
+ * lists in flight whose write finished before the failed flush was issued,
+ * and which the readd took back as the error record that says what the flush
+ * may have lost (wib_readd_base()).
+ */
+struct btrfs_wib_names {
+	u64 stale;
+	u64 stale_par;
+	u64 absent;
+	u64 repair;
+	u64 landed;
+};
+
+/*
+ * In memory only.  Which members of the blocks of one region have had a write
+ * without FUA issued to them since the device holding the member last
+ * confirmed a cache flush: @cols bit b for the data column of block b, @par
+ * bit (b + p) for parity p of the full stripe starting at block b, the way
+ * the record addresses them.  A write that failed, or that was skipped for a
+ * missing device, counts; a write-back with FUA does not.
+ *
+ * A device that fails a flush may have lost exactly these writes from its
+ * cache, and nothing else: a member it confirmed a flush for since, or that no
+ * write went to, holds what it held.  So these are the only members a failed
+ * flush names (wib_readd_dropped()).  Filled when the bios are issued
+ * (btrfs_wib_note_written()), not when they complete -- a write in flight
+ * during the failed flush is in the device's cache already -- and cleared by a
+ * flush the device confirmed, for blocks with no write in flight when the
+ * flush was issued, or once the failed flush has named the member.  Protected
+ * by wib->lock.
+ */
+struct btrfs_wib_written {
+	u64 bytenr;
+	u64 cols;
+	u64 par;
+};
+
+/*
+ * Rows of written records.  A logged write notes a region the last block lists;
+ * any other write, one the in-memory set records (btrfs_wib_note_written()).
+ * Each lists at most BTRFS_WIB_NR_ENTRIES regions.
+ */
+#define BTRFS_WIB_WRITTEN_SLOTS		(2 * BTRFS_WIB_NR_ENTRIES)
+
+/* A region's in-flight bits in a snapshot block, see wib_load_snapbits(). */
+struct btrfs_wib_bits {
+	u64 bytenr;
+	u64 bits;
 };
 
 struct btrfs_wib {
@@ -330,6 +540,13 @@ struct btrfs_wib {
 	 * room counted and the room found by eviction always agree.
 	 */
 	bool may_evict_naming;
+	/*
+	 * Under @lock: a full log spent a record that holds a running device
+	 * replace's own marks (@replace_keep in struct btrfs_wib_entry), so
+	 * the replace's target holds zeros nothing records.  The replace must
+	 * not finish (btrfs_wib_replace_marks_lost()); cleared when it ends.
+	 */
+	bool replace_marks_lost;
 
 	/* Sequence number of the last successful commit. */
 	u64 seq;
@@ -400,6 +617,83 @@ struct btrfs_wib {
 	 * the transaction commit.
 	 */
 	void *flushsnap;
+	/*
+	 * Under @commit_mutex.  A device did not confirm a flush, and the
+	 * block that would hold the in-memory set together with every record
+	 * of the last block cannot be written yet: writes in flight that the
+	 * last block does not list take the room, and finishing makes it
+	 * (wib_readd_dropped()).  The set is all a later drop keeps, so until
+	 * it has taken the records back no commit drops anything from the
+	 * last block -- not even after a flush every device confirmed, which
+	 * does not bring back what the failed one may have lost -- and
+	 * @readd_owed_failed says which devices those stripes have to name
+	 * when it does.  Never a state the log cannot leave: no write takes
+	 * more of the room meanwhile (@readd_admit_last), and when finishing
+	 * writes cannot make it, the readd does what fits instead.
+	 */
+	bool readd_owed;
+	struct btrfs_wib_flush_failed readd_owed_failed;
+	/*
+	 * Under @lock, set with @readd_owed (wib_readd_set_owed()).  Every
+	 * write into a region the last block does not list adds one more that
+	 * the block after the readd has to describe, and while such writes
+	 * keep arriving the readd never finds its room: no block is written,
+	 * and every recorded write fails.  So while it is owed, btrfs_wib_mark()
+	 * records no write into a region that the last block does not list --
+	 * @readd_last, its regions sorted, @nr_readd_last of them -- unless the
+	 * set holds a record of it (wib_readd_refuses_locked()), but plans the
+	 * readd again once the writes holding the room are gone
+	 * (wib_readd_settle()).  At @readd_until the readd stops waiting for
+	 * them, and takes back what fits instead.
+	 */
+	bool readd_admit_last;
+	u32 nr_readd_last;
+	u64 *readd_last;
+	unsigned long readd_until;
+	/* Under @commit_mutex: who failed the flush just issued. */
+	struct btrfs_wib_flush_failed flush_failed;
+	/*
+	 * Under @commit_mutex: wib_name_devices() for each entry of @last,
+	 * worked out before wib_readd_dropped() takes @lock -- the chunk map
+	 * is not walked with interrupts off -- and kept here so that a commit
+	 * allocates nothing.
+	 */
+	struct btrfs_wib_names readd_names[BTRFS_WIB_NR_ENTRIES];
+	/*
+	 * Under @commit_mutex.  @readd_landed: the last wib_readd_dropped()
+	 * took the records of @last back and worked out @landed in
+	 * @readd_names for them.  @readd_base: @last as the block written
+	 * after that readd unions it, see wib_readd_base().
+	 */
+	bool readd_landed;
+	void *readd_base;
+	/*
+	 * Under @commit_mutex: saying an owed readd's wait, see
+	 * wib_readd_say_wait().  @readd_said: the one owed now was said.
+	 */
+	struct ratelimit_state readd_say_rs;
+	u32 readd_unsaid;
+	bool readd_said;
+	/*
+	 * BTRFS_WIB_WRITTEN_SLOTS of them, see struct btrfs_wib_written.  Every
+	 * region with a member written lies in @last or in the in-memory set,
+	 * so they fit; were one ever not to, @written_unknown makes every
+	 * member count as written -- the naming as it was before these were
+	 * kept -- until a flush every device confirmed leaves @last empty.
+	 * Only kept while the log is enabled: nothing names anything otherwise.
+	 * A disable forgets them once the last block is written, not before
+	 * (wib_write_final_locked()), and a readd still owed then names every
+	 * member when the log is enabled again (wib_written_reset_locked()).
+	 */
+	struct btrfs_wib_written *written;
+	bool written_unknown;
+	/*
+	 * Under @commit_mutex: the in-flight bits of the snapshot a flush was
+	 * issued after, sorted by region (wib_load_snapbits()), and how many.
+	 * BTRFS_WIB_NR_ENTRIES of them, allocated with the log.
+	 */
+	struct btrfs_wib_bits *snapbits;
+	u32 nr_snapbits;
 
 	/* IO completion tracking for one commit, commit_mutex held. */
 	atomic_t io_pending;
@@ -419,6 +713,35 @@ struct btrfs_wib {
 	 */
 	bool consult_pending;
 	unsigned int nr_pending_stale;
+	/*
+	 * @pending holds records no recovery has taken over yet: every write
+	 * they list may have been torn, and until a read-write mount recovers
+	 * them nothing has checked a parity of theirs.  A read-only mount
+	 * never does, so it answers btrfs_wib_unrecovered() from them for as
+	 * long as it lasts.  Set at load, cleared with @consult_pending once a
+	 * recovery has taken every stripe over; protected by wib->lock.
+	 */
+	bool pending_unrecovered;
+	/*
+	 * One per @pending entry: the blocks of it a recovery has taken over,
+	 * a full stripe at a time, just before it recovers the stripe
+	 * (btrfs_wib_take_pending()).  The live table answers for those from
+	 * then on, so the queries above leave them out -- and go on answering
+	 * from @pending for every stripe the recovery has not reached, while
+	 * it runs on a mount that is still read-only and serving reads, and
+	 * for good if it stops early and the remount fails.  Allocated by the
+	 * first recovery, freed with @pending; protected by wib->lock.
+	 */
+	u64 *pending_taken;
+	/*
+	 * The full stripe [@recovering, @recovering + @recovering_len) the
+	 * recovery has taken over and is deciding right now, when a write into
+	 * it may have been torn; @recovering_len 0 when none.  Between the take
+	 * and the verdict neither @pending nor the live table answers for it:
+	 * btrfs_wib_recovering() does.  Protected by wib->lock.
+	 */
+	u64 recovering;
+	u64 recovering_len;
 
 	/* Statistics, exported through sysfs. */
 	/*
@@ -436,6 +759,12 @@ struct btrfs_wib {
 	atomic64_t stat_commit_flushes;
 	atomic64_t stat_recovered_stripes;
 	atomic64_t stat_recovery_errors;
+	/*
+	 * Full stripes the mount recovery found with a write in flight and a
+	 * data column on a missing device, could not decide, and so recorded
+	 * every parity still there as stale: see scrub_raid56_recover_absent().
+	 */
+	atomic64_t stat_recovery_suspect;
 	atomic64_t stat_sticky;
 	atomic64_t stat_sticky_evicted;
 	/*
@@ -507,6 +836,39 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf);
 int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 seq);
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 bool btrfs_wib_evicts_naming(void);
+bool btrfs_wib_keeps_naming_degraded(void);
+bool btrfs_wib_readd_legacy(void);
+bool btrfs_wib_name_unwritten(void);
+bool btrfs_wib_all_records_torn(void);
+bool btrfs_wib_torn_no_persist(void);
+bool btrfs_wib_log_unmarked(void);
+bool btrfs_wib_trust_unmarked_log(void);
+bool btrfs_wib_missing_parity_keeps_torn(void);
+bool btrfs_wib_absent_decided_keeps_torn(void);
+bool btrfs_wib_suspect_as_stale(void);
+bool btrfs_wib_replace_end_clears_verdicts(void);
+bool btrfs_wib_evicts_replace_marks(void);
+bool btrfs_wib_replace_keeps_added_only(void);
+bool btrfs_wib_reload_verdicts_plain(void);
+void btrfs_wib_take_pending(struct btrfs_wib *wib, u64 start, u64 len, bool take);
+bool btrfs_wib_disable_forgets_writes(void);
+bool btrfs_wib_snapshot_misses_marks(void);
+bool btrfs_wib_readd_admits_new(void);
+bool btrfs_wib_readd_no_repair(void);
+bool btrfs_wib_finished_stay_inflight(void);
+bool btrfs_wib_remount_ro_keeps_inflight(void);
+bool btrfs_wib_readd_disowns_all(void);
+bool btrfs_wib_readd_admits_busy(void);
+bool btrfs_wib_torn_unevictable(void);
+bool btrfs_wib_torn_spent_eagerly(void);
+bool btrfs_wib_kept_torn_in_order(void);
+#endif
+#ifdef CONFIG_BTRFS_DEBUG
+bool btrfs_wib_unrecovered_as_ambiguous(void);
+bool btrfs_wib_torn_remedy_legacy(void);
+#else
+static inline bool btrfs_wib_unrecovered_as_ambiguous(void) { return false; }
+static inline bool btrfs_wib_torn_remedy_legacy(void) { return false; }
 #endif
 void btrfs_raid56_alert_stop(struct btrfs_fs_info *fs_info);
 
@@ -519,17 +881,47 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info);
 int btrfs_wib_persist_now(struct btrfs_fs_info *fs_info);
 int btrfs_wib_rw_mount(struct btrfs_fs_info *fs_info, bool log_replay_pending,
 		       bool rdonly);
+void btrfs_wib_ro_mount(struct btrfs_fs_info *fs_info);
+bool btrfs_wib_unrecovered(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			   int nr_data);
+bool btrfs_wib_stripe_torn(struct btrfs_fs_info *fs_info, u64 start, u64 len);
+bool btrfs_wib_recovering(struct btrfs_fs_info *fs_info, u64 full_stripe_start);
+/*
+ * Besides the parities on a missing device (bits 0 and 1), what the recovery
+ * found a full stripe consistent but for (btrfs_scrub_raid56_full_stripe()'s
+ * @unwritten_par): a data column on a missing device it decided, both parities
+ * there and regenerated.  See btrfs_wib_parity_unwritten().
+ */
+#define BTRFS_WIB_STRIPE_DECIDED	BIT(2)
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+void btrfs_wib_parity_unwritten(struct btrfs_fs_info *fs_info, u64 start, u64 len,
+				unsigned int parities);
+#endif
+void btrfs_wib_unmount(struct btrfs_fs_info *fs_info);
+void btrfs_wib_remount_ro(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);
 void btrfs_wib_disable(struct btrfs_fs_info *fs_info);
 int btrfs_wib_request_enable(struct btrfs_fs_info *fs_info, bool automatic);
 
 int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_note_written(struct btrfs_fs_info *fs_info, u64 full_stripe_start,
+			    int nr_data, u64 cols, u32 par, bool logged);
+void btrfs_wib_note_written_data(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
-void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
+			   bool durable);
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info);
+bool btrfs_wib_persisting(struct btrfs_fs_info *fs_info);
+bool btrfs_wib_replace_mark_stale(struct btrfs_fs_info *fs_info, u64 logical,
+				  bool owned);
+bool btrfs_wib_replace_mark_parity(struct btrfs_fs_info *fs_info,
+				   u64 full_stripe_start, int parity, bool owned);
+int btrfs_wib_replace_end(struct btrfs_fs_info *fs_info, bool finished);
+bool btrfs_wib_replace_marks_lost(struct btrfs_fs_info *fs_info);
+bool btrfs_wib_replace_resume_rewinds(struct btrfs_fs_info *fs_info, u64 nr_uncopyable);
 
 /*
  * What the log knows about one full stripe, as the read and scrub paths need
@@ -564,6 +956,10 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 			    struct btrfs_wib_stripe_state *st);
 void btrfs_wib_update_stale_parity(struct btrfs_fs_info *fs_info,
 				   u64 full_stripe_start, int parity, bool stale);
+void btrfs_wib_mark_suspect_parity(struct btrfs_fs_info *fs_info,
+				   u64 full_stripe_start, u64 len, int parity);
+void btrfs_wib_keep_prior_verdict(struct btrfs_fs_info *fs_info,
+				  u64 full_stripe_start, u32 parities);
 /*
  * A copy of the data columns of one full stripe a scrub declined to repair,
  * taken at the verdict from the buffers the scrub already holds.
@@ -634,12 +1030,16 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 bool btrfs_wib_block_valid(const struct btrfs_fs_info *fs_info, const void *block);
 /* Decode entry @i of an on-disk block, whichever format it is in. */
 void btrfs_wib_read_entry(const void *block, u32 i, struct btrfs_wib_entry *out);
+bool btrfs_wib_block_marks_torn(const void *block);
+int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
+			 unsigned int *nr_torn);
 bool btrfs_wib_block_drops(const void *old, const void *new);
 int btrfs_wib_add_pending(struct btrfs_wib *wib,
 			  const struct btrfs_wib_entry *src);
 void btrfs_wib_finalize_pending(struct btrfs_wib *wib);
 int btrfs_wib_try_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len);
+bool btrfs_wib_readd_refuses(struct btrfs_wib *wib, u64 logical, u64 len);
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);

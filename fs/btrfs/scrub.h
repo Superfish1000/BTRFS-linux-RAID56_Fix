@@ -47,7 +47,9 @@ enum btrfs_raid56_recover_mode {
 int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 				   struct scrub_ctx *sctx,
 				   u64 full_stripe_start,
-				   enum btrfs_raid56_recover_mode mode);
+				   enum btrfs_raid56_recover_mode mode,
+				   bool log_replay_pending, bool torn,
+				   unsigned int *unwritten_par);
 void btrfs_scrub_pause(struct btrfs_fs_info *fs_info);
 void btrfs_scrub_continue(struct btrfs_fs_info *fs_info);
 int btrfs_scrub_cancel(struct btrfs_fs_info *info);

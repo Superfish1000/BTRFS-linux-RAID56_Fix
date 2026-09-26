@@ -6,6 +6,8 @@
 #include <linux/blkdev.h>
 #include <linux/ratelimit.h>
 #include <linux/sched/mm.h>
+#include <linux/raid/pq.h>
+#include <linux/raid/xor.h>
 #include "ctree.h"
 #include "discard.h"
 #include "volumes.h"
@@ -90,6 +92,13 @@ enum scrub_stripe_flags {
 	 * update the accounting.
 	 */
 	SCRUB_STRIPE_FLAG_NO_REPORT,
+
+	/*
+	 * RAID5/6 device replace: the target gets every sector of this data
+	 * column, not only the ones an extent covers.  See
+	 * scrub_replace_copy_column().
+	 */
+	SCRUB_STRIPE_FLAG_WHOLE_COLUMN,
 };
 
 /*
@@ -187,12 +196,22 @@ struct scrub_stripe {
 	 * rather than believing them: set after verification in
 	 * scrub_stripe_read_repair_worker(), because scrub_verify_one_sector()
 	 * clears the error bit of an unchecksummed sector before that
-	 * ("we have no other choice but to trust it").
+	 * ("we have no other choice but to trust it"), and set again after
+	 * every re-read of this mirror for the same reason
+	 * (scrub_verify_repair_read()).
 	 *
 	 * Only set where the rebuild is PROVABLE -- see
 	 * scrub_raid56_parity_stripe(), which decides per full stripe.
 	 */
 	bool wib_rebuild;
+
+	/*
+	 * With SCRUB_STRIPE_FLAG_WHOLE_COLUMN: the full stripe this column
+	 * belongs to and how many data columns it has, which is what the
+	 * write-intent log is asked about and what it records against.
+	 */
+	u64 raid56_full_stripe;
+	u16 raid56_nr_data;
 
 	struct work_struct work;
 };
@@ -229,6 +248,33 @@ struct scrub_ctx {
 	 */
 	bool			raid56_defer_retire;
 	bool			raid56_keep_record;
+	/*
+	 * Set by btrfs_scrub_raid56_full_stripe() for the one full stripe it
+	 * recovers: a write into it may have been torn (its @torn), so its
+	 * parity may not describe its data.  scrub_raid56_plan_wib() then
+	 * declines a rebuild no parity is left over to check
+	 * (SCRUB_WIB_TORN), and scrub_raid56_parity_stripe() says so in
+	 * @raid56_torn_undecided.
+	 */
+	bool			raid56_torn;
+	bool			raid56_torn_undecided;
+	/*
+	 * Set by scrub_raid56_recover_absent() for its verify pass, which only
+	 * reads what its classification decides from: act on no record.
+	 */
+	bool			raid56_verify_only;
+	/*
+	 * Set by scrub_raid56_absent_pq() when it decided the data column on a
+	 * missing device and regenerated both parities from the data: nothing
+	 * in the stripe is left that a torn write could be in.
+	 */
+	bool			raid56_absent_decided;
+	/*
+	 * Device replace of a RAID5/6 chunk: copy whole data columns.  Decided
+	 * once per chunk by scrub_enumerate_chunks(), which also has to make
+	 * the chunk's content stable for it; see scrub_replace_copies_column().
+	 */
+	bool			raid56_whole_column;
 	u64			write_pointer;
 
 	struct mutex            wr_lock;
@@ -1023,12 +1069,54 @@ static struct btrfs_bio *alloc_scrub_bbio(struct btrfs_fs_info *fs_info,
 	return bbio;
 }
 
+/*
+ * Testing only: raid56_wf_replace_refuses_free=1 lets a RAID5/6 device replace
+ * rebuild the sectors of a column that no extent holds in the same reads as its
+ * data, as before scrub_replace_splits_free(): in a full stripe the
+ * write-intent log marks possibly torn the rebuild of the whole read is
+ * refused, and the free sectors are counted as lost, raising replace_uncopyable
+ * and leaving zeros and a stale mark on the new device.  The negative control
+ * for uml/replace_torn_free.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_refuses_free;
+module_param_named(raid56_wf_replace_refuses_free, replace_refuses_free, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_refuses_free,
+		 "Let a RAID5/6 device replace rebuild the free sectors of a column in the same reads as its data, so that a stripe marked possibly torn refuses them and the replace reports them lost (testing only: restores a known defect)");
+#else
+static const bool replace_refuses_free;
+#endif
+
+/*
+ * Does a device replace that rebuilds @stripe's RAID5/6 data column at @mirror
+ * read the sectors no extent holds on their own, and say so
+ * (@scrub_reads_free in struct btrfs_bio)?
+ *
+ * A rebuild of data without a checksum is refused where the full stripe may be
+ * torn and no parity is left over to check it (recover_rbio()), and every
+ * sector of a read goes with it.  A free sector counts as unchecked data there,
+ * as the RAID5/6 layer cannot tell it from data -- so the replace of a missing
+ * device after a crash counted every free sector of such a stripe as lost,
+ * raised replace_uncopyable for data that was never there, and put zeros and a
+ * stale mark on its target where the rebuild was exactly what belongs there.
+ * Read apart, only the data is refused.
+ */
+static bool scrub_replace_splits_free(const struct scrub_stripe *stripe, int mirror)
+{
+	return stripe->sctx->is_dev_replace && mirror > 1 &&
+	       (stripe->bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) &&
+	       (stripe->bg->flags & BTRFS_BLOCK_GROUP_DATA) &&
+	       !READ_ONCE(replace_refuses_free);
+}
+
 static void scrub_stripe_submit_repair_read(struct scrub_stripe *stripe,
 					    int mirror, int blocksize, bool wait)
 {
 	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
 	struct btrfs_bio *bbio = NULL;
 	const unsigned long old_error_bitmap = scrub_bitmap_read_error(stripe);
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	const bool split = scrub_replace_splits_free(stripe, mirror);
 	int i;
 
 	ASSERT(stripe->mirror_num >= 1, "stripe->mirror_num=%d", stripe->mirror_num);
@@ -1036,9 +1124,12 @@ static void scrub_stripe_submit_repair_read(struct scrub_stripe *stripe,
 	       "atomic_read(&stripe->pending_io)=%d", atomic_read(&stripe->pending_io));
 
 	for_each_set_bit(i, &old_error_bitmap, stripe->nr_sectors) {
+		const bool reads_free = split && !test_bit(i, &has_extent);
+
 		/* The current sector cannot be merged, submit the bio. */
 		if (bbio && ((i > 0 && !test_bit(i - 1, &old_error_bitmap)) ||
-			     bbio->bio.bi_iter.bi_size >= blocksize)) {
+			     bbio->bio.bi_iter.bi_size >= blocksize ||
+			     bbio->scrub_reads_free != reads_free)) {
 			ASSERT(bbio->bio.bi_iter.bi_size);
 			atomic_inc(&stripe->pending_io);
 			btrfs_submit_bbio(bbio, mirror);
@@ -1047,10 +1138,12 @@ static void scrub_stripe_submit_repair_read(struct scrub_stripe *stripe,
 			bbio = NULL;
 		}
 
-		if (!bbio)
+		if (!bbio) {
 			bbio = alloc_scrub_bbio(fs_info, REQ_OP_READ,
 						stripe->logical + (i << fs_info->sectorsize_bits),
 						scrub_repair_read_endio, stripe);
+			bbio->scrub_reads_free = reads_free;
+		}
 
 		scrub_bio_add_sector(bbio, stripe, i);
 	}
@@ -1271,11 +1364,16 @@ static void scrub_write_sectors(struct scrub_ctx *sctx, struct scrub_stripe *str
  * repair below rebuilds it anyway.
  *
  * What is left is exactly the case this record exists for.
+ *
+ * Returns the sectors it marked.  Verification never sets those bits again, so
+ * they have to be put back after every re-read of this mirror; see
+ * scrub_verify_repair_read().
  */
-static void scrub_mark_wib_stale_sectors(struct scrub_stripe *stripe)
+static unsigned long scrub_mark_wib_stale_sectors(struct scrub_stripe *stripe)
 {
 	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
 	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+	unsigned long marked = 0;
 	int sector_nr;
 	int nr_marked = 0;
 
@@ -1285,12 +1383,78 @@ static void scrub_mark_wib_stale_sectors(struct scrub_stripe *stripe)
 		if (stripe->sectors[sector_nr].csum)
 			continue;
 		scrub_bitmap_set_bit_error(stripe, sector_nr);
+		__set_bit(sector_nr, &marked);
 		nr_marked++;
 	}
 	if (nr_marked)
 		btrfs_warn_rl(stripe->bg->fs_info,
 "scrub: rebuilding %d sector(s) at %llu from the parity: the write-intent log records their last write as not having reached the disk, and without a checksum nothing else can tell",
 			      nr_marked, stripe->logical);
+	return marked;
+}
+
+/*
+ * Testing only: let a re-read of a stripe's own mirror clear the errors that
+ * scrub_mark_wib_stale_sectors() forced, as scrub_stripe_read_repair_worker()
+ * did before.  The negative control for uml/forced_stale.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool reread_trusts_stale;
+module_param_named(raid56_scrub_reread_trusts_stale, reread_trusts_stale, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_reread_trusts_stale,
+		 "Let scrub's last-resort re-read of a data column the write-intent log names stale clear the errors the log forced on it (testing only: restores a known defect)");
+#else
+static const bool reread_trusts_stale;
+#endif
+
+/*
+ * Verify what a repair read of @mirror has just put in the buffer for the
+ * sectors in @reread, then put back the errors that no read of the stripe's
+ * own mirror can cure.
+ *
+ * @forced are the sectors whose error bit was set not for anything found in
+ * their bytes but because something else knows the copy on @stripe->mirror_num
+ * is wrong: today the write-intent log, through
+ * scrub_mark_wib_stale_sectors().  scrub_verify_one_sector() knows nothing of
+ * that.  For a sector without a checksum it clears the error bit of whatever it
+ * is handed -- "we have no other choice but to trust it".
+ *
+ * For a read of another mirror that is the point: on RAID5/6 it is the rebuild
+ * the forcing asked for, and its bytes are not the ones the log condemned.  But
+ * the last-resort pass of scrub_stripe_read_repair_worker() re-reads every
+ * mirror, the stripe's own first, and for a sector no rebuild could supply --
+ * the parity or a sibling column did not read -- that re-read puts the
+ * condemned bytes straight back into the buffer.  They used to verify clean,
+ * leave the error bitmap, be written back over themselves and be counted as
+ * repaired; on the RAID5/6 parity path the parity was then regenerated from
+ * them and the record retired.  The acknowledged value, which only the parity
+ * still held, was gone, and nothing said so.
+ *
+ * Kept in error, the sector is refused instead: nothing is written from it,
+ * scrub_raid56_parity_stripe() reports the full stripe unrepaired and keeps the
+ * record (which raid56_health keeps counting), and a later scrub rebuilds it
+ * once the parity reads again.
+ *
+ * Only the sectors @reread covers: one an earlier mirror already rebuilt was
+ * not read again, still holds the rebuild, and is good.
+ */
+static void scrub_verify_repair_read(struct scrub_stripe *stripe, int mirror,
+				     unsigned long reread, unsigned long forced)
+{
+	unsigned long again;
+	int sector_nr;
+
+	scrub_verify_one_stripe(stripe, reread);
+	if (mirror != stripe->mirror_num || READ_ONCE(reread_trusts_stale))
+		return;
+	if (!bitmap_and(&again, &forced, &reread, stripe->nr_sectors))
+		return;
+	for_each_set_bit(sector_nr, &again, stripe->nr_sectors)
+		scrub_bitmap_set_bit_error(stripe, sector_nr);
+	btrfs_warn_rl(stripe->bg->fs_info,
+"scrub: %d sector(s) at %llu re-read from mirror %d still hold what the write-intent log records as stale; keeping them in error rather than accepting them",
+		      bitmap_weight(&again, stripe->nr_sectors), stripe->logical,
+		      mirror);
 }
 
 /*
@@ -1347,6 +1511,13 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 	unsigned long error;
 	unsigned long unprovable;
 	/*
+	 * Errors set from outside verification, which a re-read of this
+	 * mirror must not clear: see scrub_verify_repair_read().  Anything
+	 * that marks a sector bad for what is known about it rather than for
+	 * what its bytes say belongs here.
+	 */
+	unsigned long forced = 0;
+	/*
 	 * On RAID5/6 every mirror above the first is a reconstruction from the
 	 * parity rather than another copy of the bytes.
 	 */
@@ -1361,7 +1532,7 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 	wait_scrub_stripe_io(stripe);
 	scrub_verify_one_stripe(stripe, scrub_bitmap_read_has_extent(stripe));
 	if (unlikely(stripe->wib_rebuild))
-		scrub_mark_wib_stale_sectors(stripe);
+		forced = scrub_mark_wib_stale_sectors(stripe);
 	/* Save the initial failed bitmap for later repair and report usage. */
 	errors.init_error_bitmap = scrub_bitmap_read_error(stripe);
 	errors.nr_io_errors = scrub_bitmap_weight_io_error(stripe);
@@ -1386,7 +1557,7 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 		scrub_stripe_submit_repair_read(stripe, mirror,
 						BTRFS_STRIPE_LEN, false);
 		wait_scrub_stripe_io(stripe);
-		scrub_verify_one_stripe(stripe, old_error_bitmap);
+		scrub_verify_repair_read(stripe, mirror, old_error_bitmap, forced);
 		if (reconstructs && mirror > 1 && !stripe->wib_rebuild &&
 		    !btrfs_raid56_scrub_trusts_rebuild())
 			scrub_note_unprovable(stripe, &unprovable,
@@ -1404,6 +1575,11 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 	 * Thus here we do sector-by-sector read.
 	 *
 	 * This can be slow, thus we only try it as the last resort.
+	 *
+	 * "Including the failed one" is a re-read of this stripe's own mirror,
+	 * which for a sector the write-intent log names stale brings back the
+	 * very bytes it condemned; scrub_verify_repair_read() keeps those in
+	 * error.
 	 */
 
 	for (i = 0, mirror = stripe->mirror_num;
@@ -1414,7 +1590,7 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
 		scrub_stripe_submit_repair_read(stripe, mirror,
 						fs_info->sectorsize, true);
 		wait_scrub_stripe_io(stripe);
-		scrub_verify_one_stripe(stripe, old_error_bitmap);
+		scrub_verify_repair_read(stripe, mirror, old_error_bitmap, forced);
 		if (reconstructs && mirror > 1 && !stripe->wib_rebuild &&
 		    !btrfs_raid56_scrub_trusts_rebuild())
 			scrub_note_unprovable(stripe, &unprovable,
@@ -1546,8 +1722,15 @@ static void scrub_write_sectors(struct scrub_ctx *sctx, struct scrub_stripe *str
 	int sector_nr;
 
 	for_each_set_bit(sector_nr, &write_bitmap, stripe->nr_sectors) {
-		/* We should only writeback sectors covered by an extent. */
-		ASSERT(scrub_bitmap_test_bit_has_extent(stripe, sector_nr));
+		/*
+		 * We should only writeback sectors covered by an extent --
+		 * except to a replace target taking a RAID5/6 data column
+		 * whole, where the free sectors are what the parity was
+		 * computed over too.
+		 */
+		ASSERT(scrub_bitmap_test_bit_has_extent(stripe, sector_nr) ||
+		       (dev_replace &&
+			test_bit(SCRUB_STRIPE_FLAG_WHOLE_COLUMN, &stripe->state)));
 
 		/* Cannot merge with previous sector, submit the current one. */
 		if (bbio && sector_nr && !test_bit(sector_nr - 1, &write_bitmap)) {
@@ -2077,6 +2260,48 @@ static void scrub_submit_extent_sector_read(struct scrub_stripe *stripe)
 	}
 }
 
+/*
+ * The initial read of @stripe from @mirror when it is a device replace's
+ * rebuild of a RAID5/6 data column: one bio per run of sectors that hold an
+ * extent or that do not, those marked (scrub_replace_splits_free()).
+ */
+static void scrub_submit_initial_read_split(struct scrub_stripe *stripe, int mirror,
+					    unsigned int nr_sectors)
+{
+	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	struct btrfs_bio *bbio = NULL;
+
+	/* Held until every bio is submitted: the last to end runs the repair. */
+	atomic_inc(&stripe->pending_io);
+	for (unsigned int cur = 0; cur < nr_sectors; cur++) {
+		const bool reads_free = !test_bit(cur, &has_extent);
+
+		if (bbio && bbio->scrub_reads_free != reads_free) {
+			atomic_inc(&stripe->pending_io);
+			btrfs_submit_bbio(bbio, mirror);
+			bbio = NULL;
+		}
+		if (!bbio) {
+			bbio = alloc_scrub_bbio(fs_info, REQ_OP_READ,
+						stripe->logical +
+						(cur << fs_info->sectorsize_bits),
+						scrub_read_endio, stripe);
+			bbio->scrub_reads_free = reads_free;
+		}
+		scrub_bio_add_sector(bbio, stripe, cur);
+	}
+	if (bbio) {
+		atomic_inc(&stripe->pending_io);
+		btrfs_submit_bbio(bbio, mirror);
+	}
+	if (atomic_dec_and_test(&stripe->pending_io)) {
+		wake_up(&stripe->io_wait);
+		INIT_WORK(&stripe->work, scrub_stripe_read_repair_worker);
+		queue_work(fs_info->scrub_workers, &stripe->work);
+	}
+}
+
 static void scrub_submit_initial_read(struct scrub_ctx *sctx,
 				      struct scrub_stripe *stripe)
 {
@@ -2094,13 +2319,6 @@ static void scrub_submit_initial_read(struct scrub_ctx *sctx,
 		return;
 	}
 
-	bbio = alloc_scrub_bbio(fs_info, REQ_OP_READ,
-				stripe->logical, scrub_read_endio, stripe);
-	/* Read the whole range inside the chunk boundary. */
-	for (unsigned int cur = 0; cur < nr_sectors; cur++)
-		scrub_bio_add_sector(bbio, stripe, cur);
-	atomic_inc(&stripe->pending_io);
-
 	/*
 	 * For dev-replace, either user asks to avoid the source dev, or
 	 * the device is missing, we try the next mirror instead.
@@ -2114,6 +2332,17 @@ static void scrub_submit_initial_read(struct scrub_ctx *sctx,
 
 		mirror = calc_next_mirror(mirror, num_copies);
 	}
+	if (scrub_replace_splits_free(stripe, mirror)) {
+		scrub_submit_initial_read_split(stripe, mirror, nr_sectors);
+		return;
+	}
+
+	bbio = alloc_scrub_bbio(fs_info, REQ_OP_READ,
+				stripe->logical, scrub_read_endio, stripe);
+	/* Read the whole range inside the chunk boundary. */
+	for (unsigned int cur = 0; cur < nr_sectors; cur++)
+		scrub_bio_add_sector(bbio, stripe, cur);
+	atomic_inc(&stripe->pending_io);
 	btrfs_submit_bbio(bbio, mirror);
 }
 
@@ -2156,6 +2385,416 @@ static void submit_initial_group_read(struct scrub_ctx *sctx,
 		scrub_submit_initial_read(sctx, stripe);
 	}
 	blk_finish_plug(&plug);
+}
+
+/*
+ * Testing only: let a RAID5/6 device replace copy only the sectors an extent
+ * covers of each data column, as it did before, and count nothing it could not
+ * copy.  The negative control for uml/replace_whole_column.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_extents_only;
+module_param_named(raid56_wf_replace_extents_only, replace_extents_only, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_extents_only,
+		 "Let a RAID5/6 device replace copy only the sectors an extent covers, leaving the rest of each data column as whatever the new device held (testing only: restores a known defect)");
+#else
+static const bool replace_extents_only;
+#endif
+
+/*
+ * Testing only: the negative controls for uml/replace_source_data.sh.
+ *
+ * raid56_wf_replace_rebuilds_unchecked lets a RAID5/6 device replace rebuild
+ * the data without a checksum that the source returned, in a full stripe the
+ * write-intent log does not record, instead of copying it, and rebuild what
+ * the source did not return before asking the source again; see
+ * scrub_replace_copy_column().
+ *
+ * raid56_wf_replace_keeps_marks lets the stale marks a replace makes for what
+ * it could not copy take effect at once, while the source still serves the
+ * column, and outlive a replace that does not finish; see
+ * scrub_replace_record_lost().
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_rebuilds_unchecked;
+module_param_named(raid56_wf_replace_rebuilds_unchecked, replace_rebuilds_unchecked,
+		   bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_rebuilds_unchecked,
+		 "Let a RAID5/6 device replace put a rebuild from the parity on the new device in place of data without a checksum that the old device returned (testing only: restores a known defect)");
+static bool replace_keeps_marks;
+module_param_named(raid56_wf_replace_keeps_marks, replace_keeps_marks, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_keeps_marks,
+		 "Let the stale marks a RAID5/6 device replace makes for sectors it cannot copy apply to the old device at once and outlive a replace that does not finish (testing only: restores a known defect)");
+#else
+static const bool replace_rebuilds_unchecked;
+static const bool replace_keeps_marks;
+#endif
+
+/*
+ * Testing only: raid56_wf_replace_abort_unlatched=1 raises no
+ * replace_aborted alert when a replace is aborted because it could not record
+ * what it could neither copy nor rebuild, as before the alert existed: with
+ * nothing recorded the state goes back to ok as soon as the alert work runs.
+ * The negative control for uml/replace_abort.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_abort_unlatched;
+module_param_named(raid56_wf_replace_abort_unlatched, replace_abort_unlatched, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_abort_unlatched,
+		 "Raise no latched alert when a RAID5/6 device replace is aborted because it could not record what it could not copy, so the health goes back to ok (testing only: restores a known defect)");
+#else
+static const bool replace_abort_unlatched;
+#endif
+
+/*
+ * A replace is aborted because it could not record what it could neither copy
+ * nor rebuild (@why says why).  Nothing may be recorded then, and no record
+ * would keep the health failing until the admin has seen it: raise the event
+ * that does.
+ */
+static void scrub_replace_aborted(struct btrfs_fs_info *fs_info, u64 full_stripe_start)
+{
+	if (!READ_ONCE(replace_abort_unlatched))
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPLACE_ABORTED,
+				   full_stripe_start, NULL, 0);
+}
+
+/*
+ * Does a device replace of @bg copy whole RAID5/6 data columns?
+ *
+ * The parity of a full stripe describes every sector of every data column,
+ * allocated or not: a read-modify-write reads the sectors of the columns it
+ * does not write, free ones included, and computes the parity over all of them
+ * (rmw_read_wait_recover(), generate_pq_vertical()).  So a free sector is not
+ * nothing.  It is one of the terms the parity needs to give any OTHER column
+ * of its row back.
+ *
+ * The replace used to copy only the sectors an extent covers, and the target
+ * kept whatever it held everywhere else -- the free sectors of a column, and
+ * the whole column wherever the source's column of a full stripe held no
+ * extent while its neighbours did.  Nothing said so.  The array had lost its
+ * redundancy on those rows, and the first time another device went missing,
+ * every sector rebuilt against one of those holes was wrong; where the data
+ * has no checksum it was returned as the file's content.  Data without a
+ * checksum was only ever copied as the source held it, whatever the parity
+ * said.  tools/testing/btrfs/uml/replace_whole_column.sh reads both back.
+ *
+ * Only RAID5/6: the other profiles copy mirrors, which nothing is computed
+ * from.
+ */
+static bool scrub_replace_copies_column(const struct scrub_ctx *sctx,
+					const struct btrfs_block_group *bg)
+{
+	return sctx->is_dev_replace &&
+	       (bg->flags & BTRFS_BLOCK_GROUP_RAID56_MASK) &&
+	       !READ_ONCE(replace_extents_only);
+}
+
+/* Make @bitmap the set of sectors the next repair read of @stripe reads. */
+static void scrub_stripe_set_error(struct scrub_stripe *stripe, unsigned long bitmap)
+{
+	int sector_nr;
+
+	scrub_bitmap_clear_error(stripe, 0, stripe->nr_sectors);
+	for_each_set_bit(sector_nr, &bitmap, stripe->nr_sectors)
+		scrub_bitmap_set_bit_error(stripe, sector_nr);
+}
+
+/*
+ * Read the sectors @want of @stripe from @mirror into its buffer, and return
+ * the ones that could not be had.
+ *
+ * A bio fails as a whole, and on RAID5/6 a rebuild that has to refuse one row
+ * fails every sector it was asked for, so what failed is asked for again one
+ * sector at a time to find out which of them really cannot be read.
+ */
+static unsigned long scrub_replace_read(struct scrub_stripe *stripe,
+					unsigned long want, int mirror)
+{
+	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
+	unsigned long io_error;
+	unsigned long failed;
+
+	scrub_stripe_set_error(stripe, want);
+	scrub_stripe_submit_repair_read(stripe, mirror, BTRFS_STRIPE_LEN, false);
+	wait_scrub_stripe_io(stripe);
+	io_error = scrub_bitmap_read_io_error(stripe);
+	bitmap_and(&failed, &want, &io_error, stripe->nr_sectors);
+	if (bitmap_weight(&failed, stripe->nr_sectors) <= 1)
+		return failed;
+
+	scrub_stripe_set_error(stripe, failed);
+	scrub_stripe_submit_repair_read(stripe, mirror, fs_info->sectorsize, true);
+	io_error = scrub_bitmap_read_io_error(stripe);
+	bitmap_and(&failed, &failed, &io_error, stripe->nr_sectors);
+	return failed;
+}
+
+/*
+ * Open a record for the full stripe at @full_stripe_start that a member of it
+ * can then be named in.  Returns NULL, or why no record can be kept that
+ * outlives this mount.
+ */
+static const char *scrub_replace_add_record(struct btrfs_fs_info *fs_info,
+					    u64 full_stripe_start, int nr_data)
+{
+	if (!btrfs_wib_persisting(fs_info))
+		return "the write-intent log is not enabled";
+	/* See btrfs_wib_stripe_state(): no one would be told. */
+	if (nr_data > 64)
+		return "the write-intent log cannot describe a full stripe that wide";
+	if (btrfs_wib_try_add_sticky(fs_info, full_stripe_start,
+				     btrfs_stripe_nr_to_offset(nr_data)) < 0)
+		return "the write-intent log is full";
+	return NULL;
+}
+
+/*
+ * The sectors @lost of @stripe's column can be neither copied nor rebuilt.
+ * Count them, raise the alert, and record the target's column stale before the
+ * zeros that stand in for them are written.
+ *
+ * Stale, and only the column.  What was committed there is still what the
+ * parity and the other columns of the full stripe describe -- nothing about
+ * them went wrong -- so a read of the column rebuilds from them instead of
+ * believing the zeros: it fails with EIO while the device whose read failed is
+ * still failing, and returns the right data once it is back.  A later scrub
+ * (scrub_raid56_plan_wib()) or read-modify-write (rmw_prepare_repair())
+ * rebuilds the column the same way, writes it and retires the record.
+ * Recording the parity bad as well would forbid the rebuild the one thing that
+ * still holds the data: on RAID5 the column could never be read again, and on
+ * RAID6 every other column of the stripe would lose its rebuild along with it.
+ * That is also how the model behind this copy records what it cannot copy
+ * (map-recovery's recovery_model.py, s1-whole-record: 0 wrong reads).
+ *
+ * The whole column, too, because the log has no smaller unit (one bit per
+ * BTRFS_STRIPE_LEN).  Once the target serves it, every sector of the column
+ * without a checksum is read through a rebuild (btrfs_check_read_bio()) --
+ * also the ones this copy got right, which then fail with EIO wherever that
+ * rebuild cannot be done, typically for as long as the sibling or parity that
+ * made these sectors uncopyable stays unreadable in their rows too.  A record
+ * of only the lost rows would spare them, and the log cannot express one;
+ * recording less than the column would let the zeros be read as data.  The
+ * next scrub or write of the stripe rebuilds what it can of the column and
+ * retires the record once all of it is back (scrub_raid56_plan_wib(),
+ * rmw_prepare_repair()).
+ *
+ * The mark describes the target, not the source.  Until the replace finishes,
+ * the source goes on serving the column, so the mark is the replace's own
+ * until then (btrfs_wib_replace_mark_stale()): the source's good sectors are
+ * read as they were, its siblings still rebuild from it, and a replace that is
+ * cancelled or fails takes the mark back with its target
+ * (btrfs_wib_replace_end()) instead of leaving the source's column condemned
+ * -- to be rebuilt from the parity by the next scrub or write, and rebuilt
+ * rather than copied by the next replace.
+ *
+ * The record is made before any zero is written.  If it cannot be made -- the
+ * log is full, or it is not being persisted and the record would not outlive
+ * this mount -- nothing is written and the replace is aborted: the source
+ * stays in the filesystem and nothing is lost that was not lost already.
+ *
+ * Returns 0, or -EIO to abort the replace.
+ */
+static int scrub_replace_record_lost(struct scrub_ctx *sctx,
+				     struct scrub_stripe *stripe,
+				     unsigned long lost)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	const int nr = bitmap_weight(&lost, stripe->nr_sectors);
+	const char *why = NULL;
+	unsigned long data;
+	int nr_data;
+
+	bitmap_and(&data, &lost, &has_extent, stripe->nr_sectors);
+	nr_data = bitmap_weight(&data, stripe->nr_sectors);
+	atomic64_add(nr, &fs_info->dev_replace.num_uncorrectable_read_errors);
+
+	why = scrub_replace_add_record(fs_info, stripe->raid56_full_stripe,
+				       stripe->raid56_nr_data);
+	/*
+	 * Marking can make the log shrink to fit (the first stale bit halves
+	 * what a block holds); a record that did not survive that is no
+	 * record.
+	 */
+	if (!why &&
+	    !btrfs_wib_replace_mark_stale(fs_info, stripe->logical,
+					  !READ_ONCE(replace_keeps_marks)))
+		why = "the write-intent log could not keep the record";
+	btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPLACE_LOST,
+			   stripe->raid56_full_stripe, NULL, 0);
+	if (why) {
+		btrfs_err(fs_info,
+"scrub: device replace can neither copy nor rebuild %d sector(s) at logical %llu (%d holding data), and cannot record them because %s; aborting the replace rather than leave zeros on the target that would read back as data",
+			  nr, stripe->logical, nr_data, why);
+		scrub_replace_aborted(fs_info, stripe->raid56_full_stripe);
+		return -EIO;
+	}
+	btrfs_err_rl(fs_info,
+"scrub: device replace could neither copy nor rebuild %d sector(s) at logical %llu (%d holding data); the target holds zeros there, recorded stale, so reads fail with EIO rather than return them -- and, the record covering the whole %u KiB column, so do reads of its other sectors without a checksum wherever they cannot be rebuilt either, once the replace finishes",
+		     nr, stripe->logical, nr_data, BTRFS_STRIPE_LEN >> 10);
+	return 0;
+}
+
+/*
+ * Put a RAID5/6 data column on the replace target whole: every sector of it,
+ * not only the ones an extent covers (see scrub_replace_copies_column()).
+ *
+ * Where each sector comes from:
+ *
+ * - A sector its checksum or its tree block's header verified is copied as the
+ *   buffer holds it -- read from the source, or rebuilt and verified by the
+ *   repair worker.  That is the only content anything has proved.
+ *
+ * - Data without a checksum is copied as the source returned it.  The source
+ *   is a member in good standing here: every read of the sector returned
+ *   exactly those bytes until now.  A rebuild of it, on the other hand, is
+ *   checked by nothing -- the write-intent log vets it only against what the
+ *   log records (mark_stale_sectors(), rbio_rebuilt_unverified()), so a
+ *   parity that rotted, one torn by a crash while the log was off or before
+ *   it was enabled, or a silently corrupt sibling goes straight onto the
+ *   target.  Afterwards the stripe even agrees with itself (the target holds
+ *   what the parity said), no scrub can find it, and the correct copy is gone
+ *   with the source.  Copied, the data stays what reads returned, and any
+ *   disagreement with the parity stays where a scrub finds it.  The data the
+ *   source did not return -- a read fails as a whole, and the repair worker
+ *   left an unverifiable rebuild in its place (scrub_note_unprovable()) -- is
+ *   asked of the source again, one sector at a time, before anything else.
+ *   Where the log names the source's column stale, or the source is missing,
+ *   or the replace was told to avoid it ('-r'), the data is rebuilt instead,
+ *   as below.
+ *
+ * - Free sectors, and what the source cannot give, are rebuilt from the other
+ *   columns and the parity, leaving the source out (mirror 2).  The rebuild
+ *   consults the write-intent log (mark_stale_sectors()) and refuses rather
+ *   than guess when the log names more than the parity can cover
+ *   (rbio_rebuilt_unverified()).  For a free sector it is also exactly the
+ *   value needed: whatever the source held there, the target now holds what
+ *   makes the parity true for its row, so a later rebuild of any OTHER column
+ *   of that row comes out right -- even from a parity that rotted.
+ *
+ * - Where the log holds a record for this full stripe and does not name the
+ *   source's column stale, the free sectors too are copied as the source has
+ *   them.  The record is kept against the column's position, so from now on
+ *   it describes the target, and carrying the column over unchanged leaves
+ *   every question it records exactly as open as it was for whoever answers
+ *   it (a scrub, the mount-time recovery): the source is what a read returned
+ *   until now.  A rebuild would add nothing -- with another member named it
+ *   is refused, or it gives back the source's own committed value.
+ *
+ * - A rebuild that is refused or cannot be done -- a sibling column or the
+ *   parity unreadable, the log naming too much -- falls back to reading the
+ *   source, if it is there, the log does not name its column stale, and it
+ *   was not just asked.  That is what the extent-only copy wrote for such a
+ *   sector of an extent, and what every read of it returned until now.
+ *
+ * - What is left cannot be had: a checksummed sector no mirror verified, or a
+ *   sector neither a rebuild nor the source gives.  The target gets zeros
+ *   there, recorded (scrub_replace_record_lost()) so that reading them fails
+ *   rather than returns them.  Metadata never gets here:
+ *   stripe_has_metadata_error() has aborted the replace already.
+ *
+ * Rebuilding first is right for a source nothing can vouch for; a device that
+ * has failed for writes and missed some of them will be one.  One that has
+ * not is the best copy there is of what it holds.
+ *
+ * Returns 0, or -EIO to abort the replace.
+ */
+static int scrub_replace_copy_column(struct scrub_ctx *sctx,
+				     struct scrub_stripe *stripe)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const unsigned int nr = stripe_length(stripe) >> fs_info->sectorsize_bits;
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+	const unsigned long error = scrub_bitmap_read_error(stripe);
+	/* The buffer holds the source's bytes, not a rebuild (-r, or no source). */
+	const bool read_source = stripe->dev->bdev &&
+		fs_info->dev_replace.cont_reading_from_srcdev_mode !=
+		BTRFS_DEV_REPLACE_ITEM_CONT_READING_FROM_SRCDEV_MODE_AVOID;
+	const bool trust_source = stripe->dev->bdev &&
+				  !btrfs_wib_stale(fs_info, stripe->logical);
+	const bool rebuild_first = READ_ONCE(replace_rebuilds_unchecked);
+	unsigned long column = 0;
+	unsigned long verified = 0;
+	unsigned long lost = 0;
+	/* Data without a checksum to ask the source for again, before rebuilding. */
+	unsigned long ask_source = 0;
+	unsigned long rest;
+	int sector_nr;
+	int ret;
+
+	ASSERT(stripe->raid56_nr_data);
+	bitmap_set(&column, 0, nr);
+	for_each_set_bit(sector_nr, &has_extent, nr) {
+		if (!test_bit(sector_nr, &is_metadata) &&
+		    !stripe->sectors[sector_nr].csum)
+			continue;
+		/* Every mirror was tried by the repair worker. */
+		if (test_bit(sector_nr, &error))
+			__set_bit(sector_nr, &lost);
+		else
+			__set_bit(sector_nr, &verified);
+	}
+	bitmap_andnot(&rest, &column, &verified, nr);
+	bitmap_andnot(&rest, &rest, &lost, nr);
+
+	if (read_source && trust_source) {
+		if (btrfs_wib_stripe_error(fs_info, stripe->raid56_full_stripe,
+					   stripe->raid56_nr_data) !=
+		    BTRFS_WIB_STRIPE_NO_ERROR) {
+			/*
+			 * A recorded stripe: the source's bytes already in the
+			 * buffer go over as they are.  Only what it did not
+			 * return is left to find.
+			 */
+			bitmap_and(&rest, &rest, &error, nr);
+		} else if (!rebuild_first) {
+			/*
+			 * Data the source returned goes over as it is; free
+			 * sectors are rebuilt.
+			 */
+			unsigned long returned;
+
+			bitmap_andnot(&returned, &has_extent, &error, nr);
+			bitmap_andnot(&rest, &rest, &returned, nr);
+		}
+		if (!rebuild_first)
+			bitmap_and(&ask_source, &rest, &has_extent, nr);
+	}
+
+	if (!bitmap_empty(&ask_source, nr)) {
+		const unsigned long failed = scrub_replace_read(stripe, ask_source,
+								stripe->mirror_num);
+
+		bitmap_andnot(&rest, &rest, &ask_source, nr);
+		bitmap_or(&rest, &rest, &failed, nr);
+	}
+
+	if (!bitmap_empty(&rest, nr)) {
+		unsigned long failed = scrub_replace_read(stripe, rest, 2);
+		unsigned long again;
+
+		/* The source has just failed to give the ones it was asked for. */
+		bitmap_andnot(&again, &failed, &ask_source, nr);
+		if (!bitmap_empty(&again, nr) && trust_source) {
+			bitmap_andnot(&failed, &failed, &again, nr);
+			again = scrub_replace_read(stripe, again, stripe->mirror_num);
+			bitmap_or(&failed, &failed, &again, nr);
+		}
+		bitmap_or(&lost, &lost, &failed, nr);
+	}
+
+	if (!bitmap_empty(&lost, nr)) {
+		ret = scrub_replace_record_lost(sctx, stripe, lost);
+		if (ret < 0)
+			return ret;
+		for_each_set_bit(sector_nr, &lost, nr)
+			memset(stripe->buffer + (sector_nr << fs_info->sectorsize_bits),
+			       0, fs_info->sectorsize);
+	}
+	scrub_write_sectors(sctx, stripe, column, true);
+	return 0;
 }
 
 static int flush_scrub_stripes(struct scrub_ctx *sctx)
@@ -2205,15 +2844,25 @@ static int flush_scrub_stripes(struct scrub_ctx *sctx)
 
 			ASSERT(stripe->dev == fs_info->dev_replace.srcdev);
 
-			has_extent = scrub_bitmap_read_has_extent(stripe);
-			error = scrub_bitmap_read_error(stripe);
-			bitmap_andnot(&good, &has_extent, &error, stripe->nr_sectors);
 			/*
 			 * The repair write-backs' errors were consumed by the
 			 * report (REPAIR_DONE); from here the bitmap is the
 			 * target's, read below.
 			 */
 			stripe->write_error_bitmap = 0;
+			/*
+			 * A column that could not be recorded aborts the
+			 * replace: copy nothing more, but still wait below for
+			 * what was already submitted.
+			 */
+			if (test_bit(SCRUB_STRIPE_FLAG_WHOLE_COLUMN, &stripe->state)) {
+				if (!ret)
+					ret = scrub_replace_copy_column(sctx, stripe);
+				continue;
+			}
+			has_extent = scrub_bitmap_read_has_extent(stripe);
+			error = scrub_bitmap_read_error(stripe);
+			bitmap_andnot(&good, &has_extent, &error, stripe->nr_sectors);
 			scrub_write_sectors(sctx, stripe, good, true);
 		}
 	}
@@ -2255,6 +2904,27 @@ static void raid56_scrub_wait_endio(struct bio *bio)
 	complete(bio->bi_private);
 }
 
+/*
+ * The slot at sctx->cur_stripe has just been filled: count it, submit its group
+ * once that is complete, and flush them all once every slot is in use.
+ */
+static int scrub_stripe_queued(struct scrub_ctx *sctx)
+{
+	sctx->cur_stripe++;
+
+	/* We filled one group, submit it. */
+	if (sctx->cur_stripe % SCRUB_STRIPES_PER_GROUP == 0) {
+		const int first_slot = sctx->cur_stripe - SCRUB_STRIPES_PER_GROUP;
+
+		submit_initial_group_read(sctx, first_slot, SCRUB_STRIPES_PER_GROUP);
+	}
+
+	/* Last slot used, flush them all. */
+	if (sctx->cur_stripe == SCRUB_TOTAL_STRIPES)
+		return flush_scrub_stripes(sctx);
+	return 0;
+}
+
 static int queue_scrub_stripe(struct scrub_ctx *sctx, struct btrfs_block_group *bg,
 			      struct btrfs_device *dev, int mirror_num,
 			      u64 logical, u32 length, u64 physical,
@@ -2281,19 +2951,7 @@ static int queue_scrub_stripe(struct scrub_ctx *sctx, struct btrfs_block_group *
 	if (ret)
 		return ret;
 	*found_logical_ret = stripe->logical;
-	sctx->cur_stripe++;
-
-	/* We filled one group, submit it. */
-	if (sctx->cur_stripe % SCRUB_STRIPES_PER_GROUP == 0) {
-		const int first_slot = sctx->cur_stripe - SCRUB_STRIPES_PER_GROUP;
-
-		submit_initial_group_read(sctx, first_slot, SCRUB_STRIPES_PER_GROUP);
-	}
-
-	/* Last slot used, flush them all. */
-	if (sctx->cur_stripe == SCRUB_TOTAL_STRIPES)
-		return flush_scrub_stripes(sctx);
-	return 0;
+	return scrub_stripe_queued(sctx);
 }
 
 /*
@@ -2338,6 +2996,14 @@ static int should_cancel_scrub(const struct scrub_ctx *sctx)
 		return -ECANCELED;
 
 	/*
+	 * The write-intent log dropped a record of zeros this replace put on
+	 * its target: the replace cannot finish (btrfs_wib_replace_end()), so
+	 * stop copying now rather than at the end.
+	 */
+	if (sctx->is_dev_replace && btrfs_wib_replace_marks_lost(fs_info))
+		return -EIO;
+
+	/*
 	 * The user (e.g. fsfreeze command) or power management (PM)
 	 * suspend/hibernate can freeze the fs.  And PM suspend/hibernate will
 	 * also freeze all user processes.
@@ -2359,6 +3025,94 @@ static int should_cancel_scrub(const struct scrub_ctx *sctx)
 	    freezing(current) || signal_pending(current))
 		return -EINTR;
 	return 0;
+}
+
+/*
+ * Does anything in [@start, @start + @len) of @bg hold an extent, in the commit
+ * root every other lookup of the copy uses?  Returns 1 if so, 0 if not.
+ */
+static int scrub_range_has_extent(struct btrfs_block_group *bg, u64 start, u64 len)
+{
+	BTRFS_PATH_AUTO_RELEASE(path);
+	struct btrfs_fs_info *fs_info = bg->fs_info;
+	struct btrfs_root *extent_root = btrfs_extent_root(fs_info, bg->start);
+	int ret;
+
+	if (unlikely(!extent_root)) {
+		btrfs_err(fs_info, "scrub: no valid extent root found");
+		return -EUCLEAN;
+	}
+	path.search_commit_root = true;
+	path.skip_locking = true;
+	ret = find_first_extent_item(extent_root, &path, start, len);
+	if (ret < 0)
+		return ret;
+	return ret == 0;
+}
+
+/*
+ * RAID5/6 device replace copying whole columns: queue the source's data column
+ * @logical of the full stripe at @full_stripe_start, if anything at all in that
+ * full stripe is allocated.
+ *
+ * scrub_simple_mirror() only finds a column that holds an extent itself.  A
+ * column with none, in a full stripe whose other columns hold data, is as much
+ * a term of that stripe's parity as a used one (scrub_replace_copies_column()),
+ * so it is queued too, as a stripe without extents, and
+ * scrub_replace_copy_column() rebuilds all of it.  A full stripe with no
+ * extent anywhere is left alone: there is nothing in it to rebuild, and a
+ * write into it computes the parity of the rows it touches afresh from
+ * whatever the columns hold.
+ */
+static int queue_raid56_replace_column(struct scrub_ctx *sctx,
+				       struct btrfs_block_group *bg,
+				       struct btrfs_device *dev, u64 logical,
+				       u64 physical, u64 full_stripe_start,
+				       int nr_data)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	struct scrub_stripe *stripe;
+	int ret;
+
+	ret = should_cancel_scrub(sctx);
+	if (ret < 0)
+		return ret;
+	if (atomic_read(&fs_info->scrub_pause_req))
+		scrub_blocked_if_needed(fs_info);
+	spin_lock(&bg->lock);
+	if (test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags)) {
+		spin_unlock(&bg->lock);
+		return 0;
+	}
+	spin_unlock(&bg->lock);
+
+	/* See queue_scrub_stripe(). */
+	ASSERT(sctx->cur_stripe < SCRUB_TOTAL_STRIPES);
+	stripe = &sctx->stripes[sctx->cur_stripe];
+	scrub_reset_stripe(stripe);
+	ret = scrub_find_fill_first_stripe(bg, &sctx->extent_path,
+					   &sctx->csum_path, dev, physical, 1,
+					   logical, BTRFS_STRIPE_LEN, stripe);
+	if (ret < 0)
+		return ret;
+	if (ret > 0) {
+		ret = scrub_range_has_extent(bg, full_stripe_start,
+					     btrfs_stripe_nr_to_offset(nr_data));
+		if (ret <= 0)
+			return ret;
+		/* As scrub_raid56_parity_stripe() does for an empty column. */
+		stripe->logical = logical;
+		stripe->physical = physical;
+		stripe->dev = dev;
+		stripe->bg = bg;
+		stripe->mirror_num = 1;
+		set_bit(SCRUB_STRIPE_FLAG_INITIALIZED, &stripe->state);
+	}
+	ASSERT(stripe->logical == logical);
+	set_bit(SCRUB_STRIPE_FLAG_WHOLE_COLUMN, &stripe->state);
+	stripe->raid56_full_stripe = full_stripe_start;
+	stripe->raid56_nr_data = nr_data;
+	return scrub_stripe_queued(sctx);
 }
 
 static int scrub_raid56_cached_parity(struct scrub_ctx *sctx,
@@ -2436,6 +3190,12 @@ enum scrub_wib_plan {
 	SCRUB_WIB_PROVEN,
 	/* Named members, but not enough left to rebuild them without guessing. */
 	SCRUB_WIB_AMBIGUOUS,
+	/*
+	 * Named members and just enough good parity to rebuild them, but a
+	 * write into the stripe may have been torn and none is left over to
+	 * check the rebuild with.
+	 */
+	SCRUB_WIB_TORN,
 };
 
 /*
@@ -2552,6 +3312,48 @@ static void scrub_capture_evidence(struct scrub_ctx *sctx,
 	btrfs_raid56_evidence_commit(fs_info);
 }
 
+/*
+ * Testing only: look up the devices of a full stripe's parities where they sit
+ * in full stripe 0, without the rotation, as scrub_raid56_plan_wib() did
+ * before.  The negative control for uml/parity_rotation.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool plan_parity_unrotated;
+module_param_named(raid56_scrub_parity_unrotated, plan_parity_unrotated, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_parity_unrotated,
+		 "Count a full stripe's usable parities on the devices that hold them in full stripe 0, ignoring the RAID5/6 rotation (testing only: restores a known defect)");
+#else
+static const bool plan_parity_unrotated;
+#endif
+
+/*
+ * Testing only: rebuild the columns the write-intent log names from as many
+ * parities as there are such columns although a write into their full stripe
+ * may have been torn, with none left over to check the rebuild, and write it
+ * back -- as scrub_raid56_plan_wib() did before SCRUB_WIB_TORN.  The negative
+ * control for the named arms of uml/torn_present.sh.
+ *
+ * And let the verify pass of scrub_raid56_recover_absent() act on the record
+ * like any other pass, as it did before @raid56_verify_only: it rebuilt such a
+ * column and wrote it back before the classification had decided anything.
+ * Needs raid56_scrub_torn_trusts_parity=1 as well to show, since the verify
+ * pass only ever meets a possibly torn stripe; the negative control for the
+ * classify arms of uml/torn_present.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool torn_trusts_parity;
+module_param_named(raid56_scrub_torn_trusts_parity, torn_trusts_parity, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_torn_trusts_parity,
+		 "Rebuild a data column the write-intent log names stale from the last parity left although a write into its full stripe may have been torn, and write it back (testing only: restores a known defect)");
+static bool verify_pass_rebuilds;
+module_param_named(raid56_recover_absent_verify_rebuilds, verify_pass_rebuilds, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_absent_verify_rebuilds,
+		 "Let the recovery's verify pass over a full stripe with a data column on a missing device rebuild and write back the columns the write-intent log names stale, before it has classified the stripe (testing only: restores a known defect)");
+#else
+static const bool torn_trusts_parity;
+static const bool verify_pass_rebuilds;
+#endif
+
 static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 						 struct btrfs_chunk_map *map,
 						 u64 full_stripe_start,
@@ -2563,9 +3365,20 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	struct btrfs_wib_stripe_state st;
 	u64 holes = 0, needs_help = 0;
 	int nr_good_par = 0;
+	int rot;
 
 	*holes_out = 0;
 	if (likely(!btrfs_wib_any_stale(fs_info)))
+		return SCRUB_WIB_NONE;
+	/*
+	 * The verify pass of a classification: whatever the record names is
+	 * what the classification weighs, and a rebuild written back now would
+	 * have been written before it decided -- from both parities, which a
+	 * torn write may have left not describing the data, over a column the
+	 * crash may have left right.  Nothing is written for it here, and the
+	 * classification writes only what it decides.
+	 */
+	if (sctx->raid56_verify_only && !READ_ONCE(verify_pass_rebuilds))
 		return SCRUB_WIB_NONE;
 	/*
 	 * Wider than the masks below can express, so the log cannot be
@@ -2642,10 +3455,40 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	if (!needs_help)
 		return SCRUB_WIB_NONE;
 
-	/* Parities that can still be used as a source. */
+	/*
+	 * Parities that can still be used as a source.
+	 *
+	 * Parity p is column data_stripes + p of the full stripe, and the
+	 * columns rotate by one device per full stripe: column c of full
+	 * stripe n sits on map->stripes[(c + n) % num_stripes].  That is how
+	 * btrfs_map_block() lays out the bioc the rebuild will run on, and how
+	 * scrub_raid56_parity_stripe() resolved the data columns examined
+	 * above.  map->stripes[data_stripes + p] is where parity p sits in
+	 * full stripe 0 only; everywhere else it is another column's device,
+	 * so this used to ask about the wrong device on all but one full
+	 * stripe in num_stripes.
+	 *
+	 * Only a device that is not there makes the answer differ, and then
+	 * it is wrong both ways.  A missing device holding a data column is
+	 * taken for a missing parity: the stripe is declared ambiguous and
+	 * left without its redundancy, although the parities that really are
+	 * there -- the ones the rebuild would use -- suffice.  And a missing
+	 * parity is taken for a present one: the budget below passes a stripe
+	 * with more unknowns than equations, and all that stands between it
+	 * and a rebuild that invents a value is the recovery's own count in
+	 * mark_stale_sectors().
+	 *
+	 * @st.bad_parity is indexed by parity, not by device: no rotation.
+	 */
+	rot = div_u64(full_stripe_start - map->start,
+		      data_stripes) >> BTRFS_STRIPE_LEN_SHIFT;
 	for (int p = 0; p < nr_parity; p++) {
-		const struct btrfs_device *dev = map->stripes[data_stripes + p].dev;
+		int idx = data_stripes + p;
+		const struct btrfs_device *dev;
 
+		if (!READ_ONCE(plan_parity_unrotated))
+			idx = (idx + rot) % map->num_stripes;
+		dev = map->stripes[idx].dev;
 		if (dev && dev->bdev && !(st.bad_parity & BIT(p)))
 			nr_good_par++;
 	}
@@ -2660,12 +3503,223 @@ static enum scrub_wib_plan scrub_raid56_plan_wib(struct scrub_ctx *sctx,
 	 */
 	if (hweight64(holes) > nr_good_par)
 		return SCRUB_WIB_AMBIGUOUS;
+	/*
+	 * Enough equations, but a write into the stripe may have been torn:
+	 * in flight at a crash (@raid56_torn, the recovery's), or marked
+	 * possibly torn in the live table.  Its parity then may not describe
+	 * the data in the rows that write touched, and a rebuild that spends
+	 * every good parity on the named columns returns there the named
+	 * column xor whatever the torn write changed -- over a sector the
+	 * crash may have left right, and a checksum is what these columns
+	 * do not have.  With a parity left over the read path checks each
+	 * rebuilt row against it (recover_verify_q()) and fails the ones it
+	 * contradicts; without one, nothing can.  Leave the stripe as it is;
+	 * the recovery records it undecidable (btrfs_scrub_raid56_full_stripe()).
+	 */
+	if (hweight64(holes) == nr_good_par && !READ_ONCE(torn_trusts_parity) &&
+	    (sctx->raid56_torn ||
+	     btrfs_wib_stripe_torn(fs_info, full_stripe_start,
+				   btrfs_stripe_nr_to_offset(data_stripes))))
+		return SCRUB_WIB_TORN;
 
 	for (int i = 0; i < data_stripes; i++)
 		if (needs_help & BIT_ULL(i))
 			sctx->raid56_data_stripes[i].wib_rebuild = true;
 	return SCRUB_WIB_PROVEN;
 }
+
+/*
+ * Testing only: let a RAID5/6 device replace leave the target's parity of a
+ * full stripe it declines to regenerate as whatever the new device held, as it
+ * did before scrub_replace_copy_parity(), while the data columns are still
+ * copied whole.  raid56_wf_replace_extents_only restores this too, but along
+ * with the rest of the extent-only copy, whose own holes would stand beside
+ * this one in the same test.  The negative control for the replace arms of
+ * uml/forced_stale.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_skips_refused_parity;
+module_param_named(raid56_wf_replace_skips_refused_parity,
+		   replace_skips_refused_parity, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_skips_refused_parity,
+		 "Let a RAID5/6 device replace leave the target's parity of a full stripe scrub declines to regenerate as whatever the new device held, recording nothing (testing only: restores a known defect)");
+#else
+static const bool replace_skips_refused_parity;
+#endif
+
+/*
+ * A replace is leaving the full stripe at @full_stripe_start without
+ * regenerating its parity -- the write-intent log cannot decide the stripe, or
+ * a data column holds sectors nothing could repair -- and so without writing
+ * @src's parity column of it to the target at all.  The target would keep
+ * whatever it held there, and nothing would say so.  For a stripe the log
+ * declines to decide that parity is the only copy of what was acknowledged:
+ * lost, and worse, once a missing device comes back and the stripe becomes
+ * decidable, a rebuild the log calls proven would be computed out of the
+ * target's junk.
+ *
+ * Nor does it take a missing device.  Say the log names a data column stale
+ * and @src, which holds the parity, is there but does not return it: the
+ * rebuild of the column cannot run, the scrub keeps the column in error rather
+ * than take its stale bytes back (scrub_verify_repair_read()), and the stripe
+ * is left unrepaired with its record as it was -- that column named, no parity
+ * bad.  After the replace that record describes the target, and the target
+ * counts as good parity.  Every read of the column, its unchanged sectors along
+ * with the stale one (the record does not say which), is then rebuilt out of
+ * the target's junk and returned without an error: there is no checksum, and
+ * a rebuild the read path does not persist it still returns.  The next scrub
+ * -- what the alerts tell the administrator to run -- finds the stripe proven,
+ * rebuilds the column the same way and writes it over data that was right.
+ *
+ * So copy it as it is.  The source's parity is what the array has had all
+ * along, so the stripe's state carries over exactly, its record included.
+ * What cannot be copied -- the source is missing, or does not return it --
+ * gets zeros, and the log records this parity stale so that no rebuild uses
+ * it; the sectors are counted and the alert raised as for a data column
+ * (scrub_replace_record_lost()).  If that cannot be recorded either, the
+ * replace is aborted.  In the case above, recording the parity stale makes the
+ * stripe undecidable, which is the truth -- the acknowledged value was in the
+ * parity that did not read -- so reads of the named column fail with EIO and
+ * scrubs leave it alone (SCRUB_WIB_AMBIGUOUS) instead of inventing it.
+ *
+ * Plain block I/O, a page at a time: this is the exception, and the source's
+ * parity column has no logical address to go through the mapping with.
+ *
+ * Returns 0, or a negative error to abort the replace.
+ */
+static int scrub_replace_copy_parity(struct scrub_ctx *sctx,
+				     struct btrfs_device *src,
+				     struct btrfs_block_group *bg,
+				     struct btrfs_chunk_map *map,
+				     u64 full_stripe_start)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	struct btrfs_device *tgt = sctx->wr_tgtdev;
+	const int data_stripes = nr_data_stripes(map);
+	const u32 rot = div_u64(full_stripe_start - bg->start, data_stripes) >>
+			BTRFS_STRIPE_LEN_SHIFT;
+	const char *why;
+	struct page *page;
+	void *buf;
+	u64 physical = 0;
+	u32 lost = 0;
+	u32 nr_lost;
+	int parity = -1;
+	int ret = 0;
+
+	if (READ_ONCE(replace_skips_refused_parity))
+		return 0;
+
+	/* Which parity of this full stripe the source holds, and where. */
+	for (int c = data_stripes; c < map->num_stripes; c++) {
+		const int idx = (c + rot) % map->num_stripes;
+
+		if (map->stripes[idx].dev == src) {
+			parity = c - data_stripes;
+			physical = map->stripes[idx].physical +
+				   btrfs_stripe_nr_to_offset(rot);
+			break;
+		}
+	}
+	if (unlikely(parity < 0 || !tgt || !tgt->bdev)) {
+		btrfs_err(fs_info,
+"scrub: device replace found no parity of devid %llu in full stripe %llu to copy",
+			  src->devid, full_stripe_start);
+		return -EUCLEAN;
+	}
+
+	page = alloc_page(GFP_NOFS);
+	if (!page)
+		return -ENOMEM;
+	buf = page_address(page);
+	for (u32 off = 0; off < BTRFS_STRIPE_LEN; off += PAGE_SIZE) {
+		const sector_t sector = (physical + off) >> SECTOR_SHIFT;
+
+		if (!src->bdev ||
+		    bdev_rw_virt(src->bdev, sector, buf, PAGE_SIZE, REQ_OP_READ)) {
+			memset(buf, 0, PAGE_SIZE);
+			lost += PAGE_SIZE;
+		}
+		if (bdev_rw_virt(tgt->bdev, sector, buf, PAGE_SIZE, REQ_OP_WRITE)) {
+			/* As flush_scrub_stripes() counts the data columns'. */
+			btrfs_dev_stat_inc_and_print(tgt, BTRFS_DEV_STAT_WRITE_ERRS);
+			atomic64_add(DIV_ROUND_UP(PAGE_SIZE, fs_info->sectorsize),
+				     &fs_info->dev_replace.num_write_errors);
+			btrfs_err_rl(fs_info,
+"scrub: device replace could not write the parity of full stripe %llu to the target device; the replace will be aborted",
+				     full_stripe_start);
+			ret = -EIO;
+			break;
+		}
+	}
+	__free_page(page);
+	if (ret < 0 || !lost)
+		return ret;
+
+	nr_lost = DIV_ROUND_UP(lost, fs_info->sectorsize);
+	atomic64_add(nr_lost, &fs_info->dev_replace.num_uncorrectable_read_errors);
+	why = scrub_replace_add_record(fs_info, full_stripe_start, data_stripes);
+	/*
+	 * Parity p is recorded in block p of the full stripe (see
+	 * btrfs_wib_disk_entry::stale_par), so a stripe with fewer data
+	 * columns than parities cannot say it about its last parity.  And the
+	 * mark is the replace's own until it ends, as a data column's is
+	 * (scrub_replace_record_lost()).
+	 */
+	if (!why && parity >= data_stripes)
+		why = "the write-intent log cannot name that parity";
+	else if (!why &&
+		 !btrfs_wib_replace_mark_parity(fs_info, full_stripe_start, parity,
+						!READ_ONCE(replace_keeps_marks)))
+		why = "the write-intent log could not keep the record";
+	btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPLACE_LOST,
+			   full_stripe_start, NULL, 0);
+	if (why) {
+		btrfs_err(fs_info,
+"scrub: device replace can neither regenerate nor copy %u sector(s) of parity %d of full stripe %llu, and cannot record them because %s; aborting the replace",
+			  nr_lost, parity, full_stripe_start, why);
+		scrub_replace_aborted(fs_info, full_stripe_start);
+		return -EIO;
+	}
+	btrfs_err_rl(fs_info,
+"scrub: device replace could neither regenerate nor copy %u sector(s) of parity %d of full stripe %llu; the target holds zeros there, recorded stale, so no rebuild uses them",
+		     nr_lost, parity, full_stripe_start);
+	return 0;
+}
+
+/*
+ * Testing only: let a full stripe with unrepaired sectors hand
+ * scrub_raid56_parity_stripe()'s caller whatever its last data column's extent
+ * lookup returned, as it did before -- 1 when that column holds no extent,
+ * which scrub_stripe() takes for "stop" -- so that the rest of the chunk on
+ * the parity's device goes unscrubbed without a word.  The negative control
+ * for uml/scrub_unrepaired_stop.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool unrepaired_stops;
+module_param_named(raid56_scrub_unrepaired_stops, unrepaired_stops, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_unrepaired_stops,
+		 "Let a RAID5/6 full stripe with unrepaired sectors end the scrub of the rest of its chunk on the parity's device when its last data column holds no extent (testing only: restores a known defect)");
+#else
+static const bool unrepaired_stops;
+#endif
+
+/*
+ * Testing only: leave the record of a full stripe that no longer holds any
+ * extent as it is, as the scrub did before, rather than retire it: a stripe
+ * the record made undecidable goes on refusing every write into it after the
+ * files that held its undecidable data are deleted, and the new files meant
+ * to replace them fail where they land there.  The negative control for the
+ * clear arm of uml/torn_present.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool empty_keeps_record;
+module_param_named(raid56_scrub_empty_keeps_record, empty_keeps_record, bool, 0644);
+MODULE_PARM_DESC(raid56_scrub_empty_keeps_record,
+		 "Let a RAID5/6 scrub leave the write-intent record of a full stripe that holds no extent any more, refusing writes into it for as long as it made the stripe undecidable (testing only: restores the old behaviour)");
+#else
+static const bool empty_keeps_record;
+#endif
 
 static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 				      struct btrfs_device *scrub_dev,
@@ -2771,8 +3825,24 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 			break;
 		}
 	}
-	if (all_empty)
+	/*
+	 * Nothing in it is referenced any more, so nothing its record stands
+	 * for is either: the files that held data it made undecidable were
+	 * deleted, typically, to be restored from a backup.  Left in place, a
+	 * record naming more than the parity can rebuild refuses every write
+	 * into the stripe, the restored files' included where they land there.
+	 * Retire it, as the parity regenerated below would: whatever a later
+	 * write puts there, it computes the parity of its rows from the data.
+	 * Not for the recovery, which decides from the record, nor for a
+	 * replace or a read-only scrub.
+	 */
+	if (all_empty) {
+		if (regen_parity && !sctx->readonly && !sctx->internal &&
+		    !sctx->is_dev_replace && !sctx->raid56_defer_retire &&
+		    !READ_ONCE(empty_keeps_record) && btrfs_wib_any_stale(fs_info))
+			btrfs_wib_clear_sticky(fs_info, full_stripe_start, fstripe_len);
 		return 0;
+	}
 
 	for (int i = 0; i < data_stripes; i++) {
 		stripe = &sctx->raid56_data_stripes[i];
@@ -2807,14 +3877,37 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	 * stripe alone and keep the record -- only the diagnosis differs, and
 	 * this one is the specific one.
 	 */
-	if (regen_parity && plan == SCRUB_WIB_AMBIGUOUS) {
+	if (regen_parity &&
+	    (plan == SCRUB_WIB_AMBIGUOUS || plan == SCRUB_WIB_TORN)) {
 		sctx->raid56_keep_record = true;
 		scrub_capture_evidence(sctx, map, bg, full_stripe_start,
 				       data_stripes);
 		atomic64_inc(&fs_info->wib->stat_scrub_skipped_stale);
-		btrfs_warn_rl(fs_info,
+		if (plan == SCRUB_WIB_TORN) {
+			sctx->raid56_torn_undecided = true;
+			btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu left untouched: a write into it may have been torn, and no parity is left over to check the rebuild of the %u data stripe(s) whose last write did not reach the disk -- keeping the record rather than guessing",
+				      full_stripe_start,
+				      (unsigned int)hweight64(wib_holes));
+			/*
+			 * Undecidable, and more than a warning should say so.
+			 * The recovery's verdict raises the alert where it
+			 * records the stripe (scrub_raid56_mark_suspect()).
+			 */
+			if (!sctx->internal && !btrfs_wib_torn_remedy_legacy())
+				btrfs_raid56_alert(fs_info,
+						   BTRFS_RAID56_EV_TORN_UNDECIDABLE,
+						   full_stripe_start, NULL, 0);
+		} else {
+			btrfs_warn_rl(fs_info,
 "scrub: full stripe %llu left untouched: %u data stripe(s) whose last write did not reach the disk cannot be rebuilt from the parity that is left, and without a checksum there is nothing to decide it with -- keeping the record rather than guessing",
-			      full_stripe_start, (unsigned int)hweight64(wib_holes));
+				      full_stripe_start,
+				      (unsigned int)hweight64(wib_holes));
+		}
+		/* Untouched, but a replace target still needs the parity. */
+		if (sctx->raid56_whole_column)
+			return scrub_replace_copy_parity(sctx, scrub_dev, bg, map,
+							 full_stripe_start);
 		return 0;
 	}
 
@@ -2845,7 +3938,20 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 				  full_stripe_start, i, stripe->nr_sectors,
 				  &error);
 			sctx->raid56_keep_record = true;
-			return ret;
+			/*
+			 * A replace still needs this parity on the target.  And
+			 * @ret is whatever the last column's extent lookup
+			 * returned: 1 when it found none, which scrub_stripe()
+			 * takes for "stop", and the rest of the chunk was never
+			 * copied -- nor, for a scrub, scrubbed, with the scrub
+			 * reporting success.  This stripe is reported above and
+			 * keeps its record; the next one is not its business.
+			 */
+			if (sctx->raid56_whole_column)
+				return scrub_replace_copy_parity(sctx, scrub_dev,
+								 bg, map,
+								 full_stripe_start);
+			return READ_ONCE(unrepaired_stops) ? ret : 0;
 		}
 		bitmap_or(&extent_bitmap, &extent_bitmap, &has_extent,
 			  stripe->nr_sectors);
@@ -3161,9 +4267,19 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 		 * stripe it is no different than SINGLE profile.
 		 * We can reuse scrub_simple_mirror() here, as the repair part
 		 * is still based on @mirror_num.
+		 *
+		 * Except for a replace, which has to give the target the whole
+		 * column of every full stripe that holds anything, not only
+		 * the sectors of this column an extent covers.
 		 */
-		ret = scrub_simple_mirror(sctx, bg, logical, BTRFS_STRIPE_LEN,
-					  scrub_dev, physical, 1);
+		if (sctx->raid56_whole_column)
+			ret = queue_raid56_replace_column(sctx, bg, scrub_dev,
+							  logical, physical,
+							  stripe_logical + chunk_logical,
+							  nr_data_stripes(map));
+		else
+			ret = scrub_simple_mirror(sctx, bg, logical, BTRFS_STRIPE_LEN,
+						  scrub_dev, physical, 1);
 		if (ret < 0)
 			goto out;
 next:
@@ -3237,19 +4353,30 @@ out:
 	return ret;
 }
 
-static int finish_extent_writes_for_zoned(struct btrfs_root *root,
-					  struct btrfs_block_group *cache)
+/*
+ * Wait for every write already under way into @cache, which is read-only by
+ * now, and commit: afterwards everything allocated in it is on disk and in the
+ * commit root the copy looks extents up in, and nothing new can be.
+ */
+static int finish_extent_writes(struct btrfs_root *root,
+				struct btrfs_block_group *cache)
 {
 	struct btrfs_fs_info *fs_info = cache->fs_info;
-
-	if (!btrfs_is_zoned(fs_info))
-		return 0;
 
 	btrfs_wait_block_group_reservations(cache);
 	btrfs_wait_nocow_writers(cache);
 	btrfs_wait_ordered_roots(fs_info, U64_MAX, cache);
 
 	return btrfs_commit_current_transaction(root);
+}
+
+static int finish_extent_writes_for_zoned(struct btrfs_root *root,
+					  struct btrfs_block_group *cache)
+{
+	if (!btrfs_is_zoned(cache->fs_info))
+		return 0;
+
+	return finish_extent_writes(root, cache);
 }
 
 static noinline_for_stack
@@ -3429,8 +4556,24 @@ int scrub_enumerate_chunks(struct scrub_ctx *sctx,
 		 * group is not RO.
 		 */
 		ret = btrfs_inc_block_group_ro(cache, sctx->is_dev_replace);
+		/*
+		 * A replace copying whole RAID5/6 columns writes the target's
+		 * free sectors too -- free as the commit root has it.  A tree
+		 * block allocated here in the running transaction, before the
+		 * block group went read-only, sits in such a sector and is
+		 * written out at the commit, to the source and, duplicated, to
+		 * the target: possibly between the copy's read of that row and
+		 * its write, which would then put the old content back over it
+		 * on the target.  The same goes for data written since the last
+		 * commit, which the copy would rebuild instead of verifying.
+		 * Committing now, with nothing more to come into the block
+		 * group, leaves the copy nothing it does not see.
+		 */
+		sctx->raid56_whole_column = scrub_replace_copies_column(sctx, cache);
 		if (!ret && sctx->is_dev_replace) {
 			ret = finish_extent_writes_for_zoned(root, cache);
+			if (!ret && sctx->raid56_whole_column)
+				ret = finish_extent_writes(root, cache);
 			if (ret) {
 				btrfs_dec_block_group_ro(cache);
 				scrub_pause_off(fs_info);
@@ -3826,6 +4969,540 @@ void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info,
 }
 
 /*
+ * Testing only: recover a full stripe with a data column on a missing device
+ * as this code did before it classified one -- the column rebuilt out of
+ * whichever parity the read path reaches first, never compared with the
+ * other, and the stripe never recorded as undecidable.  The negative control
+ * for uml/degraded_crash.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool recover_absent_legacy;
+module_param_named(raid56_recover_absent_legacy, recover_absent_legacy, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_absent_legacy,
+		 "Recover a full stripe whose data column is on a missing device as before: never compare its two parities, never record it as undecidable (testing only: restores a known defect)");
+/*
+ * Classify such a stripe only when its record names no member, as the first
+ * version of scrub_raid56_recover_absent() did: one that names the missing
+ * column -- a write into it failed, as every write into it does -- goes down
+ * the ordinary path, which rebuilds the column out of the parity it is left
+ * with and checks nothing.  The negative control for the "named" arms of
+ * uml/degraded_crash.sh.
+ */
+static bool recover_absent_skip_named;
+module_param_named(raid56_recover_absent_skip_named, recover_absent_skip_named, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_absent_skip_named,
+		 "Recover a full stripe whose data column is on a missing device the old way whenever the write-intent log names a member of it (testing only: restores a known defect)");
+/*
+ * Record a RAID6 stripe undecidable when a checksummed or metadata sector of
+ * its missing column matches neither rebuild, as the first version of
+ * scrub_raid56_absent_pq() did, instead of leaving that sector unrepaired.
+ */
+static bool recover_absent_checked_suspect;
+module_param_named(raid56_recover_absent_checked_suspect,
+		   recover_absent_checked_suspect, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_absent_checked_suspect,
+		 "Record a RAID6 full stripe undecidable when a checksummed sector of its missing data column matches neither parity's rebuild (testing only: restores the old behaviour)");
+/*
+ * Record a full stripe undecidable as scrub_raid56_mark_suspect() did first:
+ * without an alert, whether the verdict was recorded or not.  The negative
+ * control for the alert arm of uml/torn_present.sh.
+ */
+static bool recover_suspect_silent;
+module_param_named(raid56_recover_suspect_silent, recover_suspect_silent, bool, 0644);
+MODULE_PARM_DESC(raid56_recover_suspect_silent,
+		 "Record a full stripe the recovery cannot decide without raising an alert (testing only: restores the old behaviour)");
+#else
+static const bool recover_absent_legacy;
+static const bool recover_absent_skip_named;
+static const bool recover_absent_checked_suspect;
+static const bool recover_suspect_silent;
+#endif
+
+/*
+ * Solve the absent data column @x of a full stripe twice, from what the disks
+ * hold: out of P into @dp and out of Q into @dq.  The other data columns are
+ * the ones the verify pass left in sctx->raid56_data_stripes; @x's own buffer
+ * is not an input, and nothing is read from @x's device.
+ *
+ * Both parities are read straight off their devices (@pdev, at @pphys), a
+ * page at a time.  Nothing else writes to the filesystem while the log is
+ * being recovered, and the verify pass wrote no parity, so what is read is
+ * what the crash left.
+ *
+ * Returns 0, -ENOMEM, or the error of a parity read.
+ */
+static int scrub_raid56_solve_absent(struct scrub_ctx *sctx, int data_stripes,
+				     struct btrfs_device **pdev, const u64 *pphys,
+				     int x, void *dp, void *dq)
+{
+	struct page *bounce = alloc_page(GFP_NOFS);
+	struct page *scratch = alloc_page(GFP_NOFS);
+	void **ptrs = kcalloc(data_stripes + 2, sizeof(*ptrs), GFP_NOFS);
+	int ret = 0;
+
+	if (!bounce || !scratch || !ptrs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (u32 off = 0; off < BTRFS_STRIPE_LEN; off += PAGE_SIZE) {
+		int nr = 0;
+
+		/* dP: P with every other data column taken out. */
+		ret = bdev_rw_virt(pdev[0]->bdev, (pphys[0] + off) >> SECTOR_SHIFT,
+				   page_address(bounce), PAGE_SIZE, REQ_OP_READ);
+		if (ret)
+			goto out;
+		memcpy(dp + off, page_address(bounce), PAGE_SIZE);
+		for (int i = 0; i < data_stripes; i++)
+			if (i != x)
+				ptrs[nr++] = sctx->raid56_data_stripes[i].buffer + off;
+		if (nr)
+			xor_gen(dp + off, ptrs, nr, PAGE_SIZE);
+
+		/* dQ: the same, out of Q, with P recomputed on the side. */
+		ret = bdev_rw_virt(pdev[1]->bdev, (pphys[1] + off) >> SECTOR_SHIFT,
+				   page_address(bounce), PAGE_SIZE, REQ_OP_READ);
+		if (ret)
+			goto out;
+		/* The Q of a lone data column is that column. */
+		if (data_stripes == 1) {
+			memcpy(dq + off, page_address(bounce), PAGE_SIZE);
+			continue;
+		}
+		for (int i = 0; i < data_stripes; i++)
+			ptrs[i] = i == x ? dq + off :
+				  sctx->raid56_data_stripes[i].buffer + off;
+		ptrs[data_stripes] = page_address(scratch);
+		ptrs[data_stripes + 1] = page_address(bounce);
+		raid6_recov_datap(data_stripes + 2, PAGE_SIZE, x, ptrs);
+	}
+out:
+	kfree(ptrs);
+	if (scratch)
+		__free_page(scratch);
+	if (bounce)
+		__free_page(bounce);
+	return ret;
+}
+
+/*
+ * The full stripe at @full_stripe_start is suspect: a crash may have torn a
+ * write into it while a data column it has to rebuild was on a missing device,
+ * or was named stale by the record with no parity left over to check its
+ * rebuild (SCRUB_WIB_TORN), and nothing can tell what that column held.
+ * Record every parity that is still there as not describing the data, and
+ * keep the record.
+ *
+ * That is all it takes for the rest of the system to refuse rather than guess,
+ * because the column already counts as failed everywhere -- a missing
+ * device's always, one the record names stale through mark_stale_sectors():
+ * a read of one of its sectors without a checksum then needs more members
+ * than the parity it may still use can rebuild, and fails with the
+ * read_ambiguous alert (recover_rbio()); a checksummed sector is rebuilt and
+ * verified as before, since mark_stale_sectors() exempts it; and a
+ * read-modify-write into the stripe is refused as undecidable.  The record is
+ * persisted with the log, so the next mount -- still degraded, or with the
+ * device back, which is when the stripe can be decided again -- starts from
+ * it: as the possibly torn stripe it is, from which that mount reaches this
+ * verdict again, or regenerates the parity from the data once the device is
+ * back.  The parity marks themselves are written only in a block that is wide
+ * anyway (btrfs_wib_mark_suspect_parity()): made wide by them, the log holds
+ * half as many regions, and a degraded recovery keeping more such stripes than
+ * that spent the records of some of them to keep the others, their verdicts
+ * with them.
+ *
+ * Whether or not the log could keep it, the administrator is told: the
+ * stripe's unchecksummed data reads as EIO, or, if the verdict was lost, may
+ * come back as a guess (BTRFS_RAID56_EV_TORN_UNDECIDABLE).
+ *
+ * Returns 4 (see btrfs_scrub_raid56_full_stripe()), or -EIO if the log could
+ * not keep all of it.
+ */
+static int scrub_raid56_mark_suspect(struct btrfs_fs_info *fs_info,
+				     u64 full_stripe_start, int data_stripes,
+				     int nr_parity, unsigned int present_par)
+{
+	const u64 len = btrfs_stripe_nr_to_offset(data_stripes);
+	struct btrfs_wib_stripe_state st;
+	unsigned int marked = 0;
+
+	btrfs_wib_add_sticky(fs_info, full_stripe_start, len);
+	for (int p = 0; p < nr_parity; p++) {
+		/*
+		 * Parity p is recorded in block p of the full stripe (see
+		 * btrfs_wib_disk_entry::stale_par), so a stripe with fewer data
+		 * columns than parities cannot say it about its last parity.
+		 */
+		if (!(present_par & BIT(p)) || p >= data_stripes)
+			continue;
+		btrfs_wib_mark_suspect_parity(fs_info, full_stripe_start, len, p);
+		marked |= BIT(p);
+	}
+	if (!READ_ONCE(recover_suspect_silent))
+		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_TORN_UNDECIDABLE,
+				   full_stripe_start, NULL, 0);
+	if (marked == present_par &&
+	    btrfs_wib_stripe_state(fs_info, full_stripe_start, data_stripes,
+				   nr_parity, &st) &&
+	    (st.bad_parity & marked) == marked)
+		return 4;
+	btrfs_err(fs_info,
+"scrub: full stripe %llu may hold a torn write that cannot be decided, but %s; a read of its data without a checksum that has to be rebuilt may return a wrong rebuild",
+		  full_stripe_start, marked == present_par ?
+		  "the write-intent log could not record it as undecidable" :
+		  "the write-intent log cannot record the last parity of a stripe with fewer data columns than parities");
+	return -EIO;
+}
+
+/*
+ * RAID6, both parities present, one data column (@xs) missing: the vertical
+ * stripe by vertical stripe classification that scrub_raid56_recover_absent()
+ * describes, and the parity regeneration it decides.
+ *
+ * A checksummed or metadata sector of @xs that matches neither rebuild is not
+ * a reason to call the stripe undecidable.  Its checksum already fails every
+ * read of it, so a mark on the parities would protect nothing more there;
+ * what the mark would do is fail the reads of the column's unchecksummed
+ * sectors in the rows where dP == dQ proves the rebuild, which the read path's
+ * own Q cross-check returns correctly, and refuse every write into the stripe
+ * for as long as the device is gone.  So it is left unrepaired, as on RAID5,
+ * and nothing is written: the parities are not regenerated from a column
+ * holding a sector nothing could verify.  The stripe is undecidable only where
+ * data without a checksum is at stake, i.e. dP != dQ in its rows.
+ *
+ * Returns 1, 4, -EIO or another negative error as that function does, or
+ * -EAGAIN if a parity could not be read, so that nothing could be compared.
+ */
+static int scrub_raid56_absent_pq(struct scrub_ctx *sctx,
+				  struct btrfs_chunk_map *map,
+				  u64 full_stripe_start,
+				  struct btrfs_device **pdev, const u64 *pphys,
+				  struct scrub_stripe *xs,
+				  unsigned long *extent_bitmap)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const u32 sectorsize = fs_info->sectorsize;
+	const int data_stripes = nr_data_stripes(map);
+	const int nr_parity = map->num_stripes - data_stripes;
+	const unsigned long has_extent = scrub_bitmap_read_has_extent(xs);
+	const unsigned long is_metadata = scrub_bitmap_read_is_metadata(xs);
+	const unsigned long error = scrub_bitmap_read_error(xs);
+	unsigned long suspect = 0;
+	unsigned long unrepaired = 0;
+	void *dp = kvmalloc(BTRFS_STRIPE_LEN, GFP_NOFS);
+	void *dq = kvmalloc(BTRFS_STRIPE_LEN, GFP_NOFS);
+	int ret;
+
+	if (!dp || !dq) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = scrub_raid56_solve_absent(sctx, data_stripes, pdev, pphys,
+					xs - sctx->raid56_data_stripes, dp, dq);
+	if (ret < 0 && ret != -ENOMEM) {
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu has a data column on missing devid %llu, and its parity could not be read to check it against: %d",
+			      full_stripe_start, xs->dev->devid, ret);
+		ret = -EAGAIN;
+	}
+	if (ret < 0)
+		goto out;
+
+	for (int nr = 0; nr < xs->nr_sectors; nr++) {
+		const u32 off = nr << fs_info->sectorsize_bits;
+
+		if (test_bit(nr, &has_extent) &&
+		    (test_bit(nr, &is_metadata) || xs->sectors[nr].csum)) {
+			/*
+			 * The verify pass rebuilt it from P and then from Q
+			 * and kept the first its checksum accepts.  If neither
+			 * passed, nothing here can decide it either -- and its
+			 * checksum refuses it at every read without help.
+			 */
+			if (!test_bit(nr, &error))
+				continue;
+			if (READ_ONCE(recover_absent_checked_suspect))
+				__set_bit(nr, &suspect);
+			else
+				__set_bit(nr, &unrepaired);
+			continue;
+		}
+		if (test_bit(nr, &has_extent) &&
+		    memcmp(dp + off, dq + off, sectorsize) != 0) {
+			__set_bit(nr, &suspect);
+			continue;
+		}
+		/* Free, or both parities agree: the column is dP. */
+		memcpy(xs->buffer + off, dp + off, sectorsize);
+	}
+	if (unrepaired)
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu: %u checksummed sector(s) of the data column on missing devid %llu match neither its rebuild from P nor the one from Q; they stay unrepaired and read as EIO, and the parity is left alone",
+			      full_stripe_start,
+			      bitmap_weight(&unrepaired, xs->nr_sectors),
+			      xs->dev->devid);
+	if (suspect) {
+		btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu: its two parities disagree about %u sector(s) of the data column on missing devid %llu, and no checksum can say which is right",
+			      full_stripe_start,
+			      bitmap_weight(&suspect, xs->nr_sectors),
+			      xs->dev->devid);
+		ret = scrub_raid56_mark_suspect(fs_info, full_stripe_start,
+						data_stripes, nr_parity, 3);
+		goto out;
+	}
+	/*
+	 * Nothing is written for a sector nothing verified: the regeneration
+	 * below would fold whichever guess the verify pass left in the buffer
+	 * into both parities, and with the device gone those are all there is.
+	 */
+	if (unrepaired) {
+		ret = -EIO;
+		goto out;
+	}
+
+	/*
+	 * Decided.  Regenerate both parities from the data columns as they now
+	 * stand in memory, the missing one included, without reading any of
+	 * them again: Q (or, where the checksum chose dQ, P) is rewritten to
+	 * agree.
+	 */
+	for (int p = 0; p < nr_parity; p++) {
+		ret = scrub_raid56_cached_parity(sctx, pdev[p], map,
+						 full_stripe_start, extent_bitmap);
+		if (ret < 0)
+			break;
+	}
+	/* A parity write failed (strict scrub rbio): still as it was. */
+	if (ret == -EREMOTEIO)
+		ret = -EIO;
+	/*
+	 * The column's device is still missing: the record stays, but the
+	 * stripe is consistent -- its parities describe the data, the missing
+	 * column's rows as decided -- and no longer possibly torn.
+	 */
+	if (ret == 0) {
+		sctx->raid56_absent_decided = true;
+		ret = 1;
+	}
+out:
+	kvfree(dp);
+	kvfree(dq);
+	return ret;
+}
+
+/*
+ * Write-intent log recovery of a full stripe with a data column on a device
+ * that is not there: the crash happened while the array was degraded.
+ *
+ * The ordinary recovery rebuilds such a column like any unreadable one, from
+ * the parity, and folds the result into the parity it regenerates.  After a
+ * torn write that is a guess.  A write into another column that reached its
+ * device while the parity did not (or the other way round) leaves the parity
+ * describing a vector that never existed, and the missing column "rebuilt"
+ * from it is the old content xor the change.  With a checksum the rebuild
+ * fails verification and the read fails loudly; without one -- nodatacow,
+ * nodatasum, preallocated extents -- the rebuild is simply returned, now and
+ * at every later read, and on RAID6 it silently becomes the only answer the
+ * moment a second device goes.  (syn_stripe_model.py: 384 to 161,280 wrong
+ * reads for the old rule depending on geometry, 0 for the one below.)
+ *
+ * So classify the stripe instead, never reading the missing column (it cannot
+ * be read anyway; its own checksum-verified content would be the one exception,
+ * which matters only once a device can be present and distrusted at once).
+ *
+ * @unknown is every data column the parity has to stand in for: the ones on
+ * a missing device, and the ones the record names stale, whose content on the
+ * disk is not what was acknowledged.  @bad_parity is the parities the record
+ * says no longer describe the data; with the missing ones they are not
+ * "usable".  The caller only comes here when @unknown fits within the usable
+ * parities: beyond that the record already fails every rebuild of those
+ * columns' unchecksummed sectors (mark_stale_sectors()), a stripe marked
+ * suspect by an earlier mount included, and there is nothing to decide.
+ *
+ * RAID6 with both parities usable and one unknown data column X, on the
+ * missing device -- solve X out of P (dP) and out of Q (dQ), vertical stripe by
+ * vertical stripe:
+ *   dP == dQ			consistent; nothing to do.
+ *   X holds no extent		X := dP; the regeneration rewrites Q to agree,
+ *				so that a later loss of a second device finds
+ *				two parities describing the same vector.
+ *   X checksummed or metadata	the verify pass already took the first of
+ *				dP, dQ that verifies, and the regeneration
+ *				rewrites the parity that disagrees.  If neither
+ *				verifies the sector stays unrepaired and nothing
+ *				is written (scrub_raid56_absent_pq()).
+ *   anything else		suspect.
+ *
+ * Otherwise -- RAID5, or RAID6 with a parity missing or recorded stale, or a
+ * second data column missing or recorded stale -- there is nothing left to
+ * compare with:
+ *   an unknown column holds a referenced sector without a checksum
+ *			suspect.
+ *   otherwise		leave the parity alone.  A checksummed X was verified
+ *			against the parity left, and regenerating that parity
+ *			from the rebuild would give it back unchanged.
+ *
+ * One suspect vertical stripe makes the full stripe suspect, since the record
+ * describes whole parities: scrub_raid56_mark_suspect().  Nothing is written
+ * then, nor before it: the verify pass reads a column the record names as it
+ * is, and rebuilds only what a checksum verifies (@raid56_verify_only), since
+ * the rebuild the record would ask for -- from every parity, none left over --
+ * is what the classification is deciding.  A present data column the verify
+ * pass could not clean up counts as nothing to compare with too: dP and dQ
+ * would be computed from it.
+ *
+ * The record naming X changes none of this, although it is the usual case: a
+ * write into X while its device is gone "fails" there, so X is named stale
+ * and the record kept -- and the write was acknowledged, its value only in the
+ * parity.  A later write into the same full stripe, torn by the crash, then
+ * leaves that parity describing a vector that never existed just as it does
+ * for an X nobody named, and the name adds nothing a read could use: X is
+ * failed already, so mark_stale_sectors() finds room in the budget, and the
+ * single-parity rebuild runs unchecked.  Nor does the plan the ordinary path
+ * makes from the record help (scrub_raid56_plan_wib()): a column on a missing
+ * device is a hole it counts, never one it has to rebuild, and a stripe with
+ * nothing else named passes it as having nothing to do.
+ *
+ * The cost is availability after any mount that meets such a record while
+ * the device is still gone, crash or not: a record does not say whether a
+ * write was torn after it was made, so a RAID5 stripe written into while
+ * degraded refuses its missing column's unchecksummed data, and writes into
+ * it, until the device is back.  Refused, not wrong.
+ *
+ * "Referenced" and "free" mean something only once the extent tree is
+ * complete, so with a tree log still to replay (@classify false) this only
+ * verifies and keeps the record; btrfs_wib_recover_after_replay() comes back
+ * to it.
+ *
+ * Returns 1 (decided as far as it can be; the record stays while the device
+ * is missing), 4 (suspect, recorded), -EIO if a present sector with an extent
+ * or a checksummed sector of an unknown column could not be repaired, a
+ * parity could not be read or written, or the suspect stripe could not be
+ * recorded, or another negative error.
+ */
+static int scrub_raid56_recover_absent(struct scrub_ctx *sctx,
+				       struct btrfs_block_group *bg,
+				       struct btrfs_chunk_map *map,
+				       u64 full_stripe_start, int rot,
+				       u64 unknown, unsigned int bad_parity,
+				       bool classify)
+{
+	struct btrfs_fs_info *fs_info = sctx->fs_info;
+	const int data_stripes = nr_data_stripes(map);
+	const int nr_parity = map->num_stripes - data_stripes;
+	struct btrfs_device *pdev[2] = { NULL, NULL };
+	u64 pphys[2] = { 0, 0 };
+	unsigned long extent_bitmap = 0;
+	unsigned int present_par = 0;
+	unsigned int usable_par;
+	bool present_unclean = false;
+	bool unrepaired = false;
+	struct scrub_stripe *xs = NULL;
+	u64 nocsum_devid = 0;
+	bool nocsum_missing = false;
+	int ret;
+
+	for (int p = 0; p < nr_parity; p++) {
+		const int idx = (data_stripes + p + rot) % map->num_stripes;
+
+		if (!map->stripes[idx].dev->bdev)
+			continue;
+		pdev[p] = map->stripes[idx].dev;
+		pphys[p] = map->stripes[idx].physical + btrfs_stripe_nr_to_offset(rot);
+		present_par |= BIT(p);
+	}
+	usable_par = present_par & ~bad_parity;
+	/* No parity left: nothing to verify against or to record anything on. */
+	if (!present_par)
+		return 1;
+
+	/*
+	 * Verify and repair the data columns, and write no parity.  Nor act on
+	 * the record: the columns it names are among @unknown, which is what
+	 * is being decided (scrub_raid56_plan_wib()).
+	 */
+	sctx->raid56_verify_only = true;
+	ret = scrub_raid56_parity_stripe(sctx, pdev[__ffs(present_par)], bg, map,
+					 full_stripe_start, false);
+	sctx->raid56_verify_only = false;
+	if (ret < 0)
+		return ret;
+
+	for (int i = 0; i < data_stripes; i++) {
+		struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
+		const unsigned long has_extent = scrub_bitmap_read_has_extent(stripe);
+		const unsigned long is_metadata = scrub_bitmap_read_is_metadata(stripe);
+		const unsigned long error = scrub_bitmap_read_error(stripe);
+		int nr;
+
+		/* The block group went away before the pass read anything. */
+		if (stripe->logical != full_stripe_start + btrfs_stripe_nr_to_offset(i))
+			return 1;
+		extent_bitmap |= has_extent;
+		if (!(unknown & BIT_ULL(i))) {
+			/*
+			 * Any error, a free sector's too: dP and dQ would be
+			 * computed from whatever that buffer holds.
+			 */
+			if (error || stripe->write_error_bitmap)
+				present_unclean = true;
+			if ((error | stripe->write_error_bitmap) & has_extent)
+				unrepaired = true;
+			continue;
+		}
+		/*
+		 * A missing column's write errors are the repair writes to a
+		 * device that is not there, which always fail: not news.  A
+		 * named column on a device that is there took its repair or
+		 * did not.
+		 */
+		if (stripe->dev->bdev && (stripe->write_error_bitmap & has_extent))
+			unrepaired = true;
+		for_each_set_bit(nr, &has_extent, stripe->nr_sectors) {
+			if (!test_bit(nr, &is_metadata) && !stripe->sectors[nr].csum) {
+				nocsum_devid = stripe->dev->devid;
+				nocsum_missing = !stripe->dev->bdev;
+			} else if (test_bit(nr, &error)) {
+				unrepaired = true;
+			}
+		}
+		xs = stripe;
+	}
+	/* Nothing referenced anywhere in the full stripe: nothing to lose. */
+	if (!extent_bitmap)
+		return 1;
+	if (!classify)
+		return unrepaired ? -EIO : 1;
+
+	/*
+	 * One unknown column is the missing one (the caller found one), and
+	 * @xs is it.
+	 */
+	if (nr_parity == 2 && usable_par == 3 && hweight64(unknown) == 1 &&
+	    !present_unclean &&
+	    btrfs_wib_stripe_error(fs_info, full_stripe_start, data_stripes) !=
+	    BTRFS_WIB_STRIPE_PARTIAL_ERROR) {
+		ret = scrub_raid56_absent_pq(sctx, map, full_stripe_start, pdev,
+					     pphys, xs, &extent_bitmap);
+		if (ret != -EAGAIN)
+			return ret;
+		/* A parity did not read: nothing to compare with after all. */
+		unrepaired = true;
+	}
+	if (!nocsum_devid)
+		return unrepaired ? -EIO : 1;
+	btrfs_warn_rl(fs_info,
+"scrub: full stripe %llu: devid %llu holds data without a checksum in a data column that has to be rebuilt (%s), and no parity is left over to check that rebuild against",
+		      full_stripe_start, nocsum_devid,
+		      nocsum_missing ? "its device is missing" :
+		      "the write-intent log records it stale");
+	return scrub_raid56_mark_suspect(fs_info, full_stripe_start, data_stripes,
+					 nr_parity, present_par);
+}
+
+/*
  * Scrub one RAID56 full stripe for the write-intent log recovery: verify
  * every sector that holds an extent (data checksums, tree block headers),
  * repair the bad ones from the parity and write them back, and recompute
@@ -3841,32 +5518,55 @@ void btrfs_scrub_raid56_recovery_end(struct btrfs_fs_info *fs_info,
  * the data on disk, which covers extents the extent tree does not know yet
  * (tree log).
  *
+ * A full stripe with a data column on a missing device is classified by
+ * scrub_raid56_recover_absent() instead, if @torn -- its record says a write
+ * into it may have been torn, see wib_recover_one() -- except in VERIFY mode
+ * and unless its record already makes it undecidable.
+ * @log_replay_pending: a tree log is still to be replayed, so the extent tree
+ * does not know every extent yet; such a stripe is then only verified and kept
+ * for btrfs_wib_recover_after_replay().
+ * @unwritten_par: set, on a return of 1, to the parities on a missing device
+ * when they are all that is missing and every parity that is there was
+ * regenerated from the data: the stripe is consistent but for those.  Or to
+ * BTRFS_WIB_STRIPE_DECIDED when a data column is what is missing, and the
+ * classification decided it and regenerated both parities
+ * (scrub_raid56_absent_pq()).  0 otherwise.
+ *
  * Return 0 if every extent found was verified or repaired (and, unless
  * VERIFY, the full stripe is consistent), 1 if a device of the chunk is
  * missing (its sectors were not repaired), 3 in SCRUB mode if the scrub
  * declined the stripe or could not get its repair onto the disk (the record
  * must stay), 2 if every extent was verified
  * but the parity of a vertical stripe with an unreadable sector holding no
- * extent could not be recomputed, -EIO if a sector holding an extent could
- * not be repaired or a parity write failed (the parity is then left alone
- * where it may still allow the repair later), -ENOENT if @full_stripe_start
- * is not in a RAID56 block group (anymore), or another negative error.
+ * extent could not be recomputed, 4 if a torn write left the stripe
+ * undecidable -- a data column on a missing device, or one the record names
+ * that no parity left over could check the rebuild of (every present parity is
+ * recorded stale; the record must stay) -- -EIO if a sector holding an extent
+ * could not be repaired or a parity write failed (the parity is then left
+ * alone where it may still allow the repair later), -ENOENT if
+ * @full_stripe_start is not in a RAID56 block group (anymore), or another
+ * negative error.
  */
 int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 				   struct scrub_ctx *sctx,
 				   u64 full_stripe_start,
-				   enum btrfs_raid56_recover_mode mode)
+				   enum btrfs_raid56_recover_mode mode,
+				   bool log_replay_pending, bool torn,
+				   unsigned int *unwritten_par)
 {
 	const bool regen = mode != BTRFS_RAID56_RECOVER_VERIFY;
+	struct btrfs_wib_stripe_state st;
 	struct btrfs_block_group *bg;
 	struct btrfs_chunk_map *map = NULL;
 	u64 fstripe_len;
 	bool missing = false;
+	u64 absent = 0;
 	int data_stripes;
 	u32 rem;
 	int rot;
 	int ret;
 
+	*unwritten_par = 0;
 	bg = btrfs_lookup_block_group(fs_info, full_stripe_start);
 	if (!bg)
 		return -ENOENT;
@@ -3888,6 +5588,13 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 		if (!map->stripes[i].dev->bdev)
 			missing = true;
 	}
+	/* The data columns on a missing device, in full stripe order. */
+	if (missing && data_stripes <= 64 &&
+	    map->num_stripes - data_stripes <= 2) {
+		for (int c = 0; c < data_stripes; c++)
+			if (!map->stripes[(c + rot) % map->num_stripes].dev->bdev)
+				absent |= BIT_ULL(c);
+	}
 
 	/* Reused across the run; only a differently shaped chunk reallocates. */
 	ret = scrub_alloc_raid56_data_stripes(sctx, bg, data_stripes);
@@ -3896,6 +5603,77 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 
 	sctx->raid56_defer_retire = mode == BTRFS_RAID56_RECOVER_SCRUB;
 	sctx->raid56_keep_record = false;
+	sctx->raid56_torn = torn;
+	sctx->raid56_torn_undecided = false;
+	sctx->raid56_absent_decided = false;
+
+	/*
+	 * A data column on a missing device.  The passes below would rebuild it
+	 * from whichever parity the read path reaches first and fold that into
+	 * the parity they regenerate, which after a torn write is a guess; see
+	 * scrub_raid56_recover_absent().
+	 *
+	 * Whatever the record names.  The usual record here names the missing
+	 * column itself -- every write into it while the device is gone fails
+	 * there -- and the plan the passes would make from it
+	 * (scrub_raid56_plan_wib()) never has to rebuild a column on a device
+	 * that is not there, so it has nothing to do, and the passes rebuild
+	 * the column exactly as for a stripe nothing named.  The named columns
+	 * are unknown along with the missing ones, and the parities the record
+	 * condemns cannot be used to decide them.
+	 *
+	 * The one stripe left to the passes is one with more unknown columns
+	 * than usable parities: the record already fails every rebuild of their
+	 * unchecksummed sectors, and there is nothing to compare with.  That is
+	 * the verdict of an earlier mount's pass through here too -- every
+	 * parity still there recorded stale -- which stands until the device
+	 * is back.
+	 *
+	 * And only where a write into the stripe may have been torn (@torn): in
+	 * flight at the crash, or marked possibly torn before it.  A record of
+	 * a plain failed write names what the failure left stale and nothing
+	 * else went wrong since, so the parity describes the acknowledged data
+	 * and the passes rebuild the missing column from it exactly.
+	 * Classified, its unchecksummed sectors would read as EIO until the
+	 * device is back, for nothing.
+	 */
+	if (absent && torn && mode != BTRFS_RAID56_RECOVER_VERIFY &&
+	    !READ_ONCE(recover_absent_legacy)) {
+		const int nr_parity = map->num_stripes - data_stripes;
+		const bool named = btrfs_wib_stripe_state(fs_info, full_stripe_start,
+							  data_stripes, nr_parity,
+							  &st);
+		const u64 unknown = absent | st.stale_cols;
+		unsigned int usable = 0;
+
+		for (int p = 0; p < nr_parity; p++) {
+			const int idx = (data_stripes + p + rot) % map->num_stripes;
+
+			if (map->stripes[idx].dev->bdev && !(st.bad_parity & BIT(p)))
+				usable |= BIT(p);
+		}
+		if (!(named && READ_ONCE(recover_absent_skip_named)) &&
+		    hweight64(unknown) <= hweight32(usable)) {
+			ret = scrub_raid56_recover_absent(sctx, bg, map,
+							  full_stripe_start, rot,
+							  unknown, st.bad_parity,
+							  !log_replay_pending);
+			if (ret == 1 && sctx->raid56_absent_decided)
+				*unwritten_par = BTRFS_WIB_STRIPE_DECIDED;
+			goto out_map;
+		}
+		/*
+		 * The parities the record condemns stand -- as the verdict of
+		 * an earlier mount, reloaded from a wide log block as the stale
+		 * parities it made, or as parities a write left stale -- and
+		 * they are all that keeps a read of the missing column's
+		 * unchecksummed data from a rebuild out of them: a full log
+		 * spends them last, as it does this mount's verdicts.
+		 */
+		if (st.bad_parity)
+			btrfs_wib_keep_prior_verdict(fs_info, full_stripe_start,
+						     st.bad_parity);
+	}
 
 	/*
 	 * Every parity stripe of the full stripe is regenerated by a separate
@@ -3923,6 +5701,27 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 		/* A parity write failed (strict scrub rbio): still stale. */
 		ret = -EIO;
 	}
+	/*
+	 * A pass left the stripe untouched because a write into it may have
+	 * been torn and no parity was left over to check the rebuild of a
+	 * column the record names (SCRUB_WIB_TORN).  Undecidable, as a stripe
+	 * with such a column on a missing device is: record it so, so that the
+	 * reads and writes that would need that rebuild fail rather than make
+	 * it (scrub_raid56_mark_suspect()).  Whatever else went wrong in the
+	 * stripe, this is its verdict.
+	 */
+	if (ret == 0 && sctx->raid56_torn_undecided) {
+		const int nr_parity = map->num_stripes - data_stripes;
+		unsigned int present_par = 0;
+
+		for (int p = 0; p < nr_parity; p++)
+			if (map->stripes[(data_stripes + p + rot) % map->num_stripes].dev->bdev)
+				present_par |= BIT(p);
+		ret = present_par ?
+		      scrub_raid56_mark_suspect(fs_info, full_stripe_start, data_stripes,
+						nr_parity, present_par) : 3;
+		goto out_map;
+	}
 	if (ret == 0) {
 		for (int i = 0; i < data_stripes; i++) {
 			struct scrub_stripe *stripe = &sctx->raid56_data_stripes[i];
@@ -3938,6 +5737,32 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 				break;
 			}
 		}
+	}
+	/*
+	 * Consistent but for the parities on a missing device: every data
+	 * column is there and was verified, every parity that is there was
+	 * regenerated from it, and no pass declined anything -- nor had to
+	 * regenerate without the extents only a tree log still to be replayed
+	 * knows.  The missing parities were not rewritten; what they hold is
+	 * all that may still describe a write a crash tore, and the caller
+	 * records them stale rather than the stripe possibly torn.
+	 */
+	if (ret == 0 && missing && regen && !log_replay_pending &&
+	    !sctx->raid56_keep_record) {
+		const int nr_parity = map->num_stripes - data_stripes;
+		unsigned int gone = 0;
+		bool data_gone = false;
+
+		for (int c = 0; c < map->num_stripes; c++) {
+			if (map->stripes[(c + rot) % map->num_stripes].dev->bdev)
+				continue;
+			if (c < data_stripes)
+				data_gone = true;
+			else
+				gone |= BIT(c - data_stripes);
+		}
+		if (!data_gone && gone != GENMASK(nr_parity - 1, 0))
+			*unwritten_par = gone;
 	}
 	if (ret == 0 && missing)
 		ret = 1;
@@ -3970,6 +5795,8 @@ int btrfs_scrub_raid56_full_stripe(struct btrfs_fs_info *fs_info,
 	}
 
 out_map:
+	sctx->raid56_defer_retire = false;
+	sctx->raid56_torn = false;
 	btrfs_free_chunk_map(map);
 out_bg:
 	btrfs_put_block_group(bg);

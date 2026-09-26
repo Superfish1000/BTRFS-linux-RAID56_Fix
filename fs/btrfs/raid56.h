@@ -337,5 +337,8 @@ void btrfs_raid56_start_repairs(struct btrfs_fs_info *fs_info);
 int btrfs_raid56_pause_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_resume_repairs(struct btrfs_fs_info *fs_info);
 void btrfs_raid56_drain_repairs(struct btrfs_fs_info *fs_info);
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_raid56_no_repair_on_fault(void);
+#endif
 
 #endif

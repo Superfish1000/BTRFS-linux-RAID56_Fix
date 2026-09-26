@@ -1351,6 +1351,7 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 	bool enabled;
 	unsigned int nr_inflight = 0;
 	unsigned int nr_sticky = 0;
+	unsigned int nr_torn = 0;
 
 	if (!wib)
 		return sysfs_emit(buf, "unsupported\n");
@@ -1360,11 +1361,12 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		nr_inflight += hweight64(wib->entries[i].bitmap);
 		nr_sticky += hweight64(wib->entries[i].sticky);
+		nr_torn += hweight64(wib->entries[i].torn);
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 
 	return sysfs_emit(buf,
-		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nsticky_total %llu\nsticky_evicted %llu\nstale_evicted %llu\nstale_query_fast %llu\nstale_query_slow %llu\nscrub_skipped_stale %llu\nread_ambiguous %llu\nrepair_queued %llu\nrepair_ok %llu\nrepair_failed %llu\nrepair_dropped %llu\nrepair_skipped %llu\n",
+		"enabled %d\ninflight_blocks %u\nsticky_blocks %u\npending_recovery_regions %u\nmarks %llu\ncommits %llu\ncommit_flushes %llu\ncommit_errors %llu\nrecovered_stripes %llu\nrecovery_errors %llu\nrecovery_suspect %llu\nsticky_total %llu\nsticky_evicted %llu\nstale_evicted %llu\nstale_query_fast %llu\nstale_query_slow %llu\nscrub_skipped_stale %llu\nread_ambiguous %llu\nrepair_queued %llu\nrepair_ok %llu\nrepair_failed %llu\nrepair_dropped %llu\nrepair_skipped %llu\ntorn_blocks %u\n",
 		enabled, nr_inflight, nr_sticky, wib->nr_pending,
 		(unsigned long long)atomic64_read(&wib->stat_marks),
 		(unsigned long long)atomic64_read(&wib->stat_commits),
@@ -1372,6 +1374,7 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&wib->stat_commit_errors),
 		(unsigned long long)atomic64_read(&wib->stat_recovered_stripes),
 		(unsigned long long)atomic64_read(&wib->stat_recovery_errors),
+		(unsigned long long)atomic64_read(&wib->stat_recovery_suspect),
 		(unsigned long long)atomic64_read(&wib->stat_sticky),
 		(unsigned long long)atomic64_read(&wib->stat_sticky_evicted),
 		(unsigned long long)atomic64_read(&wib->stat_stale_evicted),
@@ -1383,7 +1386,8 @@ static ssize_t btrfs_raid56_write_intent_show(struct kobject *kobj,
 		(unsigned long long)atomic64_read(&wib->stat_repair_ok),
 		(unsigned long long)atomic64_read(&wib->stat_repair_failed),
 		(unsigned long long)atomic64_read(&wib->stat_repair_dropped),
-		(unsigned long long)atomic64_read(&wib->stat_repair_skipped));
+		(unsigned long long)atomic64_read(&wib->stat_repair_skipped),
+		nr_torn);
 }
 BTRFS_ATTR(, raid56_write_intent, btrfs_raid56_write_intent_show);
 

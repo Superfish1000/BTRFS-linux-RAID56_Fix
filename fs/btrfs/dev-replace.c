@@ -22,6 +22,7 @@
 #include "fs.h"
 #include "accessors.h"
 #include "scrub.h"
+#include "raid56-wib.h"
 
 /*
  * Device replace overview
@@ -347,10 +348,21 @@ int btrfs_run_dev_replace(struct btrfs_trans_handle *trans)
 	struct extent_buffer *eb;
 	struct btrfs_dev_replace_item *ptr;
 	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	/*
+	 * The RAID5/6 write-intent log dropped a record of zeros the running
+	 * replace put on its target (btrfs_wib_replace_marks_lost()).  The
+	 * replace fails -- but resumed from this item first, after a crash or
+	 * a suspend for unmount that came before, it would not copy that
+	 * stripe again, and would finish with the zeros unrecorded.  Say to
+	 * resume from the start, where every stripe is copied or recorded
+	 * again.
+	 */
+	const bool rewind = btrfs_wib_replace_marks_lost(fs_info);
 
 	down_read(&dev_replace->rwsem);
 	if (!dev_replace->is_valid ||
-	    !dev_replace->item_needs_writeback) {
+	    (!dev_replace->item_needs_writeback &&
+	     !(rewind && dev_replace->cursor_left_last_write_of_item))) {
 		up_read(&dev_replace->rwsem);
 		return 0;
 	}
@@ -428,7 +440,7 @@ int btrfs_run_dev_replace(struct btrfs_trans_handle *trans)
 	btrfs_set_dev_replace_num_uncorrectable_read_errors(eb, ptr,
 		atomic64_read(&dev_replace->num_uncorrectable_read_errors));
 	dev_replace->cursor_left_last_write_of_item =
-		dev_replace->cursor_left;
+		rewind ? 0 : dev_replace->cursor_left;
 	btrfs_set_dev_replace_cursor_left(eb, ptr,
 		dev_replace->cursor_left_last_write_of_item);
 	btrfs_set_dev_replace_cursor_right(eb, ptr,
@@ -953,6 +965,19 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
 		scrub_ret = btrfs_set_target_alloc_state(src_device, tgt_device);
 		if (scrub_ret)
 			goto error;
+		/*
+		 * The RAID5/6 stale marks for what the copy could not put on
+		 * the target apply from the first read the target serves,
+		 * which waits for the rwsem held here -- unless the
+		 * write-intent log had to drop one, and the target would serve
+		 * zeros nothing records: then the replace fails.
+		 */
+		scrub_ret = btrfs_wib_replace_end(fs_info, true);
+		if (scrub_ret) {
+			dev_replace->replace_state =
+				BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED;
+			goto error;
+		}
 		btrfs_dev_replace_update_device_in_mapping_tree(fs_info,
 								src_device,
 								tgt_device);
@@ -964,6 +989,8 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
 				 src_device->devid,
 				 btrfs_dev_name(tgt_device), scrub_ret);
 error:
+		/* ... and go with the target when it is not kept. */
+		btrfs_wib_replace_end(fs_info, false);
 		up_write(&dev_replace->rwsem);
 		mutex_unlock(&fs_info->chunk_mutex);
 		mutex_unlock(&fs_devices->device_list_mutex);
@@ -1297,13 +1324,52 @@ suspend:
 	return ret;
 }
 
+/*
+ * Testing only: raid56_wf_resume_fail_warns=1 lets a device replace resumed at
+ * mount that fails raise a kernel warning, with its backtrace, as it did
+ * before -- also for the failures the replace makes on purpose and has
+ * reported already: its target failing writes, a sector it could neither copy
+ * nor record, a record of zeros on its target the RAID5/6 write-intent log had
+ * to drop.  The negative control for the resume-lost arm of
+ * uml/replace_marks_kept.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool resume_fail_warns;
+module_param_named(raid56_wf_resume_fail_warns, resume_fail_warns, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_resume_fail_warns,
+		 "Let a device replace resumed at mount that fails raise a kernel warning with a backtrace, as for a bug, although it reported why (testing only: restores a known defect)");
+#else
+static const bool resume_fail_warns;
+#endif
+
 static int btrfs_dev_replace_kthread(void *data)
 {
 	struct btrfs_fs_info *fs_info = data;
 	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	const u64 uncopyable = atomic64_read(&dev_replace->num_uncorrectable_read_errors);
+	u64 start = dev_replace->committed_cursor_left;
+	u64 srcdevid;
 	u64 progress;
 	int ret;
 
+	/*
+	 * What the replace copied before the crash or unmount includes zeros
+	 * where it could neither copy nor rebuild, and the RAID5/6
+	 * write-intent log reloaded its record of them as ordinary marks, which
+	 * a full log may spend: copy again from the start, and every one is
+	 * recorded again as the replace's own.
+	 */
+	if (btrfs_wib_replace_resume_rewinds(fs_info, uncopyable)) {
+		down_write(&dev_replace->rwsem);
+		dev_replace->cursor_left = 0;
+		dev_replace->item_needs_writeback = 1;
+		up_write(&dev_replace->rwsem);
+		start = 0;
+		btrfs_info(fs_info,
+"dev_replace: %llu sector(s) could not be copied before it was interrupted; copying again from the start, so that the raid56 write-intent log keeps its record of the zeros put there",
+			   uncopyable);
+	}
+	srcdevid = dev_replace->srcdev->devid;
 	progress = btrfs_dev_replace_progress(fs_info);
 	progress = div_u64(progress, 10);
 	btrfs_info(fs_info,
@@ -1313,12 +1379,24 @@ static int btrfs_dev_replace_kthread(void *data)
 		btrfs_dev_name(dev_replace->tgtdev),
 		(unsigned int)progress);
 
-	ret = btrfs_scrub_dev(fs_info, dev_replace->srcdev->devid,
-			      dev_replace->committed_cursor_left,
+	ret = btrfs_scrub_dev(fs_info, dev_replace->srcdev->devid, start,
 			      btrfs_device_get_total_bytes(dev_replace->srcdev),
 			      &dev_replace->scrub_progress, false, true);
 	ret = btrfs_dev_replace_finishing(fs_info, ret);
-	WARN_ON(ret && ret != -ECANCELED);
+	/*
+	 * Not a bug: a replace fails when its target fails writes, or when it
+	 * can neither copy a sector nor record that it could not, and those
+	 * have said why already.  Nobody waits for this thread's result, so
+	 * say that it failed.
+	 */
+	if (ret && ret != -ECANCELED) {
+		if (READ_ONCE(resume_fail_warns))
+			WARN_ON(1);
+		else
+			btrfs_err(fs_info,
+"dev_replace of devid %llu resumed at mount failed: %d; the messages before this one say why, and 'btrfs replace status' where it stands",
+				  srcdevid, ret);
+	}
 
 	btrfs_exclop_finish(fs_info);
 	return 0;

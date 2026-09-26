@@ -89,6 +89,33 @@
  */
 #define RBIO_CSUMS_KNOWN_BIT		9
 
+/*
+ * Set by raid56_parity_recover() on a read of a mixed (DATA|METADATA) block
+ * group made for a data inode that keeps no checksums, or by relocation for a
+ * range that has none (bio_reads_nocsum_data()).  fill_data_csums()
+ * cannot look in a mixed block group, so the reader is the only thing that
+ * says the sectors it asked for are unchecked data.  See
+ * rbio_sector_unchecked().
+ */
+#define RBIO_MIXED_NOCSUM_BIT		10
+
+/*
+ * Set by raid56_parity_recover() on a scrub read that asks only for sectors no
+ * extent holds: a RAID5/6 device replace rebuilding the free sectors of a
+ * column (scrub_replace_splits_free()).  There is no data there for a torn
+ * parity to make wrong: the rebuild is what makes the row agree with its
+ * parity, which is what the replace's target has to hold.  See recover_rbio().
+ */
+#define RBIO_READS_FREE_BIT		11
+
+/*
+ * Set by mark_stale_sectors() with RBIO_STALE_AMBIGUOUS_BIT on a write whose
+ * stripe the write-intent log names a data column of, which only the last
+ * parity left could rebuild, while it marks the stripe possibly torn: that
+ * rebuild is a guess.  For the refusal's message, see rmw_rbio().
+ */
+#define RBIO_STALE_TORN_BIT		12
+
 #ifdef CONFIG_BTRFS_DEBUG
 /*
  * Crash injection for testing the write-intent log, module parameter
@@ -1704,6 +1731,21 @@ static void generate_pq_vertical(struct btrfs_raid_bio *rbio, int sectornr)
 			rbio->stripe_uptodate_bitmap);
 }
 
+/*
+ * Testing only: copy to a replace target only the sectors of the source's
+ * column a write supplied or repaired, as rmw_assemble_write_bios() used to,
+ * and not the ones it read to compute the parity.  The negative control for
+ * uml/replace_rmw_resident.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_skips_resident;
+module_param_named(raid56_wf_replace_skips_resident, replace_skips_resident, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_skips_resident,
+		 "During a device replace, do not copy to the new device the sectors of the old one a read-modify-write read to compute its parity (testing only: restores a known defect)");
+#else
+static const bool replace_skips_resident;
+#endif
+
 static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 				   struct bio_list *bio_list, int crash_point)
 {
@@ -1832,8 +1874,22 @@ static int rmw_assemble_write_bios(struct btrfs_raid_bio *rbio,
 
 		if (stripe < rbio->nr_data) {
 			paddrs = sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
+			/*
+			 * Every data sector of a touched vertical stripe, not
+			 * only the ones this write supplies or repairs: the
+			 * new parity was computed from what the source holds
+			 * there (read, or rebuilt), and the target has to hold
+			 * the same.  The copy of this column may already have
+			 * put something else on the target -- a free sector is
+			 * rebuilt from the parity of the time, which says
+			 * nothing about what the source holds -- and then,
+			 * once the source is gone, a rebuild of any other
+			 * column of the row from this parity and the target
+			 * comes out wrong, with nothing to tell.
+			 */
 			if (paddrs == NULL &&
-			    test_bit(total_sector_nr, rbio->repair_bitmap))
+			    (!READ_ONCE(replace_skips_resident) ||
+			     test_bit(total_sector_nr, rbio->repair_bitmap)))
 				paddrs = rbio_stripe_paddrs(rbio, stripe, sectornr);
 			if (paddrs == NULL)
 				continue;
@@ -1958,6 +2014,22 @@ static void rbio_update_error_bitmap(struct btrfs_raid_bio *rbio, struct bio *bi
 	     (bio_size >> rbio->bioc->fs_info->sectorsize_bits); i++)
 		set_bit(i, rbio->error_bitmap);
 }
+
+/*
+ * Testing only: let a read-modify-write or a repair rebuild a data column the
+ * write-intent log names stale from the last parity left, and write it back,
+ * although the log marks the full stripe possibly torn -- as it did while only
+ * scrub (SCRUB_WIB_TORN) and the read path (btrfs_wib_stripe_torn()) asked.
+ * The negative control for the repair arms of uml/torn_present.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool rmw_trusts_torn;
+module_param_named(raid56_rmw_trusts_torn, rmw_trusts_torn, bool, 0644);
+MODULE_PARM_DESC(raid56_rmw_trusts_torn,
+		 "Let a read-modify-write or a repair write back a data column the write-intent log names stale, rebuilt with no parity left over to check it, into a full stripe it marks possibly torn (testing only: restores a known defect)");
+#else
+static const bool rmw_trusts_torn;
+#endif
 
 /*
  * Treat the sectors the write-intent log records as stale the way a failed
@@ -2094,6 +2166,50 @@ static void mark_stale_sectors(struct btrfs_raid_bio *rbio)
 		if (add)
 			set_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags);
 		return;
+	}
+
+	/*
+	 * Within the budget, but with no parity left over to check the rebuild
+	 * of a named data column, in a full stripe the log marks possibly torn
+	 * (btrfs_wib_stripe_torn()): a write into it may have landed on some
+	 * devices and not others, so the parity may not describe the data in
+	 * the rows that write touched, and there the rebuild is the column xor
+	 * whatever the torn write changed.  A read hands no such rebuild back
+	 * (recover_rbio()), and scrub writes none (SCRUB_WIB_TORN).  A write
+	 * would write it back over the column -- which the crash, or the flush
+	 * the name comes from, may have left right -- and drop the name, and
+	 * the column would then read back as that guess with no error at all.
+	 * A repair queued for the name does it on its own, without any write.
+	 * Refuse, as for an undecidable stripe: nothing of the stripe changes.
+	 * Not a column whose every sector has a checksum, which is left to it
+	 * below; a read that will rebuild anyway leaves the refusing to
+	 * recover_rbio(), which asks row by row.
+	 */
+	if (rbio->operation == BTRFS_RBIO_WRITE && add &&
+	    nr_failed + hweight64(add) == nr_parity && !READ_ONCE(rmw_trusts_torn)) {
+		bool unchecked = false;
+
+		for (int i = 0; i < rbio->nr_data && !unchecked; i++) {
+			const int first = i * rbio->stripe_nsectors;
+
+			if (!(want & BIT_ULL(i)))
+				continue;
+			for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
+				if (!rbio->csum_bitmap ||
+				    !test_bit(first + nr, rbio->csum_bitmap)) {
+					unchecked = true;
+					break;
+				}
+			}
+		}
+		if (unchecked &&
+		    btrfs_wib_stripe_torn(fs_info, rbio->bioc->full_stripe_logical,
+					  (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT)) {
+			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
+			set_bit(RBIO_STALE_TORN_BIT, &rbio->flags);
+			set_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags);
+			return;
+		}
 	}
 
 	/*
@@ -2883,7 +2999,9 @@ out:
  * Testing only: hand back a rebuild nothing can check, as this code used to --
  * one that had to use a column recorded stale (rbio_rebuilt_unverified()), or
  * a RAID6 retry from one parity when the other disagrees
- * (set_rbio_raid6_extra_error()).
+ * (set_rbio_raid6_extra_error()).  Both only ever ask rbio_sector_unchecked(),
+ * so this is also exactly the old behaviour of a mixed block group, where
+ * nothing counted as unchecked (tools/testing/btrfs/uml/mixed_unchecked.sh).
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool read_trusts_ambiguous;
@@ -2892,6 +3010,40 @@ MODULE_PARM_DESC(raid56_read_trusts_ambiguous,
 		 "Return data rebuilt from a column recorded stale, or from one RAID6 parity the other contradicts, when nothing can check it (testing only: restores known defects)");
 #else
 static const bool read_trusts_ambiguous;
+#endif
+
+/*
+ * Testing only: let a read-only mount hand back a rebuild of data without a
+ * checksum out of a full stripe the write-intent log lists as possibly torn,
+ * with no parity left over to check it, as it did before
+ * rbio_rebuilt_unchecked_row() -- the torn parity's guess returned as the
+ * file's content.  The negative control for the read-only phase of
+ * uml/degraded_crash.sh.  raid56_read_trusts_ambiguous, which the probes that
+ * measure what a parity holds set, lets this through as well.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool read_trusts_unrecovered;
+module_param_named(raid56_read_trusts_unrecovered, read_trusts_unrecovered, bool, 0644);
+MODULE_PARM_DESC(raid56_read_trusts_unrecovered,
+		 "On a mount that has not recovered the write-intent log (read-only), return data without a checksum rebuilt with no parity left to check it from a full stripe the log lists (testing only: restores a known defect)");
+#else
+static const bool read_trusts_unrecovered;
+#endif
+
+/*
+ * Testing only: hand back such a rebuild from a full stripe the live table
+ * marks possibly torn (@torn in struct btrfs_wib_entry) -- one the read-write
+ * mount's recovery kept undecided, or a failed flush left torn -- as the read
+ * path did while it asked btrfs_wib_unrecovered() alone.  The negative control
+ * for the unreadable arm of uml/torn_present.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool read_trusts_torn;
+module_param_named(raid56_read_trusts_torn, read_trusts_torn, bool, 0644);
+MODULE_PARM_DESC(raid56_read_trusts_torn,
+		 "Return data without a checksum rebuilt with no parity left to check it from a full stripe the write-intent log marks possibly torn (testing only: restores a known defect)");
+#else
+static const bool read_trusts_torn;
 #endif
 
 static unsigned long rbio_stale_cols(struct btrfs_raid_bio *rbio);
@@ -2906,6 +3058,18 @@ static bool set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio,
  * layer, which rejects a wrong rebuild and accepts a right one; refusing it
  * here would turn correct metadata into read errors.
  *
+ * A mixed block group holds both, and its checksums cannot be looked up from
+ * here: fill_data_csums() skips it, because a csum tree read that needed a
+ * rebuild of this very full stripe would wait for the lock this rbio holds.
+ * This used to answer "checked" for every sector of one, so nodatasum data
+ * there got the unverifiable Q-only rebuild at mirror 3, and the rebuild
+ * from a column recorded stale, with no error.  Ask the reader instead: a
+ * READ_REBUILD rbio has exactly one bio (rbio_can_merge() never merges it),
+ * and RBIO_MIXED_NOCSUM_BIT says whether it reads for an inode that keeps no
+ * checksums, or relocates a range that has none.  Tree blocks and checksummed
+ * data are checked above this layer and keep the old answer, as do scrub
+ * reads.
+ *
  * @unknown is the answer when fill_data_csums() could not look (no memory, a
  * csum leaf that would not read): whether refusing then costs a correct
  * read or saves a wrong one depends on the caller.
@@ -2915,11 +3079,13 @@ static bool rbio_sector_unchecked(struct btrfs_raid_bio *rbio, int stripe,
 {
 	const int idx = stripe * rbio->stripe_nsectors + sectornr;
 
-	if (!(rbio->bioc->map_type & BTRFS_BLOCK_GROUP_DATA) ||
-	    (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_METADATA))
+	if (!(rbio->bioc->map_type & BTRFS_BLOCK_GROUP_DATA))
 		return false;
 	if (stripe >= rbio->nr_data)
 		return false;
+	if (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_METADATA)
+		return test_bit(RBIO_MIXED_NOCSUM_BIT, &rbio->flags) &&
+		       sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
 	if (!sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
 		return false;
 	if (!test_bit(RBIO_CSUMS_KNOWN_BIT, &rbio->flags))
@@ -2955,6 +3121,63 @@ static bool rbio_rebuilt_unverified(struct btrfs_raid_bio *rbio)
 		}
 	}
 	return false;
+}
+
+/*
+ * Did this read rebuild a sector somebody asked for, that has no checksum, in
+ * a vertical stripe that spent every parity on its missing members, so that
+ * nothing was left over to cross-check the result?  A RAID6 row with one
+ * member gone is rebuilt from P and checked against Q (recover_verify_q()); a
+ * RAID5 row with one gone, or a RAID6 row with two, has nothing to check with,
+ * and returns whatever the parity makes of the members that are there.
+ *
+ * Whether that matters is btrfs_wib_unrecovered()'s question: in a full stripe
+ * the write-intent log lists and no recovery has looked at, the parity may be
+ * torn, and then that is a guess.
+ *
+ * @cols receives the members missing from such rows, as bioc->stripes[] bits,
+ * for the alert.
+ */
+static bool rbio_rebuilt_unchecked_row(struct btrfs_raid_bio *rbio,
+				       unsigned long *cols)
+{
+	const int nr_parity = rbio->real_stripes - rbio->nr_data;
+	bool found = false;
+
+	for (int nr = 0; nr < rbio->stripe_nsectors; nr++) {
+		unsigned long row = 0;
+		bool unchecked = false;
+		int errors = 0;
+
+		for (int stripe = 0; stripe < rbio->real_stripes; stripe++) {
+			if (!test_bit(stripe * rbio->stripe_nsectors + nr,
+				      rbio->error_bitmap))
+				continue;
+			errors++;
+			/* A column past BITS_PER_LONG counts, unnamed. */
+			if (stripe < BITS_PER_LONG)
+				row |= BIT(stripe);
+			if (rbio_sector_unchecked(rbio, stripe, nr, true))
+				unchecked = true;
+		}
+		if (unchecked && errors >= nr_parity) {
+			*cols |= row;
+			found = true;
+		}
+	}
+	return found;
+}
+
+/*
+ * A READ_REBUILD rbio has one bio (rbio_can_merge() never merges it): is it a
+ * scrub's?  While the mount's recovery decides a full stripe, the scrub
+ * reading it is the recovery itself (btrfs_wib_recovering()).
+ */
+static bool rbio_scrub_read(struct btrfs_raid_bio *rbio)
+{
+	struct bio *bio = bio_list_peek(&rbio->bio_list);
+
+	return bio && btrfs_bio(bio)->is_scrub;
 }
 
 static void recover_rbio(struct btrfs_raid_bio *rbio)
@@ -3062,6 +3285,71 @@ static void recover_rbio(struct btrfs_raid_bio *rbio)
 	}
 
 	/*
+	 * The same refusal where the parity itself may be torn: a full stripe
+	 * the write-intent log lists, on a mount that has not recovered it --
+	 * a read-only one, typically ro,degraded to salvage data.  A write in
+	 * flight at the crash names no member, and an earlier failed write
+	 * into the missing column names only that one, which is failed
+	 * already: either way the check above finds room in the budget, and
+	 * the rebuild of the missing column from P would be returned as it is,
+	 * the old content xor whatever the torn write changed.  See
+	 * btrfs_wib_unrecovered().  The same while a read-write mount's
+	 * recovery decides the stripe, for every read but the recovery's own
+	 * (btrfs_wib_recovering()).
+	 *
+	 * And where a read-write mount's recovery took the record over but
+	 * could not decide the stripe -- a sector that did not read, a parity
+	 * write that failed -- and kept it marked possibly torn
+	 * (btrfs_wib_stripe_torn()), as a flush that failed while writes were
+	 * in flight marks one too.  Such a stripe's parity is as unchecked as
+	 * an unrecovered one's.
+	 *
+	 * Not for a device replace rebuilding sectors no extent holds
+	 * (RBIO_READS_FREE_BIT): there is no data there to guess at, and the
+	 * rebuild is what its target has to hold for the row to agree with
+	 * the parity.  Refused, the sectors were counted as lost, and zeros
+	 * went on the target in their place.
+	 */
+	if (ret == 0 && rbio->operation == BTRFS_RBIO_READ_REBUILD &&
+	    !READ_ONCE(read_trusts_ambiguous) &&
+	    !test_bit(RBIO_READS_FREE_BIT, &rbio->flags)) {
+		struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+		const u64 full_stripe = rbio->bioc->full_stripe_logical;
+		unsigned long cols = 0;
+		bool unrecovered = false;
+		bool torn = false;
+
+		if (rbio_rebuilt_unchecked_row(rbio, &cols)) {
+			unrecovered = !READ_ONCE(read_trusts_unrecovered) &&
+				      (btrfs_wib_unrecovered(fs_info, full_stripe,
+							     rbio->nr_data) ||
+				       (!rbio_scrub_read(rbio) &&
+					btrfs_wib_recovering(fs_info, full_stripe)));
+			torn = !unrecovered && !READ_ONCE(read_trusts_torn) &&
+			       btrfs_wib_stripe_torn(fs_info, full_stripe,
+						     (u64)rbio->nr_data <<
+						     BTRFS_STRIPE_LEN_SHIFT);
+		}
+		if (unrecovered || torn) {
+			atomic64_inc(&fs_info->wib->stat_read_ambiguous);
+			if (unrecovered)
+				btrfs_warn_rl(fs_info,
+"raid56: refusing a read of full stripe %llu: the write-intent log lists a write into it that may have been torn and this mount has not recovered it, and data without a checksum there had to be rebuilt with no parity left over to check it",
+					      full_stripe);
+			else
+				btrfs_warn_rl(fs_info,
+"raid56: refusing a read of full stripe %llu: the write-intent log marks it possibly torn and no recovery has decided it, and data without a checksum there had to be rebuilt with no parity left over to check it",
+					      full_stripe);
+			btrfs_raid56_alert(fs_info,
+					   btrfs_wib_unrecovered_as_ambiguous() ?
+					   BTRFS_RAID56_EV_READ_AMBIGUOUS :
+					   BTRFS_RAID56_EV_READ_UNRECOVERED,
+					   full_stripe, rbio->bioc, cols);
+			ret = -EIO;
+		}
+	}
+
+	/*
 	 * A RAID6 retry that kept every column it read -- see
 	 * set_rbio_raid6_extra_error() -- found the parities disagreeing
 	 * about a sector with no checksum.  Every such retry says so, not
@@ -3164,6 +3452,58 @@ static bool set_rbio_raid6_extra_error(struct btrfs_raid_bio *rbio,
 }
 
 /*
+ * Testing only: count every relocation read of a mixed block group as
+ * checked, as bio_reads_nocsum_data() did before it asked the data relocation
+ * inode which of its blocks have no checksum -- so that a balance or a device
+ * remove copies an unverifiable rebuild of nodatasum data into the new chunk.
+ * The negative control for the reloc arm of uml/mixed_unchecked.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool read_trusts_mixed_reloc;
+module_param_named(raid56_read_trusts_mixed_reloc, read_trusts_mixed_reloc, bool, 0644);
+MODULE_PARM_DESC(raid56_read_trusts_mixed_reloc,
+		 "Let relocation read data without a checksum out of a mixed RAID5/6 block group through a rebuild nothing can check (testing only: restores a known defect)");
+#else
+static const bool read_trusts_mixed_reloc;
+#endif
+
+/*
+ * Does @bio read data that nothing above this layer will check?  Asked only
+ * for a mixed block group; see RBIO_MIXED_NOCSUM_BIT.
+ *
+ * @bio is a btrfs_bio from btrfs_submit_chunk(): a read or a split of one, or
+ * the one-block repair read that btrfs_check_read_bio() sends for it, which
+ * carries the failed read's inode.  Scrub reads carry the btree inode.
+ *
+ * The data relocation inode reads extents with and without checksums alike
+ * and has no NODATASUM of its own.  Which of its blocks have no checksum is
+ * known per range: btrfs_lookup_bio_sums() has just marked them
+ * EXTENT_NODATASUM in its io_tree for this very bio -- a repair read's too --
+ * for btrfs_data_csum_check() to skip.  Any such block makes the bio one that
+ * reads unchecked data; the repair reads that get here are one block each.
+ */
+static bool bio_reads_nocsum_data(struct bio *bio)
+{
+	struct btrfs_bio *bbio = btrfs_bio(bio);
+	struct btrfs_inode *inode = bbio->inode;
+
+	if (!inode || !is_data_inode(inode))
+		return false;
+	if (btrfs_is_data_reloc_root(inode->root)) {
+		if (READ_ONCE(read_trusts_mixed_reloc))
+			return false;
+		if (READ_ONCE(inode->flags) & BTRFS_INODE_NODATASUM)
+			return true;
+		return bio->bi_iter.bi_size &&
+		       btrfs_test_range_bit_exists(&inode->io_tree, bbio->file_offset,
+						   bbio->file_offset +
+						   bio->bi_iter.bi_size - 1,
+						   EXTENT_NODATASUM);
+	}
+	return READ_ONCE(inode->flags) & BTRFS_INODE_NODATASUM;
+}
+
+/*
  * the main entry point for reads from the higher layers.  This
  * is really only called when the normal read path had a failure,
  * so we assume the bio they send down corresponds to a failed part
@@ -3184,6 +3524,13 @@ void raid56_parity_recover(struct bio *bio, struct btrfs_io_context *bioc,
 
 	rbio->operation = BTRFS_RBIO_READ_REBUILD;
 	rbio_add_bio(rbio, bio);
+	/* This rbio's only bio: READ_REBUILD rbios are never merged. */
+	if ((bioc->map_type & BTRFS_BLOCK_GROUP_DATA) &&
+	    (bioc->map_type & BTRFS_BLOCK_GROUP_METADATA) &&
+	    bio_reads_nocsum_data(bio))
+		set_bit(RBIO_MIXED_NOCSUM_BIT, &rbio->flags);
+	if (btrfs_bio(bio)->is_scrub && btrfs_bio(bio)->scrub_reads_free)
+		set_bit(RBIO_READS_FREE_BIT, &rbio->flags);
 
 	set_rbio_range_error(rbio, bio);
 
@@ -3537,9 +3884,13 @@ static void rmw_update_stale_data(struct btrfs_raid_bio *rbio, u64 full_stripe_s
 		 * btrfs_wib_done() refuses to clear @stale for exactly this
 		 * reason one level up, where the range is the full stripe and
 		 * the unit is the column.  Same argument, one level down.
+		 *
+		 * Not durable: these writes went to the device's cache, and a
+		 * mark a failed flush put on the column while they were in
+		 * flight stays (see @hold in struct btrfs_wib_entry).
 		 */
 		if (supplied_all)
-			btrfs_wib_clear_stale(fs_info, logical, BTRFS_STRIPE_LEN);
+			btrfs_wib_clear_stale(fs_info, logical, BTRFS_STRIPE_LEN, false);
 	}
 }
 
@@ -3899,6 +4250,14 @@ static const bool repair_ignores_freeze;
 static const bool repair_no_pin;
 #endif
 
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+/* The self tests run at load, after the command line has set the knob. */
+bool btrfs_raid56_no_repair_on_fault(void)
+{
+	return READ_ONCE(no_repair_on_fault);
+}
+#endif
+
 /* Caller holds wib->repair_lock. */
 static void raid56_repair_schedule(struct btrfs_wib *wib)
 {
@@ -4120,8 +4479,16 @@ static void raid56_repair_finished(struct btrfs_raid_bio *rbio, int ret, bool fa
 		 * recorded write waits 60 seconds and fails.  Still under the
 		 * stripe lock, so no write can land between the check and the
 		 * retirement.
+		 *
+		 * Not a record marked possibly torn, though (@torn in struct
+		 * btrfs_wib_entry): a repair rewrites the members the record
+		 * names and the parity of the rows it touched, and such a
+		 * record names none -- the rows its write may have torn are
+		 * as they were.  A scrub or a full stripe write retires it.
 		 */
-		if (!READ_ONCE(repair_keeps_record) && !rbio_stripe_recorded(rbio))
+		if (!READ_ONCE(repair_keeps_record) && !rbio_stripe_recorded(rbio) &&
+		    !btrfs_wib_stripe_torn(fs_info, logical,
+					   (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT))
 			btrfs_wib_clear_sticky(fs_info, logical,
 					       (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT);
 	}
@@ -4275,6 +4642,36 @@ static const bool refusal_clears_marks;
 static const bool persist_fail_keeps_clear;
 #endif
 
+/*
+ * Tell the write-intent log which members phase B is about to write, before it
+ * does (btrfs_wib_note_written()): once issued, a write sits in the device's
+ * cache, where a failed flush can lose it whether or not it has completed.
+ * Every data column with a sector to write in a touched vertical stripe, as
+ * rmw_assemble_write_bios() picks them, whether or not its device is there to
+ * take it; and every parity.  Phase A's write-backs are not among them: they
+ * go with FUA, and no flush can take them back.
+ */
+static void rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
+			     bool logged)
+{
+	u64 cols = 0;
+	int sectornr;
+
+	for (int stripe = 0; stripe < min(rbio->nr_data, 64); stripe++) {
+		for_each_set_bit(sectornr, &rbio->dbitmap, rbio->stripe_nsectors) {
+			if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1) ||
+			    test_bit(stripe * rbio->stripe_nsectors + sectornr,
+				     rbio->repair_bitmap)) {
+				cols |= BIT_ULL(stripe);
+				break;
+			}
+		}
+	}
+	btrfs_wib_note_written(rbio->bioc->fs_info, full_stripe_start, rbio->nr_data,
+			       cols, GENMASK(rbio->real_stripes - rbio->nr_data - 1, 0),
+			       logged);
+}
+
 static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
@@ -4370,10 +4767,14 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start)
 			    !(rbio->verified_bitmap &&
 			      test_bit(first + nr, rbio->verified_bitmap)))
 				all = false;
+		/*
+		 * Durable: written with FUA above, so a device that fails a
+		 * flush later cannot lose it (see @hold in btrfs_wib_entry).
+		 */
 		if (all) {
 			btrfs_wib_clear_stale(fs_info,
 					      full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
-					      BTRFS_STRIPE_LEN);
+					      BTRFS_STRIPE_LEN, true);
 			cleared |= BIT_ULL(stripe);
 		}
 	}
@@ -4484,9 +4885,15 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 		 */
 		if (test_bit(RBIO_STALE_AMBIGUOUS_BIT, &rbio->flags) &&
 		    !READ_ONCE(rmw_no_refuse)) {
-			btrfs_warn_rl(fs_info,
+			if (test_bit(RBIO_STALE_TORN_BIT, &rbio->flags))
+				btrfs_warn_rl(fs_info,
+"raid56: refusing %s full stripe %llu: the write-intent log names a data column of it stale and marks it possibly torn, so its parity may not describe the data and none is left over to check a rebuild of that column -- writing would put a guess over it",
+					      test_bit(RBIO_REPAIR_BIT, &rbio->flags) ?
+					      "a repair of" : "a write into", full_stripe_start);
+			else
+				btrfs_warn_rl(fs_info,
 "raid56: refusing a write into full stripe %llu: the write-intent log records more of it stale than its parity can rebuild, and writing would destroy the only copy of acknowledged data",
-				      full_stripe_start);
+					      full_stripe_start);
 			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
 			/* A repair's is reported by raid56_repair_finished(). */
 			if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
@@ -4598,6 +5005,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	/* We should have at least one bio assembled. */
 	ASSERT(bio_list_size(&bio_list));
 	phase_b = true;
+	rmw_note_written(rbio, full_stripe_start, logged);
 	submit_write_bios(rbio, &bio_list);
 	wait_event(rbio->io_wait, atomic_read(&rbio->stripes_pending) == 0);
 
@@ -5126,6 +5534,10 @@ static int finish_parity_scrub(struct btrfs_raid_bio *rbio)
 	}
 
 submit_write:
+	/* A parity rewrite goes to the device's cache like any other write. */
+	if (!bio_list_empty(&bio_list))
+		btrfs_wib_note_written(bioc->fs_info, bioc->full_stripe_logical,
+				       nr_data, 0, BIT(rbio->scrubp - nr_data), false);
 	submit_write_bios(rbio, &bio_list);
 	return 0;
 

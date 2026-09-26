@@ -3750,6 +3750,9 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 				  ERR_PTR(ret));
 			goto fail_sysfs;
 		}
+	} else {
+		/* Nothing is recovered: say what that leaves refused. */
+		btrfs_wib_ro_mount(fs_info);
 	}
 
 	fs_info->cleaner_kthread = kthread_run(cleaner_kthread, fs_info,
@@ -4609,8 +4612,14 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 		 */
 		if (!btrfs_is_shutdown(fs_info)) {
 			ret = btrfs_commit_super(fs_info);
+			/*
+			 * Committed, and nothing is in flight any more: have
+			 * the RAID56 write-intent log say so too.
+			 */
 			if (ret)
 				btrfs_err(fs_info, "commit super block returned %pe", ERR_PTR(ret));
+			else
+				btrfs_wib_unmount(fs_info);
 		}
 	}
 
