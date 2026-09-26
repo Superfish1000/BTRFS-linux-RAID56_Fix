@@ -4206,7 +4206,7 @@ torn_readd_prep)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 	esac
-	case "${CONTROL:-0}" in 2|3|4)
+	case "${CONTROL:-0}" in 2|3|4|5|6)
 		{ echo 1 > /sys/module/btrfs/parameters/raid56_wf_no_readd_name &&
 		  echo 1 > /sys/module/btrfs/parameters/raid56_wf_log_unmarked; } 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
@@ -4309,7 +4309,32 @@ torn_readd_verify)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_evict_stage0 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 	esac
-	do_mount $OPTS,degraded $MNTDEV
+	# CONTROL=5 and 6, the recover-full pair: the upgrade log, and the
+	# verdicts counted as stale parities, so that the read-write recovery
+	# has more to keep than a wide block holds.  5: it cannot keep one, and
+	# the mount fails; the read-only mount after it is scored instead.  6:
+	# raid56_wf_recover_drops_records=1, it drops them and mounts
+	# read-write.
+	case "${CONTROL:-0}" in 5|6)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_suspect_as_stale 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "recover-full: the recovery's verdicts count as stale parities"
+	esac
+	[ "${CONTROL:-0}" = 6 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_recover_drops_records 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: the recovery drops the records it cannot keep"
+	}
+	refused=0
+	if [ "$PHASE" = rw ] && [ "${CONTROL:-0}" = 5 ] &&
+	   ! mount -o $OPTS,degraded $MNTDEV $MNT; then
+		refused=1
+		log "TR_RW_REFUSED: the read-write mount failed"
+		kmsg "could not keep the record|recovery stopped" 2
+		do_mount ro,degraded $MNTDEV
+	elif ! grep -q " $MNT " /proc/mounts; then
+		do_mount $OPTS,degraded $MNTDEV
+	fi
 	kmsg "write-intent|scrub: full stripe|possibly torn" 8
 	kmsg "does not mark the writes" 1
 	stats
@@ -4326,7 +4351,8 @@ torn_readd_verify)
 	    "fail_old=$fail_old direct_bad=$direct_bad recovery_suspect=${sus:-?}" \
 	    "read_unverifiable=${amb:-?} sticky_evicted=${ev:-?} regions=${regs:-?}"
 	echo "$checked $ok $eio $wrong $torn_rows $fail_old $direct_bad ${sus:-?} ${ev:-?}" \
-	     "${regs:-?}" > $T/umltest/tr.$TAG.$PHASE
+	     "${regs:-?} $(sed -n 's/^record_dropped //p' /sys/fs/btrfs/*/raid56_health | head -1)" \
+	     "$refused" > $T/umltest/tr.$TAG.$PHASE
 	umount $MNT || log "UMOUNT_FAIL"
 	finish
 	;;

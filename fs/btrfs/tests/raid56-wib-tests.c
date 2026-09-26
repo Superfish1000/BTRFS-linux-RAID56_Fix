@@ -1474,6 +1474,68 @@ static int test_named_records_stay(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
+/*
+ * A mount's recovery that has no room left to keep a record stops rather than
+ * drop it (@recovery_full in struct btrfs_wib): the stripe would go on as one
+ * nothing was wrong with, on a filesystem mounted read-write.  The recovery
+ * then fails the mount, or leaves it read-only.  Anything else drops it with
+ * the alert, as does the recovery under raid56_wf_recover_drops_records=1.
+ */
+static int test_recovery_full(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool drops = btrfs_wib_recover_drops_records();
+	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+	const u64 full0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_RECOVERY_FULL]);
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 5600;
+	const u64 extra = (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE;
+	u64 dropped;
+	int ret = -EINVAL;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the recovery-full test");
+		return 0;
+	}
+	/* Full of records naming a member: nothing may be spent for room. */
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		btrfs_wib_add_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+		btrfs_wib_mark_stale(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	WRITE_ONCE(wib->recovery_full, false);
+	WRITE_ONCE(wib->recovery_running, true);
+	btrfs_wib_add_sticky(fs_info, extra, blk);
+	WRITE_ONCE(wib->recovery_running, false);
+	dropped = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) - dropped0;
+	if (find_live_entry(wib, extra)) {
+		test_err("a record was kept in a log with no room for it");
+		goto out;
+	}
+	if (drops) {
+		if (wib->recovery_full || dropped != 1) {
+			test_err("raid56_wf_recover_drops_records is set, yet the recovery stopped (%d) or dropped %llu: the test is blind",
+				 wib->recovery_full, dropped);
+			goto out;
+		}
+		test_msg("raid56_wf_recover_drops_records is set: the record dropped, the recovery goes on, as expected");
+	} else if (!wib->recovery_full || dropped ||
+		   atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_RECOVERY_FULL]) != full0 + 1) {
+		test_err("the recovery with no room for a record did not stop (%d), dropped %llu",
+			 wib->recovery_full, dropped);
+		goto out;
+	}
+	ret = 0;
+out:
+	WRITE_ONCE(wib->recovery_full, false);
+	for (u64 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the recovery-full test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
 /* Forget the repairs asked for so far: none runs here (see btrfs_test_raid56_wib()). */
 static void clear_repairs(struct btrfs_wib *wib)
 {
@@ -4961,6 +5023,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_named_records_stay(fs_info);
+	if (ret)
+		goto out;
+	ret = test_recovery_full(fs_info);
 	if (ret)
 		goto out;
 	ret = test_torn_spent_last(fs_info);

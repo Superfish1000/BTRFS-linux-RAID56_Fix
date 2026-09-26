@@ -231,6 +231,11 @@ MODULE_PARM_DESC(raid56_stale_no_persist,
  * records name stale as stale -- for good when the remount fails.  The
  * negative control for uml/recover_interrupt.sh.
  *
+ * raid56_wf_recover_drops_records=1: let the recovery drop a record it has no
+ * room to keep (btrfs_wib_add_sticky(), record_dropped) and go on to mount
+ * read-write, as before @recovery_full in struct btrfs_wib.  The negative
+ * control for the recover-full pair of uml/torn_readd.sh.
+ *
  * raid56_wf_missing_parity_keeps_torn=1: keep a stripe the recovery found
  * consistent but for a parity on a missing device marked possibly torn, as
  * before btrfs_wib_parity_unwritten(), rather than recording that parity
@@ -288,6 +293,10 @@ static bool recover_drops_refusals;
 module_param_named(raid56_wf_recover_drops_refusals, recover_drops_refusals, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_recover_drops_refusals,
 		 "Let the write-intent log recovery drop the read-only mount's refusals for every stripe it lists before recovering any, and for good when it stops early (testing only: restores a known defect)");
+static bool recover_drops_records;
+module_param_named(raid56_wf_recover_drops_records, recover_drops_records, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_recover_drops_records,
+		 "Let the write-intent log recovery drop a record it has no room to keep and mount read-write (testing only: restores a known defect)");
 static bool missing_parity_keeps_torn;
 module_param_named(raid56_wf_missing_parity_keeps_torn, missing_parity_keeps_torn, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_missing_parity_keeps_torn,
@@ -310,6 +319,7 @@ static const bool suspect_as_stale;
 static const bool replace_end_clears_verdicts;
 static const bool reload_verdicts_plain;
 static const bool recover_drops_refusals;
+static const bool recover_drops_records;
 static const bool missing_parity_keeps_torn;
 static const bool absent_decided_keeps_torn;
 static const bool recovering_stripe_readable;
@@ -360,6 +370,11 @@ bool btrfs_wib_replace_end_clears_verdicts(void)
 bool btrfs_wib_reload_verdicts_plain(void)
 {
 	return READ_ONCE(reload_verdicts_plain);
+}
+
+bool btrfs_wib_recover_drops_records(void)
+{
+	return READ_ONCE(recover_drops_records);
 }
 #endif
 
@@ -3799,8 +3814,9 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 
 /*
  * Keep [@logical, @logical + @len) recorded across mounts without a write in
- * flight: used for stripes whose recovery could not complete.  Dropped with
- * a warning if the log is full.
+ * flight: used for stripes whose recovery could not complete.  If the log is
+ * full, a mount's recovery stops instead (@recovery_full in struct btrfs_wib),
+ * anything else drops it with a warning.
  */
 /*
  * Record [@logical, @logical + @len) as having had a failed write.  Returns
@@ -3838,6 +3854,12 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	ret = btrfs_wib_try_mark(wib, logical, len);
 	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret < 0) {
+		if (READ_ONCE(wib->recovery_running) && !READ_ONCE(recover_drops_records)) {
+			WRITE_ONCE(wib->recovery_full, true);
+			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_RECOVERY_FULL, logical,
+					   NULL, 0);
+			return;
+		}
 		btrfs_warn(fs_info,
 	"raid56 write-intent log full, cannot keep full stripe at %llu for the next mount, run scrub once all devices are present",
 			   logical);
@@ -6069,6 +6091,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_REPLACE_ABORTED] = "replace_aborted",
 	[BTRFS_RAID56_EV_READ_UNRECOVERED] = "read_unrecovered",
 	[BTRFS_RAID56_EV_TORN_UNDECIDABLE] = "torn_undecidable",
+	[BTRFS_RAID56_EV_RECOVERY_FULL] = "recovery_log_full",
 };
 
 /*
@@ -6089,7 +6112,8 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 					 BIT(BTRFS_RAID56_EV_READ_PARITY) |	\
 					 BIT(BTRFS_RAID56_EV_LOG_UNFLUSHED) |	\
 					 BIT(BTRFS_RAID56_EV_REPLACE_DROPPED) |	\
-					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED))
+					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED) |	\
+					 BIT(BTRFS_RAID56_EV_RECOVERY_FULL))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -6314,6 +6338,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 	case BTRFS_RAID56_EV_REPLACE_DROPPED:
 		btrfs_err(fs_info,
 "raid56: the write-intent log was full with a device missing and had to drop the record of zeros a running device replace put on its new device in full stripe %llu, where it could neither copy nor rebuild the old device's data. The replace FAILS rather than let the new device serve those zeros as data: the old device stays as it was, present or missing, and nothing is lost that was not lost already. Writes into the degraded array fill the log with records that cannot retire until a replace finishes: pause them, then start the replace again ('btrfs replace start <devid> <new device> <mountpoint>'). If the machine went down before the replace stopped and it resumes at the next mount, cancel it ('btrfs replace cancel <mountpoint>') and start it again. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+			  logical, fsid);
+		break;
+	case BTRFS_RAID56_EV_RECOVERY_FULL:
+		btrfs_err(fs_info,
+"raid56: the mount's recovery of the write-intent log could not keep the record of full stripe %llu: it has more stripes to keep recorded than the log holds, and dropping one could let data without a checksum there read back old, or as a rebuild nothing checked, with no error. So the filesystem is NOT made writable: a first mount fails, a remount stays read-only, and the log on the devices stays as it was. Mount it read-only (-o ro, with -o degraded if a device is missing) to read the data: what the log cannot vouch for reads as EIO. If a device was missing only at this mount -- present when the filesystem last ran -- bring it back and mount again: with every device there the recovery decides those stripes and keeps fewer. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_REPLACE_ABORTED:
@@ -6581,7 +6610,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -6600,6 +6629,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_REPLACE_ABORTED],
 			   pending[BTRFS_RAID56_EV_READ_UNRECOVERED],
 			   pending[BTRFS_RAID56_EV_TORN_UNDECIDABLE],
+			   pending[BTRFS_RAID56_EV_RECOVERY_FULL],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
@@ -7575,6 +7605,8 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 		wib_recovery_stopped(wib, PTR_ERR(sctx));
 		return PTR_ERR(sctx);
 	}
+	WRITE_ONCE(wib->recovery_full, false);
+	WRITE_ONCE(wib->recovery_running, true);
 
 	for (unsigned int i = 0; i < wib->nr_pending; i++) {
 		const struct btrfs_wib_entry *e = &wib->pending[i];
@@ -7658,6 +7690,11 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				mode = wib_error_mode();
 			if (mode == BTRFS_RAID56_RECOVER_SCRUB) {
 				btrfs_wib_add_sticky(fs_info, start, len);
+				/* Not scrubbed without it: see @recovery_full. */
+				if (READ_ONCE(wib->recovery_full)) {
+					ret = -ENOSPC;
+					goto out;
+				}
 				wib_readd_stale(fs_info, start, len);
 			}
 			/*
@@ -7702,6 +7739,17 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				else
 					wib_keep_torn(wib, start, len);
 			}
+			/*
+			 * Kept only in part, or not at all: give the stripe
+			 * back to @pending, which refuses what a read-only
+			 * mount refuses, and stop (@recovery_full).
+			 */
+			if (READ_ONCE(wib->recovery_full)) {
+				btrfs_wib_take_pending(wib, last_start, last_len, false);
+				wib_set_recovering(wib, 0, 0);
+				ret = -ENOSPC;
+				goto out;
+			}
 			/* The verdict is in: the live table answers now. */
 			wib_set_recovering(wib, 0, 0);
 		}
@@ -7728,6 +7776,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 	 */
 	ret = wib_persist_all_slots(wib, BTRFS_WIB_NR_SLOTS);
 out:
+	WRITE_ONCE(wib->recovery_running, false);
 	/* Stopped short of the end: @pending answers for what is left. */
 	if (ret < 0 && wib->pending)
 		wib_recovery_stopped(wib, ret);
@@ -7773,6 +7822,8 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 		ret = PTR_ERR(sctx);
 		goto out;
 	}
+	WRITE_ONCE(wib->recovery_full, false);
+	WRITE_ONCE(wib->recovery_running, true);
 
 	for (unsigned int i = 0; i < nr; i++) {
 		const struct btrfs_wib_entry *e = &snap[i];
@@ -7812,6 +7863,11 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 					      &start, &len, &unwritten_par, &st);
 			if (ret < 0)
 				goto out_end;
+			/* See @recovery_full: the mount fails. */
+			if (READ_ONCE(wib->recovery_full)) {
+				ret = -ENOSPC;
+				goto out_end;
+			}
 			if (!len) {
 				/* No RAID56 stripe there anymore. */
 				btrfs_wib_clear_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
@@ -7834,6 +7890,7 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 		   st.done, st.skipped, st.kept, st.failed);
 	ret = wib_persist_all_slots(wib, 1);
 out_end:
+	WRITE_ONCE(wib->recovery_running, false);
 	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
 out:
 	kvfree(snap);

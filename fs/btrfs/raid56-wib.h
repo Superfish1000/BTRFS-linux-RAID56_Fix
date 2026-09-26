@@ -48,6 +48,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_REPLACE_ABORTED, /* a replace could not record what it lost: it fails */
 	BTRFS_RAID56_EV_READ_UNRECOVERED, /* read refused: its parity may be torn, unchecked */
 	BTRFS_RAID56_EV_TORN_UNDECIDABLE, /* a torn stripe the recovery or a scrub cannot decide */
+	BTRFS_RAID56_EV_RECOVERY_FULL,	/* the mount's recovery could not keep a record */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -756,6 +757,18 @@ struct btrfs_wib {
 	 */
 	u64 recovering;
 	u64 recovering_len;
+	/*
+	 * A mount's recovery is running (btrfs_wib_recover(),
+	 * btrfs_wib_recover_after_replay()), and @recovery_full: it could not
+	 * keep a record, for want of room (btrfs_wib_add_sticky()).  Dropped,
+	 * the record's stripe went on as one nothing was wrong with -- read
+	 * back as a rebuild nothing checked, or its parity recomputed from a
+	 * stale column -- on a filesystem mounted read-write.  So the recovery
+	 * stops there instead, and the mount stays read-only: @pending goes on
+	 * answering for what it did not take over.
+	 */
+	bool recovery_running;
+	bool recovery_full;
 
 	/* Statistics, exported through sysfs. */
 	/*
@@ -865,6 +878,7 @@ bool btrfs_wib_replace_end_clears_verdicts(void);
 bool btrfs_wib_evicts_replace_marks(void);
 bool btrfs_wib_replace_keeps_added_only(void);
 bool btrfs_wib_reload_verdicts_plain(void);
+bool btrfs_wib_recover_drops_records(void);
 void btrfs_wib_take_pending(struct btrfs_wib *wib, u64 start, u64 len, bool take);
 bool btrfs_wib_disable_forgets_writes(void);
 bool btrfs_wib_snapshot_misses_marks(void);

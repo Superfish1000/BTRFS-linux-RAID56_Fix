@@ -3,7 +3,7 @@
 # Is a write that a failed flush may have torn still treated as one after a
 # crash, when the log could not name the device in its record?
 #
-#   torn_readd.sh <kernel> [omit-device] [readd|upgrade|upgrade-verdict]
+#   torn_readd.sh <kernel> [omit-device] [readd|upgrade|upgrade-verdict|recover-full]
 #
 # See torn_readd_prep and torn_readd_verify in init-final3.sh.  RAID5 data,
 # RAID1C3 metadata, four devices.  While device 1 drops writes, one block per
@@ -56,6 +56,16 @@
 #                    their rows back as a value nobody wrote, with no error.
 #                    The read-only phase, which records no verdict, refuses
 #                    as the upgrade arm does.
+# recover-full: the upgrade log again, the verify boots with
+# raid56_wf_suspect_as_stale=1 and nothing spent (the default): the
+# read-write recovery has more to keep than a wide block holds.
+#   recover-full        it cannot keep one: the mount fails with the
+#                       recovery_log_full alert, and the read-only mount after
+#                       it refuses what the log cannot vouch for
+#   recover-full-drops  raid56_wf_recover_drops_records=1: it drops them
+#                       (record_dropped) and mounts read-write, and the rows of
+#                       the stripes it dropped read back as a value nobody
+#                       wrote, with no error
 # The upgrade pairs' verify boots set raid56_wf_evict_stage0=1: the control
 # shows the order in which stage 0's full log spent records with a device
 # missing; the default spends none.
@@ -64,7 +74,7 @@
 # something wrong.
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: torn_readd.sh <kernel> [omit-device] [readd|upgrade|upgrade-verdict]}
+KERNEL=${1:?usage: torn_readd.sh <kernel> [omit-device] [readd|upgrade|upgrade-verdict|recover-full]}
 OMIT=${2:-2}
 PAIR=${3:-readd}
 case $PAIR in
@@ -72,6 +82,7 @@ readd) A=fixed; B=control; CA=0; CB=1;;
 upgrade) A=upgrade; B=upgrade-control; CA=2; CB=3;;
 # Its own tag for the same fixed arm: the upgrade pair may run at the same time.
 upgrade-verdict) A=upgrade-v; B=upgrade-verdict; CA=2; CB=4;;
+recover-full) A=recover-full; B=recover-full-drops; CA=5; CB=6;;
 *) echo "unknown pair $PAIR"; exit 2;;
 esac
 NDEV=4
@@ -133,10 +144,12 @@ prep() { cat $T/umltest/tr-prep.tr-$1 2>/dev/null || echo "? ? ? ? ? ? ?"; }
 res() { cat $T/umltest/tr.tr-$1.$2 2>/dev/null || echo "? ? ? ? ? ? ? ? ? ?"; }
 read -r f_acked f_fl f_unn f_torn1 f_torn2 f_commit f_sticky <<<"$(prep $A)"
 read -r c_acked c_fl c_unn c_torn1 c_torn2 c_commit c_sticky <<<"$(prep $B)"
-read -r fr_chk fr_ok fr_eio fr_wrong fr_torn fr_fold fr_dbad _ _ fr_regs <<<"$(res $A ro)"
-read -r fw_chk fw_ok fw_eio fw_wrong fw_torn fw_fold fw_dbad fw_sus fw_ev _ <<<"$(res $A rw)"
-read -r cr_chk cr_ok cr_eio cr_wrong cr_torn cr_fold cr_dbad _ _ cr_regs <<<"$(res $B ro)"
-read -r cw_chk cw_ok cw_eio cw_wrong cw_torn cw_fold cw_dbad cw_sus cw_ev _ <<<"$(res $B rw)"
+read -r fr_chk fr_ok fr_eio fr_wrong fr_torn fr_fold fr_dbad _ _ fr_regs _ <<<"$(res $A ro)"
+read -r fw_chk fw_ok fw_eio fw_wrong fw_torn fw_fold fw_dbad fw_sus fw_ev _ fw_drop fw_refused \
+	<<<"$(res $A rw)"
+read -r cr_chk cr_ok cr_eio cr_wrong cr_torn cr_fold cr_dbad _ _ cr_regs _ <<<"$(res $B ro)"
+read -r cw_chk cw_ok cw_eio cw_wrong cw_torn cw_fold cw_dbad cw_sus cw_ev _ cw_drop cw_refused \
+	<<<"$(res $B rw)"
 echo "  prep: acknowledged $f_acked/$c_acked, flush errors $f_fl/$c_fl," \
      "log_flush_unnamed $f_unn/$c_unn, torn_blocks after the readd $f_torn1/$c_torn1," \
      "after the drop $f_torn2/$c_torn2, sticky_blocks $f_sticky/$c_sticky ($A/$B)"
@@ -205,6 +218,33 @@ if [ $PAIR = readd ] && [ "${f_torn2:-0}" = 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- something retired the marks before the crash"
 	echo "        (torn_blocks $f_torn1 after the readd, 0 after the drop)"
 	exit 2
+fi
+if [ $PAIR = recover-full ]; then
+	echo "  read-write mount refused: $A ${fw_refused:-?}, $B ${cw_refused:-?};" \
+	     "record_dropped $A ${fw_drop:-?}, $B ${cw_drop:-?}"
+	if [ "${fr_regs:-0}" -le 82 ]; then
+		echo "RESULT: INCONCLUSIVE -- the log listed ${fr_regs:-?} regions, no more than a wide"
+		echo "        block describes (82): nothing for the recovery to run out of room for"
+		exit 2
+	fi
+	if [ "${cw_refused:-1}" != 0 ] || [ "${cw_drop:-0}" = 0 ] || [ "${cw_wrong:-0}" = 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control did not drop a record, mount read-write and"
+		echo "        read something wrong (refused ${cw_refused:-?}, record_dropped ${cw_drop:-?}," \
+		     "wrong ${cw_wrong:-?})"
+		exit 2
+	fi
+	if [ "${fw_refused:-0}" != 1 ] || [ "${fw_drop:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- the recovery with no room left mounted read-write" \
+		     "(refused ${fw_refused:-?}) or dropped ${fw_drop:-?} record(s)"
+		exit 1
+	fi
+	grep -aq "could not keep the record of full stripe" $T/umltest/tr-$A/log.rw ||
+		{ echo "RESULT: FAIL -- no recovery_log_full explanation"; exit 1; }
+	echo "RESULT: PASS -- with more to keep than the log holds, the read-write mount failed with"
+	echo "        the recovery_log_full alert and dropped nothing; read-only, nothing read wrong"
+	echo "        (eio $fw_eio).  Control: $cw_drop record(s) dropped, mounted read-write, and"
+	echo "        $cw_wrong block(s) read back as a value nobody wrote, with no error"
+	exit 0
 fi
 if [ $PAIR = upgrade-verdict ]; then
 	case "${fr_regs:-?}${fw_sus:-?}${cw_ev:-?}" in
