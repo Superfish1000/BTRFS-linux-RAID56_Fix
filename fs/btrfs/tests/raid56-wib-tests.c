@@ -1871,6 +1871,110 @@ out:
 	return ret;
 }
 
+/*
+ * A write that failed on a device names the member it did not reach only after
+ * its record exists, and a record that names nothing is the first a full log
+ * spends.  In between, a concurrent write into a new region of a log full of
+ * named records used to spend it: the name then found no entry, and the stale
+ * member was read as it is.  btrfs_wib_failed() keeps the write in flight until
+ * it has named the member, so the concurrent write finds no room and fails
+ * instead.  Both ways a write can fail: a read-modify-write (btrfs_wib_mark(),
+ * then btrfs_wib_failed()) and a full stripe write
+ * (btrfs_wib_try_add_failed()).  raid56_wf_failed_leaves_flight=1 opens the
+ * window again, and the record is lost.
+ */
+static int test_failed_named_before_spent(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool window = btrfs_wib_failed_leaves_flight();
+	const u64 other = 5802ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 base = 5600;
+	unsigned long flags;
+	int ret;
+
+	/* A negative-control run asked for the old eviction on purpose. */
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the failed-write naming test");
+		return 0;
+	}
+
+	/* One slot left in the wide layout, and every record names a member. */
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++) {
+		const u64 logical = (base + i) * BTRFS_WIB_ENTRY_SIZE;
+
+		btrfs_wib_add_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		btrfs_wib_mark_stale(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (!find_live_entry(wib, logical)) {
+			test_err("named record %llu was not created", i);
+			return -EINVAL;
+		}
+	}
+
+	for (int full = 0; full < 2; full++) {
+		const u64 logical = (5800ULL + full) * BTRFS_WIB_ENTRY_SIZE;
+		const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+		const char *what = full ? "full stripe write" : "read-modify-write";
+		u64 dropped;
+		int concurrent;
+		bool named;
+
+		if (full) {
+			ret = btrfs_wib_try_add_failed(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		} else {
+			ret = btrfs_wib_mark(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+			if (!ret)
+				btrfs_wib_failed(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		}
+		if (ret) {
+			test_err("the failed %s found no room: %d", what, ret);
+			return ret;
+		}
+
+		/* The concurrent write, before the failed one named anything. */
+		spin_lock_irqsave(&wib->lock, flags);
+		concurrent = btrfs_wib_try_mark(wib, other, BTRFS_WIB_BLOCK_SIZE);
+		spin_unlock_irqrestore(&wib->lock, flags);
+		btrfs_wib_mark_stale(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		btrfs_wib_done(fs_info, logical, BTRFS_WIB_BLOCK_SIZE, false);
+		if (!concurrent)
+			btrfs_wib_done(fs_info, other, BTRFS_WIB_BLOCK_SIZE, false);
+		named = btrfs_wib_stale(fs_info, logical);
+		dropped = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) - dropped0;
+
+		if (window) {
+			if (concurrent || named || dropped != 1) {
+				test_err("raid56_wf_failed_leaves_flight is set, yet the failed %s kept its name (concurrent mark %d, named %d)",
+					 what, concurrent, named);
+				return -EINVAL;
+			}
+			test_msg("raid56_wf_failed_leaves_flight is set: the failed %s's record was spent before it named the member, as expected",
+				 what);
+		} else if (concurrent != -ENOSPC || !named || dropped) {
+			test_err("the failed %s lost its record before naming the member (concurrent mark %d, named %d)",
+				 what, concurrent, named);
+			return -EINVAL;
+		}
+		btrfs_wib_clear_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+	}
+
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_BLOCK_SIZE);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the failed-write naming test");
+		return -EINVAL;
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		return ret;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the failed-write naming test");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 /* Forget the repairs asked for so far: none runs here (see btrfs_test_raid56_wib()). */
 static void clear_repairs(struct btrfs_wib *wib)
 {
@@ -3960,6 +4064,216 @@ out:
 	return readd_clear(rig, k, 1);
 }
 
+/* A full stripe written copy-on-write at the start of region @k issues its bios. */
+static u64 readd_issue_full(struct readd_rig *rig, u64 k)
+{
+	return btrfs_wib_note_full_stripe(rig->fs_info, readd_region(k), READD_NR_DATA, 0x3,
+					  0x1);
+}
+
+static void readd_full_done(struct readd_rig *rig, u64 k, u64 noted)
+{
+	btrfs_wib_full_stripe_done(rig->fs_info, readd_region(k), READD_NR_DATA, noted);
+}
+
+static bool unlogged_listed(struct btrfs_wib *wib, u64 k)
+{
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		const struct btrfs_wib_unlogged *u = &wib->unlogged[i];
+
+		if ((u->cols | u->par) && u->bytenr == readd_region(k))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The full stripes of regions [@first, @first + @nr) written copy-on-write and
+ * finished, but the last one's still in flight unless @finish_all.
+ */
+static u64 readd_full_many(struct readd_rig *rig, u64 first, u64 nr, bool finish_all)
+{
+	u64 noted = 0;
+
+	for (u64 k = first; k < first + nr; k++) {
+		noted = readd_issue_full(rig, k);
+		if (k < first + nr - 1 || finish_all)
+			readd_full_done(rig, k, noted);
+	}
+	return noted;
+}
+
+/*
+ * A full stripe written copy-on-write is not recorded, and a failed flush
+ * after one named nothing: its member on the device that failed the flush
+ * read back old, with no error.  Now the failed flush names it (struct
+ * btrfs_wib_unlogged), finished or in flight -- a write in flight holding the
+ * name against its own completion -- unless a flush every device confirmed
+ * was issued after the write had finished.  One issued while it was in flight
+ * forgets nothing.  Where the log cannot name them all -- it did not keep
+ * track of every such write, or has no room for the names -- no name is put
+ * on and every commit fails from then on (@unlogged_refused), with the
+ * full_stripe_flush_unnamed alert.  With raid56_wf_full_stripe_unnamed=1
+ * nothing is named and nothing fails, as before.
+ */
+static int readd_names_full_stripe(struct readd_rig *rig)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool unnamed = btrfs_wib_full_stripe_unnamed();
+	const bool asks = !unnamed && !btrfs_raid56_no_repair_on_fault();
+	const u64 refused0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_FLUSH_UNLOGGED]);
+	/* Finished before the failed flush. */
+	const u64 k_done = 430;
+	/* In flight at a confirmed flush, finished before the failed one. */
+	const u64 k_across = 431;
+	/* In flight at the failed flush. */
+	const u64 k_fly = 432;
+	/* Finished, then that confirmed flush: forgotten. */
+	const u64 k_flushed = 433;
+	const u64 k_named[] = { k_done, k_across, k_fly };
+	u64 n_flushed, n_across, n_fly, n_last;
+	int ret;
+
+	clear_repairs(wib);
+	n_flushed = readd_issue_full(rig, k_flushed);
+	readd_full_done(rig, k_flushed, n_flushed);
+	n_across = readd_issue_full(rig, k_across);
+	ret = readd_commit(rig);
+	if (ret)
+		return ret;
+	if (unlogged_listed(wib, k_flushed) || !unlogged_listed(wib, k_across)) {
+		test_err("after a confirmed flush: finished write listed %d, write in flight listed %d, expected 0 1",
+			 unlogged_listed(wib, k_flushed), unlogged_listed(wib, k_across));
+		return -EINVAL;
+	}
+	readd_full_done(rig, k_across, n_across);
+	readd_full_done(rig, k_done, readd_issue_full(rig, k_done));
+	n_fly = readd_issue_full(rig, k_fly);
+	ret = readd_commit_failed(rig);
+	if (ret) {
+		test_err("a failed flush after full stripe writes it could name failed the commit: %d",
+			 ret);
+		return ret;
+	}
+	for (int i = 0; i < ARRAY_SIZE(k_named); i++) {
+		const u64 k = k_named[i];
+		const struct btrfs_wib_entry *e = find_live_entry(wib, readd_region(k));
+		u64 stale, stale_par;
+
+		readd_expect(k, &stale, &stale_par);
+		if (!(stale | stale_par)) {
+			test_err("the rig puts nothing of region %llu on the failed device", k);
+			return -EINVAL;
+		}
+		if (unnamed) {
+			if (e) {
+				test_err("raid56_wf_full_stripe_unnamed is set, yet region %llu is recorded",
+					 k);
+				return -EINVAL;
+			}
+			continue;
+		}
+		if (!e || e->sticky != (stale | stale_par) || e->stale != stale ||
+		    e->stale_par != stale_par || !block_lists(wib->last, readd_region(k))) {
+			test_err("region %llu: sticky 0x%llx stale 0x%llx stale_par 0x%llx listed %d, expected 0x%llx 0x%llx 0x%llx 1",
+				 k, e ? e->sticky : 0, e ? e->stale : 0, e ? e->stale_par : 0,
+				 block_lists(wib->last, readd_region(k)), stale | stale_par, stale,
+				 stale_par);
+			return -EINVAL;
+		}
+		if ((e->hold | e->hold_par) != (k == k_fly ? stale | stale_par : 0)) {
+			test_err("region %llu: hold 0x%llx hold_par 0x%llx, the write %s in flight",
+				 k, e->hold, e->hold_par, k == k_fly ? "is" : "is not");
+			return -EINVAL;
+		}
+		if (repair_queued(wib, readd_region(k)) != asks) {
+			test_err("region %llu: a repair %s asked for", k, asks ? "was not" : "was");
+			return -EINVAL;
+		}
+	}
+	if (find_live_entry(wib, readd_region(k_flushed))) {
+		test_err("a full stripe a confirmed flush covered was named");
+		return -EINVAL;
+	}
+	readd_full_done(rig, k_fly, n_fly);
+	clear_repairs(wib);
+	ret = readd_clear(rig, k_done, ARRAY_SIZE(k_named));
+	if (ret)
+		return ret;
+
+	/*
+	 * More regions than the table keeps: the last is not kept, and stays
+	 * in flight across a confirmed flush, which forgets every other one.
+	 * A failed flush then cannot say what it lost of that one.
+	 */
+	n_last = readd_full_many(rig, 20, BTRFS_WIB_UNLOGGED_SLOTS + 1, false);
+	ret = readd_commit(rig);
+	if (ret)
+		return ret;
+	for (int i = 0; i < BTRFS_WIB_UNLOGGED_SLOTS; i++) {
+		if (wib->unlogged[i].cols | wib->unlogged[i].par) {
+			test_err("a confirmed flush after they finished kept the writes of region %llu",
+				 wib->unlogged[i].bytenr);
+			return -EINVAL;
+		}
+	}
+	if (!wib->unlogged_unknown) {
+		test_err("a write no record kept is still in flight, and the log forgot it");
+		return -EINVAL;
+	}
+	ret = readd_commit_failed(rig);
+	if (unnamed ? ret : ret != -EIO) {
+		test_err("a failed flush after a write the log lost track of: commit %d, expected %d",
+			 ret, unnamed ? 0 : -EIO);
+		return -EINVAL;
+	}
+	if (!unnamed && readd_commit(rig) != -EIO) {
+		test_err("the commit after a refused failed flush went on");
+		return -EINVAL;
+	}
+	readd_full_done(rig, 20 + BTRFS_WIB_UNLOGGED_SLOTS, n_last);
+	WRITE_ONCE(wib->unlogged_refused, false);
+	ret = readd_commit(rig);
+	if (ret)
+		return ret;
+	if (wib->unlogged_unknown) {
+		test_err("a confirmed flush after every write finished left the log not knowing");
+		return -EINVAL;
+	}
+
+	/* More regions to name than a block that names anything describes. */
+	readd_full_many(rig, 20, BTRFS_WIB_MAX_ENTRIES + 1, true);
+	ret = readd_commit_failed(rig);
+	if (unnamed ? ret : ret != -EIO) {
+		test_err("a failed flush with no room for the names: commit %d, expected %d",
+			 ret, unnamed ? 0 : -EIO);
+		return -EINVAL;
+	}
+	for (u64 k = 20; k < 20 + BTRFS_WIB_MAX_ENTRIES + 1; k++) {
+		if (find_live_entry(wib, readd_region(k))) {
+			test_err("region %llu recorded by a failed flush that could not name them all",
+				 k);
+			return -EINVAL;
+		}
+	}
+	if (atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_FLUSH_UNLOGGED]) !=
+	    refused0 + (unnamed ? 0 : 2)) {
+		test_err("full_stripe_flush_unnamed raised %llu times, expected %u",
+			 atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_FLUSH_UNLOGGED]) -
+			 refused0, unnamed ? 0 : 2);
+		return -EINVAL;
+	}
+	WRITE_ONCE(wib->unlogged_refused, false);
+	btrfs_raid56_health_ack(fs_info, false, 0);
+	ret = readd_commit(rig);
+	if (ret)
+		return ret;
+	if (unnamed)
+		test_msg("raid56_wf_full_stripe_unnamed is set: nothing named or refused, as expected");
+	return readd_clear(rig, 20, 1);
+}
+
 static int test_readd_names(struct btrfs_fs_info *fs_info)
 {
 	const bool legacy = btrfs_wib_readd_legacy();
@@ -4012,6 +4326,8 @@ static int test_readd_names(struct btrfs_fs_info *fs_info)
 		ret = readd_names_disable(&rig, legacy);
 	if (!ret)
 		ret = readd_names_repair(&rig, legacy);
+	if (!ret)
+		ret = readd_names_full_stripe(&rig);
 	clear_repairs(fs_info->wib);
 	if (!ret && legacy)
 		test_msg("raid56_wf_no_readd_name is set: nothing was named, as expected");
@@ -5461,6 +5777,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_latch_block(fs_info);
+	if (ret)
+		goto out;
+	ret = test_failed_named_before_spent(fs_info);
 	if (ret)
 		goto out;
 	ret = test_torn_spent_last(fs_info);
