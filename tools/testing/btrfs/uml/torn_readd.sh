@@ -56,6 +56,9 @@
 #                    their rows back as a value nobody wrote, with no error.
 #                    The read-only phase, which records no verdict, refuses
 #                    as the upgrade arm does.
+# The upgrade pairs' verify boots set raid56_wf_evict_stage0=1: the control
+# shows the order in which stage 0's full log spent records with a device
+# missing; the default spends none.
 # INCONCLUSIVE unless the log held more than 82 regions, the upgrade arm's
 # recovery recorded a verdict, and the control both spent records and read
 # something wrong.

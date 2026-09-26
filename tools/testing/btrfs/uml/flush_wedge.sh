@@ -17,23 +17,24 @@
 #              every overwritten block reads back as written or fails
 #     control  raid56_wf_readd_no_repair=1: nothing retires them, and the
 #              new writes fail at once (log_full)
+#   The named control's log_full explanation must name scrub as the remedy.
 #   torn   165 regions: too many to name, the readd marks them possibly torn,
 #          which fills a narrow block
-#     fixed    a full log spends them, last and with the alert
-#              (record_dropped): every new write succeeds
-#     control  raid56_wf_torn_unevictable=1: it keeps them, and the new
-#              writes fail at once (log_full)
-#   The control's log_full explanation must name scrub as the remedy.
+#     fixed    a full log keeps them: the new writes fail at once (log_full),
+#              its explanation says a scrub retires them, and after one a
+#              write into a new region succeeds; nothing is dropped
+#     control  raid56_wf_evict_stage0=1: it spends them, last and with the
+#              alert (record_dropped), and every new write succeeds
 #   busy   164 regions, one slot left, and instead of FW_FRESH writes one at a
 #          time, FW_BUSY (8) at once into new regions whose parity device 1
 #          holds, started while device 1 is suspended: they queue behind it
-#          and go together once it is back, the first to be recorded takes
-#          the free slot, and the others find the log full with a write in
-#          flight that frees a slot when it finishes
+#          and go together once it is back, the first to be recorded takes the
+#          free slot, and the others find the log full with a write in flight
+#          that frees a slot when it finishes
 #     fixed    they wait for it and take its slot in turn: no possibly torn
 #              record is spent, every write succeeds
-#     control  raid56_wf_torn_spent_eagerly=1: each spends one at once
-#              (sticky_evicted, record_dropped)
+#     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
+#              each spends one at once (sticky_evicted, record_dropped)
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy]}
@@ -78,9 +79,9 @@ for a in fixed control; do
 done
 res() { cat $T/umltest/fw.fw-$PLAN-$1 2>/dev/null || echo "?"; }
 read -r f_acked f_fl f_named f_torn f_queued f_rok f_ok f_eio f_rdok f_rdeio f_rdbad f_stale f_full f_drop \
-	f_commit f_secs <<<"$(res fixed)"
+	f_commit f_secs f_scrubbed <<<"$(res fixed)"
 read -r c_acked c_fl c_named c_torn c_queued c_rok c_ok c_eio c_rdok c_rdeio c_rdbad c_stale c_full c_drop \
-	c_commit c_secs <<<"$(res control)"
+	c_commit c_secs c_scrubbed <<<"$(res control)"
 case "$f_acked$c_acked" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
@@ -141,10 +142,35 @@ else
 		echo "RESULT: INCONCLUSIVE -- the readd marked nothing possibly torn"; exit 2
 	fi
 fi
+if [ $PLAN = torn ]; then
+	if [ "${c_eio:-0}" != 0 ] || [ "${c_drop:-0}" = 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control did not spend the records and keep writing"
+		echo "        (eio $c_eio, record_dropped $c_drop), so it did not reproduce stage 0"
+		exit 2
+	fi
+	if [ "${f_drop:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- possibly torn records were dropped (record_dropped $f_drop)"; exit 1
+	fi
+	if [ "${f_eio:-0}" = 0 ] || [ "${f_full:-0}" = 0 ]; then
+		echo "RESULT: FAIL -- the log full of possibly torn records did not refuse (eio $f_eio, log_full $f_full)"
+		exit 1
+	fi
+	grep -aq "retires the records that only say a write may have been torn" \
+		$T/umltest/fw-$PLAN-fixed/log ||
+		{ echo "RESULT: FAIL -- the log_full explanation does not say a scrub retires them"; exit 1; }
+	if [ "$f_scrubbed" != ok ]; then
+		echo "RESULT: FAIL -- after the scrub the alert asks for, a write into a new region still failed"
+		exit 1
+	fi
+	echo "RESULT: PASS -- a log full of possibly torn records refused $f_eio of $((f_ok + f_eio)) new writes"
+	echo "        (log_full $f_full) and dropped none; after a scrub a new write succeeded.  Control"
+	echo "        (stage 0): spent with the alert (record_dropped $c_drop), every new write succeeded"
+	exit 0
+fi
 if [ "${c_eio:-0}" = 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- the control did not wedge, so a clean fixed arm proves nothing"; exit 2
 fi
-grep -aq "btrfs scrub start <mountpoint>', which repairs every stripe it can" $T/umltest/fw-$PLAN-control/log ||
+grep -aq "btrfs scrub start <mountpoint>': it repairs every stripe it can" $T/umltest/fw-$PLAN-control/log ||
 	{ echo "RESULT: FAIL -- the log_full explanation does not name scrub"; exit 1; }
 if [ "$f_eio" != 0 ]; then
 	echo "RESULT: FAIL -- the records the failed flush left wedged the log: $f_eio of $((f_ok + f_eio)) new writes failed"
@@ -165,10 +191,3 @@ if [ $PLAN = named ]; then
 	echo "        every overwritten block reads back as written; without the repairs $c_eio of $((c_ok + c_eio)) failed"
 	exit 0
 fi
-if [ "${f_drop:-0}" = 0 ]; then
-	echo "RESULT: FAIL -- possibly torn records were spent without the record_dropped alert"; exit 1
-fi
-grep -aq "that a write may have left torn" $T/umltest/fw-$PLAN-fixed/log ||
-	{ echo "RESULT: FAIL -- no warning that a possibly torn record was spent"; exit 1; }
-echo "RESULT: PASS -- the possibly torn records were spent with the alert (record_dropped $f_drop) and every"
-echo "        new write succeeded ($f_ok); kept, $c_eio of $((c_ok + c_eio)) new writes failed"

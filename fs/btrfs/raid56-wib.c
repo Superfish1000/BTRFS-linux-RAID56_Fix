@@ -593,6 +593,19 @@ module_param_named(raid56_keep_naming_degraded, keep_naming_degraded, bool, 0644
 MODULE_PARM_DESC(raid56_keep_naming_degraded,
 		 "Never let a full write-intent log spend records naming a stale member, even with a device missing (testing only: restores a known wedge)");
 /*
+ * raid56_wf_evict_stage0=1: a full log spends records as stage 0 did -- those
+ * naming a stale member while any device is missing or a tree log is replayed
+ * at mount (wib_may_evict_naming()), and those that only say a write may have
+ * been torn with every device there (wib_entry_torn_only()) -- and explains a
+ * full log as it did.  raid56_keep_naming_degraded and
+ * raid56_wf_torn_unevictable narrow it as before.  The negative control for
+ * uml/degraded_log_full.sh and the torn arm of uml/flush_wedge.sh.
+ */
+static bool evict_stage0;
+module_param_named(raid56_wf_evict_stage0, evict_stage0, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_evict_stage0,
+		 "Let a full write-intent log spend records naming a stale member while a device is missing or a tree log is replayed, and records that only say a write may have been torn, as stage 0 did (testing only: restores known defects)");
+/*
  * raid56_wf_evict_replace_marks=1: a full log with a device missing spends a
  * running device replace's own marks in table order, like any record naming a
  * member, and the replace finishes without them.  The negative control for
@@ -652,6 +665,7 @@ MODULE_PARM_DESC(raid56_wf_kept_torn_in_order,
 #else
 static const bool evict_naming;
 static const bool keep_naming_degraded;
+static const bool evict_stage0;
 static const bool evict_replace_marks;
 static const bool replace_keeps_added_only;
 static const bool torn_unevictable;
@@ -669,6 +683,11 @@ bool btrfs_wib_evicts_naming(void)
 bool btrfs_wib_keeps_naming_degraded(void)
 {
 	return READ_ONCE(keep_naming_degraded);
+}
+
+bool btrfs_wib_evicts_stage0(void)
+{
+	return READ_ONCE(evict_stage0);
 }
 
 bool btrfs_wib_evicts_replace_marks(void)
@@ -703,15 +722,20 @@ bool btrfs_wib_kept_torn_in_order(void)
  * device takes the repair or is replaced, and spending it loses acknowledged
  * data without checksums.
  *
- * But with a device missing, the records naming its columns cannot retire --
- * nothing can be written to it -- and every write of a degraded mount into a
- * stripe with a column there makes another one.  Kept, they wedge the log
- * within a few hundred megabytes: every small write fails, a metadata write
- * turns the filesystem read-only, and 'btrfs replace', which needs it
- * writable, can no longer run.  A degraded array has lost that redundancy
- * anyway, and the returning device is a resync's job.  So spend them then,
- * last, with the alert.  The same during log replay at mount, which must be
- * able to write to finish mounting at all.
+ * Nor with a device missing, nor while a tree log is replayed at mount.  The
+ * records naming a missing device's columns cannot retire -- nothing can be
+ * written to it -- and every write of a degraded mount into a stripe with a
+ * column there makes another one, so kept, they fill the log: writes into
+ * new regions fail, a metadata write turns the filesystem read-only.  Stage 0
+ * spent them then (raid56_wf_evict_stage0=1), and lost data it should have
+ * kept: "missing" is any device of the filesystem, one that holds nothing of
+ * the stripe too, so the records spent could name a present device that
+ * keeps failing writes, whose stale data was then read back with no error;
+ * and those naming the missing device let its stale columns be read back the
+ * same way once it returned.  A replay spent those of a failing device with
+ * every device there.  A full log refuses instead, and its alert says what
+ * frees it: a replace of the failing or missing device onto a new disk, then
+ * a scrub.
  */
 static bool wib_may_evict_naming(const struct btrfs_wib *wib)
 {
@@ -719,7 +743,7 @@ static bool wib_may_evict_naming(const struct btrfs_wib *wib)
 
 	if (READ_ONCE(evict_naming))
 		return true;
-	if (READ_ONCE(keep_naming_degraded))
+	if (READ_ONCE(keep_naming_degraded) || !READ_ONCE(evict_stage0))
 		return false;
 	return READ_ONCE(fs_info->fs_devices->missing_devices) ||
 	       test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
@@ -763,18 +787,21 @@ static void wib_replace_forget(struct btrfs_wib_entry *e)
  * record names -- and no write finishing retires it: only a scrub, or a full
  * stripe write, does.  A failed flush that could not name the device leaves
  * a record like that for every stripe it covered (wib_readd_dropped()), up to
- * a log full of them.  So a full log spends them last, when nothing else is
- * left, rather than refuse every write into a new region until a scrub: not
- * while a write in flight can still free a slot (@spend_torn in
- * wib_count_entries_locked(), btrfs_wib_mark()).  What goes is the mark that
+ * a log full of them, and so does a mount's recovery for a stripe it could not
+ * decide.  Stage 0 (raid56_wf_evict_stage0=1) spent them last, when nothing
+ * else was left, rather than refuse every write into a new region until a
+ * scrub: not while a write in flight could still free a slot (@spend_torn in
+ * wib_count_entries_locked(), btrfs_wib_mark()).  What went is the mark that
  * makes a mount after a crash treat the stripe as the write in flight it was,
  * and that refuses a read of its data without a checksum that would have to
- * be rebuilt from the parity alone: wib_evict_sticky() says so, and raises
- * the alert.
+ * be rebuilt from the parity alone -- a read that failed then returned a
+ * rebuild from a parity nothing checked.  A full log keeps them now, and says
+ * that a scrub with every device there retires them.
  */
 static bool wib_entry_torn_only(const struct btrfs_wib_entry *e)
 {
-	return e->torn && !(e->stale | e->stale_par) && !READ_ONCE(torn_unevictable);
+	return e->torn && !(e->stale | e->stale_par) && !READ_ONCE(torn_unevictable) &&
+	       READ_ONCE(evict_stage0);
 }
 
 /*
@@ -809,8 +836,9 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 	 * or scrub folds it into the parity, silently for data without a
 	 * checksum -- the acknowledged value existed only in the parity.  A
 	 * full log now fails the new write instead (btrfs_wib_mark()), which
-	 * the caller sees -- except when wib_may_evict_naming() says keeping
-	 * them would wedge the log.
+	 * the caller sees -- except when wib_may_evict_naming() lets stage 0's
+	 * degraded and replay exceptions spend them (raid56_wf_evict_stage0=1),
+	 * in the order below.
 	 *
 	 * And then the recovery's verdicts on stripes it could not decide go
 	 * last (pass 3, see wib_entry_verdict()).  Spending one turns a read
@@ -6131,8 +6159,20 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 			  logical, who, devid, fsid);
 		break;
 	case BTRFS_RAID56_EV_LOG_FULL:
-		btrfs_err(fs_info,
+		if (READ_ONCE(evict_stage0)) {
+			btrfs_err(fs_info,
 "raid56: a write near %llu FAILED (EIO to the application) because the write-intent log is full of records that name stale data -- left by writes a device failed, or by a cache flush it did not confirm -- and they cannot be dropped without forgetting which copy is wrong, so the log refuses new writes instead. The records retire as their stripes are repaired: run 'btrfs scrub start <mountpoint>', which repairs every stripe it can -- the background repair takes only so many stripes, and gives up on a device that keeps failing. If a device keeps failing, no repair can land: fix or replace it first ('btrfs replace start <devid> <new device> <mountpoint>'). If the filesystem has gone read-only, detach that device and mount with -o degraded: records naming a missing device can be given up, and the replace can run. State: /sys/fs/btrfs/%pU/raid56_health",
+				  logical, fsid);
+			break;
+		}
+		if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
+			btrfs_err(fs_info,
+"raid56: the tree-log replay of this mount FAILED to write near %llu, and the mount fails, because the write-intent log is full of records it will not drop: each says which copy of a stripe is stale on a device that failed writes or is missing, or that a write into it may have been torn, and dropping one could let old data read back with no error. The same records are there at every mount until they retire. If a device fails writes, make it work again (cabling, power) and mount again: the mount's recovery repairs what the records name first. Otherwise mount without the replay to copy the data off ('mount -o ro,nologreplay', with -o degraded if a device is missing): the changes fsync'd since the last transaction commit are not visible that way. Or give those changes up for good ('btrfs rescue zero-log <device>'), mount read-write and replace the failing or missing device with a new disk ('btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'); do not reconnect a disk that went missing, its copy is stale.",
+				  logical);
+			break;
+		}
+		btrfs_err(fs_info,
+"raid56: a write near %llu FAILED (EIO to the application; a refused metadata write makes the filesystem read-only) because the write-intent log is full of records it will not drop: each says which copy of a stripe is stale -- left by writes a device failed or could not take because it is missing, or by a cache flush it did not confirm -- or that a write into it may have been torn, and dropping one could let old data, or a rebuild nothing checked, read back with no error. If a device keeps failing writes, replace it ('btrfs replace start <devid> <new device> <mountpoint>'). If a device is missing, replace that devid with a NEW disk the same way, and do not reconnect the old one: its copy is stale wherever the array was written without it. Then run 'btrfs scrub start <mountpoint>': it repairs every stripe it can, and retires the records that only say a write may have been torn. If the filesystem went read-only because its metadata is on RAID5/6 too, the replace cannot run either: mount it read-only (-o ro, with -o degraded if a device is missing) and copy the data off. State: /sys/fs/btrfs/%pU/raid56_health",
 			  logical, fsid);
 		break;
 	case BTRFS_RAID56_EV_DROPPED:

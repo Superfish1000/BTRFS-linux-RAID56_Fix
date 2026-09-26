@@ -837,6 +837,7 @@ int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 s
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 bool btrfs_wib_evicts_naming(void);
 bool btrfs_wib_keeps_naming_degraded(void);
+bool btrfs_wib_evicts_stage0(void);
 bool btrfs_wib_readd_legacy(void);
 bool btrfs_wib_name_unwritten(void);
 bool btrfs_wib_all_records_torn(void);

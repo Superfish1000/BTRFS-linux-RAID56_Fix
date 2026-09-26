@@ -47,6 +47,9 @@
 #     control  raid56_wf_resume_fail_warns=1: the same, with a kernel warning
 #              and backtrace on top (KERNEL_SPLAT), as for a bug
 #   both is keep and lost; all adds stale, resume and resume-lost.
+# Every boot sets raid56_wf_evict_stage0=1: what is checked is which records
+# stage 0's full log spent with a device missing.  The default spends none and
+# refuses the writes instead (degraded_log_full.sh).
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: replace_marks_kept.sh <kernel> [keep|lost|stale|resume|resume-lost|both|all]}

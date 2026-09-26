@@ -37,6 +37,9 @@
 #     control  raid56_wf_readd_disowns_all=1: the readd takes them over as
 #              plain stale parities, a full log spends them in table order,
 #              and their rows are rebuilt from the torn parity and returned
+# Every boot sets raid56_wf_evict_stage0=1: what is checked is the order in
+# which stage 0's full log spent records with a device missing.  The default
+# spends none and refuses the writes instead (degraded_log_full.sh).
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: verdict_keep.sh <kernel> [replace|remount|flush]}

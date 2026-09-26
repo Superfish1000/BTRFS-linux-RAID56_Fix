@@ -2745,65 +2745,201 @@ flakey)
 	finish
 	;;
 degraded_log_full)
-	# A degraded mount must stay writable however long it runs.
+	# A full write-intent log with a device missing: does it refuse rather
+	# than spend the records that name stale data?
 	#
-	# RAID5 data AND metadata over four devices; one is removed and the
-	# filesystem mounted degraded.  Every small in-place write into a full
-	# stripe with a column on the missing device then leaves a record
+	# PLAN=column: RAID5 data AND metadata over four devices; one is removed
+	# and the filesystem mounted degraded.  Every small in-place write into a
+	# full stripe with a column on the missing device then leaves a record
 	# naming that column, and none of them can retire while the device is
 	# gone.  NREG regions of 4 MiB, each written in all three data columns,
-	# is more than the log holds while anything is stale (82).  If the log
-	# keeps every such record, it fills: small writes fail, and a metadata
+	# is more than the log holds while anything is stale (82).  Kept, they
+	# fill it: writes into new regions fail with the log_full alert, which
+	# says to replace the missing devid with a new disk, and a metadata
 	# write -- RAID5 metadata goes through the same log -- aborts the
-	# transaction and leaves the filesystem read-only, with no way to run
-	# 'btrfs replace'.  CONTROL=1 sets raid56_keep_naming_degraded=1.
+	# transaction.  Every acknowledged block is read back, degraded.
+	#
+	# PLAN=unrelated: RAID5 data and RAID1 metadata over three devices, a
+	# fourth added afterwards that holds none of it, then removed: the mount
+	# is degraded, though nothing of the RAID5 chunk is missing.  Device 1
+	# fails writes while DLF_FILL (82) regions get one block each in a data
+	# column on it -- each recorded naming it, which fills a wide block --
+	# its repairs give up, and it is healed; a commit acknowledges the
+	# writes.  Then DLF_FRESH writes go into new regions, in a column on
+	# another device, and every block of the first ones is read back.
+	#
+	# CONTROL=1 sets raid56_wf_evict_stage0=1: the log spends the records
+	# (record_dropped) and every write succeeds -- with PLAN=unrelated those
+	# naming device 1, whose blocks then read back as they were before the
+	# write, with no error.
 	watchdog ${WATCH:-900}
 	dm_setup
-	mkfs.btrfs -K -q -f -d raid5 -m raid5 $DMDEVS || { log "MKFS_FAIL"; finish; }
-	dm_scan
+	set -- $DMDEVS
+	if [ "${PLAN:-column}" = unrelated ]; then
+		mkfs.btrfs -K -q -f -d raid5 -m raid1 $1 $2 $3 || { log "MKFS_FAIL"; finish; }
+		btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $1 $2 $3 >/dev/null 2>&1
+	else
+		mkfs.btrfs -K -q -f -d raid5 -m raid5 $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+	fi
 	do_mount $OPTS /dev/mapper/d0
 	allow_nodatacow
 	[ "${CONTROL:-0}" = 1 ] && {
-		echo 1 > /sys/module/btrfs/parameters/raid56_keep_naming_degraded 2>/dev/null ||
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_evict_stage0 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
-		log "control: records naming a missing device are kept"
+		log "control: raid56_wf_evict_stage0=1, a full log spends records as stage 0 did"
 	}
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
-	dd if=/dev/zero bs=1M count=$(( ${NREG:-120} * 4 + 16 )) status=none | tr '\000' 'A' > $MNT/nocow
-	sync
-	umount $MNT || { log "UMOUNT_FAIL"; finish; }
-	# Pull the last device: remove its dm node and let btrfs forget it.
-	last=$(( $(echo $DMDEVS | wc -w) - 1 ))
-	dmsetup remove d$last || log "DM_REMOVE_FAIL"
-	btrfs device scan --forget >/dev/null 2>&1
-	btrfs device scan $(echo $DMDEVS | tr ' ' '\n' | grep -v "d$last\$") >/dev/null 2>&1
-	do_mount $OPTS,degraded /dev/mapper/d0
-	log "mounted degraded without d$last: $(grep " $MNT " /proc/mounts | awk '{print $4}')"
 	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.dlf
-	ok=0; eio=0
-	for r in $(seq 0 $(( ${NREG:-120} - 1 ))); do
-		for c in 0 1 2; do
-			if dd if=/tmp/bblock.dlf of=$MNT/nocow bs=4096 oflag=direct conv=notrunc \
-			      seek=$(( r * 1024 + c * 16 )) count=1 status=none 2>/dev/null; then
-				ok=$((ok+1))
-			else
-				eio=$((eio+1))
-			fi
-		done
-	done
-	log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 ))"
-	# Metadata: many small files, then a commit.
-	meta=1
-	mkdir -p $MNT/meta 2>/dev/null || meta=0
-	for i in $(seq 1 200); do echo $i > $MNT/meta/f$i 2>/dev/null || meta=0; done
-	sync
-	btrfs filesystem sync $MNT 2>/dev/null || meta=0
-	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+	: > $T/umltest/dlf.acked.$TAG
 	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
 	hv() { awk -v k=$1 '$1 == k {print $2}' $H 2>/dev/null; }
+	wv() { awk -v k=$1 '$1 == k {print $2}' $W 2>/dev/null; }
+	# Every acknowledged block, cold: 'B', a read error, or wrong.
+	dlf_read() {
+		echo 3 > /proc/sys/vm/drop_caches
+		rok=0; reio=0; rbad=0
+		while read -r b; do
+			if dd if=$MNT/nocow of=/tmp/blk.dlf bs=4096 skip=$b count=1 iflag=direct \
+			      status=none 2>/dev/null; then
+				[ "$(tr -cd B < /tmp/blk.dlf | wc -c)" = 4096 ] && rok=$((rok + 1)) ||
+					{ rbad=$((rbad + 1)); log "DLF_READ_BAD $b"; }
+			else
+				reio=$((reio + 1))
+			fi
+		done < $T/umltest/dlf.acked.$TAG
+		acked=$(wc -l < $T/umltest/dlf.acked.$TAG)
+	}
+	# One 4 KiB block of 'B' at file block $1: 0 if it was acknowledged.
+	dlf_write() {
+		dd if=/tmp/bblock.dlf of=$MNT/nocow bs=4096 oflag=direct conv=notrunc \
+		   seek=$1 count=1 status=none 2>/dev/null || return 1
+		echo $1 >> $T/umltest/dlf.acked.$TAG
+	}
+	if [ "${PLAN:-column}" = unrelated ]; then
+		DLF_FILL=${DLF_FILL:-82}; DLF_FRESH=${DLF_FRESH:-20}
+		# 33 full stripes of three-device RAID5 (32 blocks each): a row
+		# per 4 MiB region, and odd, so that the columns rotate.
+		stride=$(( 33 * 32 )); nrows=$(( DLF_FILL + DLF_FRESH + 24 ))
+		fallocate -l $(( (nrows + 1) * stride * 4096 )) $MNT/nocow ||
+			{ log "FALLOCATE_FAIL"; finish; }
+		sync
+		python3 $T/umltest/raid56_rows.py $MNT/nocow $1 $stride $nrows region \
+			> $T/umltest/dlf.rows.$TAG 2>&1
+		# Per row whose full stripe lies in one region: its block in the
+		# data column on device 1, and one in a data column elsewhere.
+		awk '$3 >= 0 && $5 ~ /:0$/ {
+			one = -1; other = -1
+			for (k = 6; k <= NF; k++) {
+				split($k, m, ":")
+				if (m[1] < 0) continue
+				if (m[2] == 1) one = m[1]; else if (other < 0) other = m[1]
+			}
+			if (one >= 0 && other >= 0) print one, other
+		}' $T/umltest/dlf.rows.$TAG > $T/umltest/dlf.targets.$TAG
+		n=$(wc -l < $T/umltest/dlf.targets.$TAG)
+		[ "$n" -ge $(( DLF_FILL + DLF_FRESH + 1 )) ] || {
+			log "LAYOUT_FAIL $n rows: $(head -2 $T/umltest/dlf.rows.$TAG | tr '\n' ' ')"
+			finish
+		}
+		btrfs device add -f $4 $MNT >/dev/null 2>&1 || log "DEVICE_ADD_FAIL"
+		sync
+		umount $MNT || { log "UMOUNT_FAIL"; finish; }
+		dmsetup remove d3 || log "DM_REMOVE_FAIL"
+		btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $1 $2 $3 >/dev/null 2>&1
+		do_mount $OPTS,degraded $1
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		log "mounted degraded without device 3, which holds none of the RAID5 chunk:" \
+		    "$(grep " $MNT " /proc/mounts | awk '{print $4}')"
+		# The repairs retry at 0.1 s, doubling: they give up in seconds.
+		echo 100 > /sys/module/btrfs/parameters/raid56_repair_delay_ms 2>/dev/null ||
+			log "REPAIR_DELAY_KNOB_FAIL"
+		dm_error_writes 1; log "device 1 fails writes"
+		fill=0
+		head -n $DLF_FILL $T/umltest/dlf.targets.$TAG | while read -r one other; do
+			dlf_write $one
+		done
+		fill=$(wc -l < $T/umltest/dlf.acked.$TAG)
+		t=0
+		while [ $t -lt 120 ]; do
+			sleep 1; t=$((t + 1))
+			[ $t -ge 3 ] && [ "$(wv repair_queued)" = \
+			  "$(( $(wv repair_ok) + $(wv repair_failed) + $(wv repair_skipped) ))" ] && break
+		done
+		log "DLF fill: $fill of $DLF_FILL acknowledged, stale_marks=$(hv stale_marks)" \
+		    "repairs queued=$(wv repair_queued) ok=$(wv repair_ok) failed=$(wv repair_failed)" \
+		    "dropped=$(wv repair_dropped) gave_up=$(hv repair_gave_up) after ${t}s"
+		dm_heal 1; log "device 1 healed"
+		sync
+		btrfs filesystem sync $MNT >/dev/null 2>&1 || log "COMMIT_FAIL after the fill"
+		ok=0; eio=0
+		tail -n +$(( DLF_FILL + 1 )) $T/umltest/dlf.targets.$TAG | head -n $DLF_FRESH > /tmp/dlf.fresh
+		while read -r one other; do
+			if dd if=/tmp/bblock.dlf of=$MNT/nocow bs=4096 oflag=direct conv=notrunc \
+			      seek=$other count=1 status=none 2>/dev/null; then
+				ok=$((ok + 1))
+			else
+				eio=$((eio + 1))
+			fi
+		done < /tmp/dlf.fresh
+		log "writes into new regions ok=$ok eio=$eio of $DLF_FRESH"
+		dlf_read
+		meta=1
+	else
+		dd if=/dev/zero bs=1M count=$(( ${NREG:-120} * 4 + 16 )) status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		umount $MNT || { log "UMOUNT_FAIL"; finish; }
+		# Pull the last device: remove its dm node and let btrfs forget it.
+		last=$(( $(echo $DMDEVS | wc -w) - 1 ))
+		dmsetup remove d$last || log "DM_REMOVE_FAIL"
+		btrfs device scan --forget >/dev/null 2>&1
+		btrfs device scan $(echo $DMDEVS | tr ' ' '\n' | grep -v "d$last\$") >/dev/null 2>&1
+		do_mount $OPTS,degraded /dev/mapper/d0
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		log "mounted degraded without d$last: $(grep " $MNT " /proc/mounts | awk '{print $4}')"
+		ok=0; eio=0
+		for r in $(seq 0 $(( ${NREG:-120} - 1 ))); do
+			for c in 0 1 2; do
+				if dlf_write $(( r * 1024 + c * 16 )); then
+					ok=$((ok+1))
+				else
+					eio=$((eio+1))
+				fi
+			done
+		done
+		log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 ))"
+		# Before the metadata: once a transaction aborts, the tree blocks
+		# it did not write read back as EIO.
+		dlf_read
+		# Metadata: many small files, then a commit.
+		meta=1
+		mkdir -p $MNT/meta 2>/dev/null || meta=0
+		for i in $(seq 1 200); do echo $i > $MNT/meta/f$i 2>/dev/null || meta=0; done
+		sync
+		btrfs filesystem sync $MNT 2>/dev/null || meta=0
+	fi
+	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 	stats "end"
-	log "DLF ok=$ok eio=$eio meta=$meta ro=$ro state=$(hv state) dropped=$(hv record_dropped) log_full=$(hv log_full) unack=$(hv unacknowledged)"
-	echo "$ok $eio $meta $ro $(hv record_dropped) $(hv log_full)" > $T/umltest/dlf.$TAG
+	kmsg "write-intent log is full of records it will not drop" 1
+	log "DLF ok=$ok eio=$eio meta=$meta ro=$ro state=$(hv state) dropped=$(hv record_dropped)" \
+	    "log_full=$(hv log_full) unack=$(hv unacknowledged) sticky_evicted=$(wv sticky_evicted)" \
+	    "stale_evicted=$(wv stale_evicted); read back ok=$rok eio=$reio bad=$rbad of $acked"
+	fresh=-
+	if [ "${PLAN:-column}" = unrelated ]; then
+		# What the log_full alert says to do for a device that failed
+		# writes and works again: a scrub repairs what the records name.
+		btrfs scrub start -B $MNT > /tmp/dlf.scrub 2>&1
+		log "scrub rc=$?: $(tr '\n' ' ' < /tmp/dlf.scrub | cut -c1-160)"
+		other=$(tail -n 1 $T/umltest/dlf.targets.$TAG | awk '{print $2}')
+		dd if=/tmp/bblock.dlf of=$MNT/nocow bs=4096 oflag=direct conv=notrunc \
+		   seek=${other:-0} count=1 status=none 2>/dev/null && fresh=ok || fresh=eio
+		log "DLF after the scrub: a write into a new region $fresh, stale_marks=$(hv stale_marks)"
+	fi
+	echo "$ok $eio $meta $ro $(hv record_dropped) $(hv log_full) $acked $rok $reio $rbad $fresh" \
+	     "$(wv stale_evicted)" > $T/umltest/dlf.$TAG
 	kmsg "raid56|forced readonly|Transaction aborted" 8
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
@@ -3386,6 +3522,11 @@ replace_marks_kept)
 			log "CONTROL_KNOB_FAIL"
 		log "control: $KNOB=1"
 	}
+	# Both arms: what is checked is which records stage 0's full log spent
+	# with a device missing; the default spends none (see
+	# degraded_log_full).
+	echo 1 > /sys/module/btrfs/parameters/raid56_wf_evict_stage0 2>/dev/null ||
+		log "CONTROL_KNOB_FAIL"
 	ROWS=$T/umltest/rm.rows.$TAG
 	# Make the sibling sectors of the rows listed in the files fail every IO.
 	rm_bad() {
@@ -4153,6 +4294,13 @@ torn_readd_verify)
 			log "CONTROL_KNOB_FAIL"
 		log "control: the recovery's verdicts count as stale parities"
 	}
+	# The upgrade pairs: a full log with a device missing spends records as
+	# stage 0 did, which is what the upgrade-verdict control shows; the
+	# default spends none.
+	case "${CONTROL:-0}" in 2|3|4)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_evict_stage0 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+	esac
 	do_mount $OPTS,degraded $MNTDEV
 	kmsg "write-intent|scrub: full stripe|possibly torn" 8
 	kmsg "does not mark the writes" 1
@@ -4413,10 +4561,12 @@ flush_wedge)
 	#     control  raid56_wf_readd_no_repair=1: nothing retires them, and
 	#              the writes fail at once (log_full)
 	#   PLAN=torn (FW_REGIONS 165: a narrow block holds 165)
-	#     fixed    a full log spends the possibly torn records, last and with
+	#     fixed    a full log keeps the possibly torn records: the writes
+	#              fail at once (log_full), and its alert says a scrub
+	#              retires them -- after one, a write into a new region
+	#              succeeds
+	#     control  raid56_wf_evict_stage0=1: it spends them, last and with
 	#              the alert (record_dropped), and the writes succeed
-	#     control  raid56_wf_torn_unevictable=1: it keeps them, and the
-	#              writes fail at once (log_full)
 	#   PLAN=busy (FW_REGIONS 164: one slot is left) and, instead of the
 	#            writes one at a time, FW_BUSY at once into rows of new
 	#            regions whose parity FAIL holds, started while FAIL is
@@ -4427,8 +4577,9 @@ flush_wedge)
 	#            enough thread_pool for them all to get that far at once.
 	#     fixed    they wait for it and take its slot in turn: no record is
 	#              spent, every write succeeds
-	#     control  raid56_wf_torn_spent_eagerly=1: each spends a possibly
-	#              torn record at once (sticky_evicted, record_dropped)
+	#     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
+	#              each spends a possibly torn record at once (sticky_evicted,
+	#              record_dropped)
 	watchdog ${WATCH:-900}
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -4437,14 +4588,15 @@ flush_wedge)
 	allow_nodatacow
 	case "$PLAN" in
 	named) knob=raid56_wf_readd_no_repair; FW_REGIONS=${FW_REGIONS:-82};;
-	torn) knob=raid56_wf_torn_unevictable; FW_REGIONS=${FW_REGIONS:-165};;
-	busy) knob=raid56_wf_torn_spent_eagerly; FW_REGIONS=${FW_REGIONS:-164};;
+	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
+	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
+	      FW_REGIONS=${FW_REGIONS:-164};;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
-	[ "${CONTROL:-0}" = 1 ] && {
-		echo 1 > /sys/module/btrfs/parameters/$knob 2>/dev/null || log "CONTROL_KNOB_FAIL"
-		log "control: $knob=1"
-	}
+	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
+		echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null || log "CONTROL_KNOB_FAIL"
+		log "control: $k=1"
+	done
 	FW_FRESH=${FW_FRESH:-20}; FW_BUSY=${FW_BUSY:-8}
 	nrows=$((FW_REGIONS + FW_FRESH + 40))
 	[ "$PLAN" = busy ] && nrows=$((nrows + 4 * FW_BUSY + 8))
@@ -4471,8 +4623,8 @@ flush_wedge)
 		echo "$k $b $fblk"; k=$((k + 1))
 	done < $R > $T/umltest/fw.targets.$TAG
 	n=$(wc -l < $T/umltest/fw.targets.$TAG)
-	[ "$n" -ge $((FW_REGIONS + FW_FRESH)) ] || {
-		log "LAYOUT_FAIL $n of $((FW_REGIONS + FW_FRESH)) rows: $(head -2 $R | tr '\n' ' ')"
+	[ "$n" -gt $((FW_REGIONS + FW_FRESH)) ] || {
+		log "LAYOUT_FAIL $n of $((FW_REGIONS + FW_FRESH + 1)) rows: $(head -2 $R | tr '\n' ' ')"
 		finish
 	}
 	W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
@@ -4587,13 +4739,26 @@ flush_wedge)
 	done < $T/umltest/fw.acked.$TAG
 	stats "end"
 	kmsg "write-intent log full|dropping the record|btrfs scrub start|raid56:" 8
+	kmsg "write-intent log is full of records it will not drop" 1
 	log "FW fresh ok=$fok eio=$feio in ${secs}s, read back ok=$rok eio=$reio bad=$rbad of $acked," \
 	    "log_full $full0 -> $(hv log_full) record_dropped=$(hv record_dropped)" \
 	    "sticky_evicted=$(wv sticky_evicted) stale_evicted=$(wv stale_evicted)" \
 	    "state=$(hv state) action=$(hv action)"
+	# What the log_full alert says to do: a scrub retires the records, and
+	# a write into a new region goes in again.
+	scrubbed=-
+	if [ "$PLAN" = torn ] && [ "$feio" != 0 ]; then
+		btrfs scrub start -B $MNT > /tmp/fw.scrub 2>&1
+		log "scrub rc=$?: $(tr '\n' ' ' < /tmp/fw.scrub | cut -c1-160)"
+		b=$(awk -v n=$((FW_REGIONS + FW_FRESH)) '$1 == n {print $3}' $T/umltest/fw.targets.$TAG)
+		dd if=$BB of=$MNT/nocow bs=4096 seek=${b:-0} count=1 oflag=direct conv=notrunc \
+		   status=none 2>/dev/null && scrubbed=ok || scrubbed=eio
+		log "FW after the scrub: a write into a new region $scrubbed, torn_blocks=$(wv torn_blocks)" \
+		    "sticky_blocks=$(wv sticky_blocks)"
+	fi
 	echo "$acked $fl ${named:-0} ${torn:-0} ${queued:-0} $(wv repair_ok) $fok $feio $rok $reio" \
 	     "$rbad $(( ${stale1:-0} - ${stale0:-0} )) $(hv log_full) $(hv record_dropped)" \
-	     "$([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs" > $T/umltest/fw.$TAG
+	     "$([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs $scrubbed" > $T/umltest/fw.$TAG
 	rm -f $BB $T/umltest/blk.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
@@ -4634,6 +4799,11 @@ verdict_keep)
 	# the readd takes the verdicts it carries back for its own, and they
 	# are spent in table order.  Either way rows read back wrong.
 	watchdog ${WATCH:-1500}
+	# Both arms: the order checked is the one stage 0's full log spent
+	# records in with a device missing; the default spends none (see
+	# degraded_log_full).
+	echo 1 > /sys/module/btrfs/parameters/raid56_wf_evict_stage0 2>/dev/null ||
+		log "CONTROL_KNOB_FAIL"
 	knob=""
 	case "$ARM" in
 	replace) knob=raid56_wf_replace_end_clears_verdicts;;

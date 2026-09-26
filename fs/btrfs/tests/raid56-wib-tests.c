@@ -1418,6 +1418,44 @@ static int test_named_records_stay(struct btrfs_fs_info *fs_info)
 		}
 	}
 
+	/*
+	 * Nor with a device missing, nor while a tree log is replayed: stage 0
+	 * spent one then (raid56_wf_evict_stage0=1), and still does under it.
+	 * A write it let in stays in flight, so that the log is full again.
+	 */
+	for (u64 i = 0; i < 2; i++) {
+		const u64 fresh = (base + BTRFS_WIB_MAX_ENTRIES + 1 + i) * BTRFS_WIB_ENTRY_SIZE;
+		const bool spends = btrfs_wib_evicts_stage0() &&
+				    !btrfs_wib_keeps_naming_degraded();
+		u64 spent;
+
+		if (i == 0)
+			fs_info->fs_devices->missing_devices = 1;
+		else
+			set_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
+		ret = btrfs_wib_mark(fs_info, fresh, BTRFS_WIB_BLOCK_SIZE);
+		fs_info->fs_devices->missing_devices = 0;
+		clear_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
+		spent = atomic64_read(&wib->stat_stale_evicted) - stale_evicted0;
+		if (spends ? ret || spent != i + 1 : ret != -EIO || spent) {
+			test_err("%s: the mark into a log full of named records returned %d, %llu spent%s",
+				 i ? "tree-log replay" : "device missing", ret, spent,
+				 spends ? ", expected one each under raid56_wf_evict_stage0" : "");
+			if (!ret)
+				btrfs_wib_done(fs_info, fresh, BTRFS_WIB_BLOCK_SIZE, false);
+			if (i && spends)
+				btrfs_wib_done(fs_info, fresh - BTRFS_WIB_ENTRY_SIZE,
+					       BTRFS_WIB_BLOCK_SIZE, false);
+			return -EINVAL;
+		}
+	}
+	if (btrfs_wib_evicts_stage0() && !btrfs_wib_keeps_naming_degraded()) {
+		for (u64 i = 0; i < 2; i++)
+			btrfs_wib_done(fs_info, (base + BTRFS_WIB_MAX_ENTRIES + 1 + i) *
+				       BTRFS_WIB_ENTRY_SIZE, BTRFS_WIB_BLOCK_SIZE, false);
+		test_msg("raid56_wf_evict_stage0 is set: a named record spent with a device missing and during a replay, as expected");
+	}
+
 	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++)
 		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
 				       BTRFS_WIB_BLOCK_SIZE);
@@ -1447,15 +1485,16 @@ static void clear_repairs(struct btrfs_wib *wib)
 /*
  * A log full of records that only say a write may have been torn -- what a
  * failed flush that could not name the device leaves -- with every device
- * there.  No repair retires one and no write finishing does, so the log
- * spends them, after the vague records and with the alert, rather than fail
- * every write into a new region until a scrub.  raid56_wf_torn_unevictable=1
- * keeps them: the write fails at once, as it did.
+ * there.  No repair retires one and no write finishing does: the log spends
+ * the vague records, and then keeps them, failing the write at once, until a
+ * scrub retires them.  Stage 0 spent them last, with the alert
+ * (raid56_wf_evict_stage0=1), which raid56_wf_torn_unevictable=1 narrows back.
  */
 static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
-	const bool keep = btrfs_wib_torn_unevictable() && !btrfs_wib_evicts_naming();
+	const bool keep = !btrfs_wib_evicts_naming() &&
+			  (btrfs_wib_torn_unevictable() || !btrfs_wib_evicts_stage0());
 	const u64 evicted0 = atomic64_read(&wib->stat_sticky_evicted);
 	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
 	const u64 full0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_FULL]);
@@ -1512,11 +1551,10 @@ static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 	if (keep) {
 		if (ret != -EIO || left != nr ||
 		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_FULL]) != full0 + 1) {
-			test_err("raid56_wf_torn_unevictable is set, yet the mark returned %d with %u of %u records left",
+			test_err("possibly torn records are not spent, yet the mark returned %d with %u of %u records left",
 				 ret, left, nr);
 			return -EINVAL;
 		}
-		test_msg("raid56_wf_torn_unevictable is set: possibly torn records kept, the write failed, as expected");
 	} else {
 		if (ret) {
 			test_err("mark into a log full of possibly torn records failed: %d", ret);
@@ -1530,6 +1568,7 @@ static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 				 left, nr);
 			return -EINVAL;
 		}
+		test_msg("raid56_wf_evict_stage0 or raid56_evict_naming is set: a possibly torn record spent, with the alert, as expected");
 	}
 
 	for (u32 i = 0; i < nr; i++)
@@ -1566,14 +1605,16 @@ static void wib_done_later_fn(struct work_struct *work)
  * and spends nothing, rather than drop a mark a read refusal and the next mount
  * depend on.  raid56_wf_torn_spent_eagerly=1 spends one at once.  A write in
  * flight into a region the log holds a record of frees nothing, though: with
- * only that one, a write into a new region spends a record at once rather
- * than wait a minute for nothing.
+ * only that one, stage 0 (raid56_wf_evict_stage0=1) spent a record at once
+ * rather than wait a minute for nothing.  Records that only say a write may
+ * have been torn are not spent now, and that write waits its bound out.
  */
 static int test_torn_waits_for_write(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
+	const bool spendable = btrfs_wib_evicts_stage0() && !btrfs_wib_torn_unevictable();
 	const bool eager = btrfs_wib_evicts_naming() ||
-			   (btrfs_wib_torn_spent_eagerly() && !btrfs_wib_torn_unevictable());
+			   (btrfs_wib_torn_spent_eagerly() && spendable);
 	const u64 evicted0 = atomic64_read(&wib->stat_sticky_evicted);
 	const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
 	const u64 flying = 4600ULL * BTRFS_WIB_ENTRY_SIZE;
@@ -1650,8 +1691,8 @@ static int test_torn_waits_for_write(struct btrfs_fs_info *fs_info)
 	 * Full again, the last slot a possibly torn record too, and the only
 	 * write in flight one into a recorded region.
 	 */
-	if (eager || btrfs_wib_torn_unevictable()) {
-		test_msg("a knob is set: skipping the write in flight that frees nothing");
+	if (eager || !spendable) {
+		test_msg("possibly torn records are spent eagerly or not at all: skipping the write in flight that frees nothing");
 		goto out;
 	}
 	btrfs_wib_add_sticky(fs_info, extra, BTRFS_WIB_BLOCK_SIZE);
@@ -1693,17 +1734,19 @@ out:
 }
 
 /*
- * With every device there, a full log spends the possibly torn records a
+ * With every device there, a full log spent the possibly torn records a
  * failed flush left before the one the mount's recovery kept on a stripe it
  * could not decide (@kept_torn): that one refuses a read that would otherwise
  * return a rebuild from the parity alone where a sector does not read, now.
  * The recovery adds its records first, so in table order it went first.
- * raid56_wf_kept_torn_in_order=1 spends it first again.
+ * raid56_wf_kept_torn_in_order=1 spends it first again.  Only as stage 0 did
+ * (raid56_wf_evict_stage0=1): otherwise none is spent.
  */
 static int test_kept_torn_spent_last(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
-	const bool unevictable = btrfs_wib_torn_unevictable() && !btrfs_wib_evicts_naming();
+	const bool unevictable = !btrfs_wib_evicts_naming() &&
+				 (btrfs_wib_torn_unevictable() || !btrfs_wib_evicts_stage0());
 	const bool in_order = btrfs_wib_kept_torn_in_order() || btrfs_wib_evicts_naming();
 	const u64 evicted0 = atomic64_read(&wib->stat_sticky_evicted);
 	const u64 kept = 5000ULL * BTRFS_WIB_ENTRY_SIZE;
@@ -3871,6 +3914,18 @@ out:
 }
 
 /*
+ * Does a full log with a device missing spend records that name a member
+ * (wib_may_evict_naming())?  Only as stage 0 did, raid56_wf_evict_stage0=1,
+ * or under raid56_evict_naming=1: the order the tests below check is the
+ * order it spends them in then.
+ */
+static bool degraded_evicts(void)
+{
+	return !btrfs_wib_keeps_naming_degraded() &&
+	       (btrfs_wib_evicts_stage0() || btrfs_wib_evicts_naming());
+}
+
+/*
  * A full log with a device missing spends records that name a member rather
  * than fail the write (wib_may_evict_naming()), and the recovery's verdicts
  * last: dropping one turns a read that fails into a rebuild from a torn
@@ -3889,8 +3944,8 @@ static int test_suspect_spent_last(struct btrfs_fs_info *fs_info)
 	bool kept;
 	int ret = -EINVAL;
 
-	if (btrfs_wib_keeps_naming_degraded()) {
-		test_msg("raid56_keep_naming_degraded is set, skipping the spent-last test");
+	if (!degraded_evicts()) {
+		test_msg("raid56_wf_evict_stage0 is unset or raid56_keep_naming_degraded set: nothing is spent with a device missing, skipping the spent-last test");
 		return 0;
 	}
 	if (wib->entries[0].bitmap | wib->entries[0].sticky) {
@@ -4054,8 +4109,8 @@ static int test_replace_marks_spent_last(struct btrfs_fs_info *fs_info)
 	int ret = -EINVAL;
 	int end;
 
-	if (btrfs_wib_keeps_naming_degraded()) {
-		test_msg("raid56_keep_naming_degraded is set, skipping the replace-marks test");
+	if (!degraded_evicts()) {
+		test_msg("raid56_wf_evict_stage0 is unset or raid56_keep_naming_degraded set: nothing is spent with a device missing, skipping the replace-marks test");
 		return 0;
 	}
 	if (wib->entries[0].bitmap | wib->entries[0].sticky) {
@@ -4180,8 +4235,8 @@ static int test_replace_keeps_stale_column(struct btrfs_fs_info *fs_info)
 	int ret = -EINVAL;
 	int end;
 
-	if (btrfs_wib_keeps_naming_degraded()) {
-		test_msg("raid56_keep_naming_degraded is set, skipping the stale-column replace test");
+	if (!degraded_evicts()) {
+		test_msg("raid56_wf_evict_stage0 is unset or raid56_keep_naming_degraded set: nothing is spent with a device missing, skipping the stale-column replace test");
 		return 0;
 	}
 	if (wib->entries[0].bitmap | wib->entries[0].sticky) {
@@ -4344,8 +4399,8 @@ static int test_prior_verdict_spent_last(struct btrfs_fs_info *fs_info)
 	bool kept;
 	int ret = -EINVAL;
 
-	if (btrfs_wib_keeps_naming_degraded()) {
-		test_msg("raid56_keep_naming_degraded is set, skipping the prior-verdict test");
+	if (!degraded_evicts()) {
+		test_msg("raid56_wf_evict_stage0 is unset or raid56_keep_naming_degraded set: nothing is spent with a device missing, skipping the prior-verdict test");
 		return 0;
 	}
 	if (wib->entries[0].bitmap | wib->entries[0].sticky) {
