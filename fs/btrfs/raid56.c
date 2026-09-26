@@ -5073,7 +5073,15 @@ out:
 		const bool failed = ret < 0 ||
 			!bitmap_empty(rbio->error_bitmap, rbio->nr_sectors);
 
-		btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, failed);
+		/*
+		 * A failed write stays in flight until the names below are in
+		 * its record: a full log spends a record that names nothing
+		 * first, and in between is when it would (btrfs_wib_failed()).
+		 */
+		if (failed)
+			btrfs_wib_failed(fs_info, full_stripe_start, full_stripe_len);
+		else
+			btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, false);
 		faulted = failed;
 		/*
 		 * Say WHICH data this write did and did not get onto the disk,
@@ -5128,6 +5136,8 @@ out:
 			rmw_update_stale_data(rbio, full_stripe_start);
 			rmw_update_stale_parity(rbio, full_stripe_start);
 		}
+		if (failed)
+			btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, false);
 	}
 	else if (ret >= 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {
 		/*
@@ -5148,10 +5158,11 @@ out:
 		 * to was the one class that could never get a column name.
 		 *
 		 * Order matters: btrfs_wib_mark_stale() only marks blocks the
-		 * log already records, which btrfs_wib_add_sticky() has just
-		 * done.
+		 * log already records, which btrfs_wib_try_add_failed() has
+		 * just done -- in flight, so that a full log cannot spend the
+		 * record before it names the device, as for a failed RMW above.
 		 */
-		if (btrfs_wib_try_add_sticky(fs_info, full_stripe_start,
+		if (btrfs_wib_try_add_failed(fs_info, full_stripe_start,
 					     full_stripe_len) < 0) {
 			/*
 			 * No room to say which device holds the stale column:
@@ -5166,6 +5177,7 @@ out:
 		} else {
 			rmw_update_stale_data(rbio, full_stripe_start);
 			rmw_update_stale_parity(rbio, full_stripe_start);
+			btrfs_wib_done(fs_info, full_stripe_start, full_stripe_len, false);
 			faulted = true;
 		}
 	} else if (ret < 0 && !bitmap_empty(rbio->error_bitmap, rbio->nr_sectors)) {

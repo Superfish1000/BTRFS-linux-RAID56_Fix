@@ -649,6 +649,16 @@ static bool kept_torn_in_order;
 module_param_named(raid56_wf_kept_torn_in_order, kept_torn_in_order, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_kept_torn_in_order,
 		 "Let a full write-intent log spend the records the mount's recovery kept possibly torn in table order with those a failed flush left (testing only: restores a known defect)");
+/*
+ * raid56_wf_failed_leaves_flight=1: btrfs_wib_failed() ends the write at once,
+ * as btrfs_wib_done() does, so that its record names no member until the
+ * caller gets to btrfs_wib_mark_stale(), and a full log may spend it in
+ * between.  The negative control for test_failed_named_before_spent().
+ */
+static bool failed_leaves_flight;
+module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
+		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
 #else
 static const bool evict_naming;
 static const bool keep_naming_degraded;
@@ -657,6 +667,7 @@ static const bool replace_keeps_added_only;
 static const bool torn_unevictable;
 static const bool torn_spent_eagerly;
 static const bool kept_torn_in_order;
+static const bool failed_leaves_flight;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -694,6 +705,11 @@ bool btrfs_wib_torn_spent_eagerly(void)
 bool btrfs_wib_kept_torn_in_order(void)
 {
 	return READ_ONCE(kept_torn_in_order);
+}
+
+bool btrfs_wib_failed_leaves_flight(void)
+{
+	return READ_ONCE(failed_leaves_flight);
 }
 #endif
 
@@ -3680,15 +3696,8 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	return ret;
 }
 
-/*
- * All writes of the RMW recorded by btrfs_wib_mark() have completed.
- *
- * @failed: at least one of them failed (device error or missing device).
- * The stripe is then inconsistent on that device without any crash; keep it
- * logged so that it is scrubbed once the device is back, replaced or
- * dropped, at the next mount.
- */
-void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed)
+static void wib_write_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
+			   bool failed, bool keep_flight)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -3710,7 +3719,8 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 		if (!e)
 			continue;
 		mask = btrfs_wib_range_mask(cur, logical, len);
-		e->bitmap &= ~mask;
+		if (!keep_flight)
+			e->bitmap &= ~mask;
 		if (failed) {
 			e->sticky |= mask;
 			e->gen = max(e->gen, fs_info->generation);
@@ -3733,16 +3743,40 @@ void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool fa
 }
 
 /*
- * Keep [@logical, @logical + @len) recorded across mounts without a write in
- * flight: used for stripes whose recovery could not complete.  Dropped with
- * a warning if the log is full.
+ * All writes of the RMW recorded by btrfs_wib_mark() have completed.
+ *
+ * @failed: at least one of them failed (device error or missing device).
+ * The stripe is then inconsistent on that device without any crash; keep it
+ * logged so that it is scrubbed once the device is back, replaced or
+ * dropped, at the next mount.
  */
+void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed)
+{
+	wib_write_done(fs_info, logical, len, failed, false);
+}
+
 /*
- * Record [@logical, @logical + @len) as having had a failed write.  Returns
- * -ENOSPC, recording nothing and saying nothing, if the log has no room: for
- * a caller that can still fail the write instead.
+ * A write recorded by btrfs_wib_mark() failed on some device: keep its full
+ * stripe recorded, as btrfs_wib_done(..., true) does, but leave the write in
+ * flight.
+ *
+ * The record names no member yet; the caller works out which ones the write
+ * did not reach and says so next (btrfs_wib_mark_stale(),
+ * btrfs_wib_update_stale_parity()).  A record that names nothing and has
+ * nothing in flight is the first one a full log spends (wib_evict_sticky()),
+ * for a concurrent write into a new region or for the capacity halving that
+ * naming a member itself can cause -- and spent in between, the names find no
+ * entry, and the stale member is read as it is, silently for data without a
+ * checksum.  In flight, it cannot be spent.  The caller ends the write with
+ * btrfs_wib_done(..., false) once it has named what it has to.
  */
-int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_write_done(fs_info, logical, len, true, !READ_ONCE(failed_leaves_flight));
+}
+
+static int wib_try_add(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
+		       bool naming)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -3756,8 +3790,36 @@ int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len
 	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret < 0)
 		return ret;
-	btrfs_wib_done(fs_info, logical, len, true);
+	if (naming)
+		btrfs_wib_failed(fs_info, logical, len);
+	else
+		btrfs_wib_done(fs_info, logical, len, true);
 	return 0;
+}
+
+/*
+ * Keep [@logical, @logical + @len) recorded across mounts without a write in
+ * flight: used for stripes whose recovery could not complete.  Dropped with
+ * a warning if the log is full.
+ */
+/*
+ * Record [@logical, @logical + @len) as having had a failed write.  Returns
+ * -ENOSPC, recording nothing and saying nothing, if the log has no room: for
+ * a caller that can still fail the write instead.
+ */
+int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	return wib_try_add(fs_info, logical, len, false);
+}
+
+/*
+ * btrfs_wib_try_add_sticky() for a write that is about to name the members it
+ * did not reach: the record stays in flight, as after btrfs_wib_failed(),
+ * until the caller has done so and calls btrfs_wib_done(..., false).
+ */
+int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	return wib_try_add(fs_info, logical, len, true);
 }
 
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)

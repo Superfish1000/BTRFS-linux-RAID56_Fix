@@ -862,6 +862,7 @@ bool btrfs_wib_readd_admits_busy(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
+bool btrfs_wib_failed_leaves_flight(void);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_wib_unrecovered_as_ambiguous(void);
@@ -909,6 +910,7 @@ void btrfs_wib_note_written(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 			    int nr_data, u64 cols, u32 par, bool logged);
 void btrfs_wib_note_written_data(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
+void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
 void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
@@ -1042,6 +1044,7 @@ bool btrfs_wib_can_mark(struct btrfs_wib *wib, u64 logical, u64 len);
 bool btrfs_wib_readd_refuses(struct btrfs_wib *wib, u64 logical, u64 len);
 void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 		       struct btrfs_wib_entry *out);

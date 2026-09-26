@@ -1436,6 +1436,110 @@ static int test_named_records_stay(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
+/*
+ * A write that failed on a device names the member it did not reach only after
+ * its record exists, and a record that names nothing is the first a full log
+ * spends.  In between, a concurrent write into a new region of a log full of
+ * named records used to spend it: the name then found no entry, and the stale
+ * member was read as it is.  btrfs_wib_failed() keeps the write in flight until
+ * it has named the member, so the concurrent write finds no room and fails
+ * instead.  Both ways a write can fail: a read-modify-write (btrfs_wib_mark(),
+ * then btrfs_wib_failed()) and a full stripe write
+ * (btrfs_wib_try_add_failed()).  raid56_wf_failed_leaves_flight=1 opens the
+ * window again, and the record is lost.
+ */
+static int test_failed_named_before_spent(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool window = btrfs_wib_failed_leaves_flight();
+	const u64 other = 5802ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 base = 5600;
+	unsigned long flags;
+	int ret;
+
+	/* A negative-control run asked for the old eviction on purpose. */
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the failed-write naming test");
+		return 0;
+	}
+
+	/* One slot left in the wide layout, and every record names a member. */
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++) {
+		const u64 logical = (base + i) * BTRFS_WIB_ENTRY_SIZE;
+
+		btrfs_wib_add_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		btrfs_wib_mark_stale(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (!find_live_entry(wib, logical)) {
+			test_err("named record %llu was not created", i);
+			return -EINVAL;
+		}
+	}
+
+	for (int full = 0; full < 2; full++) {
+		const u64 logical = (5800ULL + full) * BTRFS_WIB_ENTRY_SIZE;
+		const u64 dropped0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]);
+		const char *what = full ? "full stripe write" : "read-modify-write";
+		u64 dropped;
+		int concurrent;
+		bool named;
+
+		if (full) {
+			ret = btrfs_wib_try_add_failed(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		} else {
+			ret = btrfs_wib_mark(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+			if (!ret)
+				btrfs_wib_failed(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		}
+		if (ret) {
+			test_err("the failed %s found no room: %d", what, ret);
+			return ret;
+		}
+
+		/* The concurrent write, before the failed one named anything. */
+		spin_lock_irqsave(&wib->lock, flags);
+		concurrent = btrfs_wib_try_mark(wib, other, BTRFS_WIB_BLOCK_SIZE);
+		spin_unlock_irqrestore(&wib->lock, flags);
+		btrfs_wib_mark_stale(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		btrfs_wib_done(fs_info, logical, BTRFS_WIB_BLOCK_SIZE, false);
+		if (!concurrent)
+			btrfs_wib_done(fs_info, other, BTRFS_WIB_BLOCK_SIZE, false);
+		named = btrfs_wib_stale(fs_info, logical);
+		dropped = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_DROPPED]) - dropped0;
+
+		if (window) {
+			if (concurrent || named || dropped != 1) {
+				test_err("raid56_wf_failed_leaves_flight is set, yet the failed %s kept its name (concurrent mark %d, named %d)",
+					 what, concurrent, named);
+				return -EINVAL;
+			}
+			test_msg("raid56_wf_failed_leaves_flight is set: the failed %s's record was spent before it named the member, as expected",
+				 what);
+		} else if (concurrent != -ENOSPC || !named || dropped) {
+			test_err("the failed %s lost its record before naming the member (concurrent mark %d, named %d)",
+				 what, concurrent, named);
+			return -EINVAL;
+		}
+		btrfs_wib_clear_sticky(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+	}
+
+	for (u64 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_BLOCK_SIZE);
+	if (btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the failed-write naming test");
+		return -EINVAL;
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		return ret;
+	if (block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the failed-write naming test");
+		return -EINVAL;
+	}
+	return 0;
+}
+
 /* Forget the repairs asked for so far: none runs here (see btrfs_test_raid56_wib()). */
 static void clear_repairs(struct btrfs_wib *wib)
 {
@@ -4843,6 +4947,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_named_records_stay(fs_info);
+	if (ret)
+		goto out;
+	ret = test_failed_named_before_spent(fs_info);
 	if (ret)
 		goto out;
 	ret = test_torn_spent_last(fs_info);
