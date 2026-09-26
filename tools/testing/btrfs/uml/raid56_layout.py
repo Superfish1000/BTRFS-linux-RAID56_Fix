@@ -9,7 +9,11 @@
 # device holding column 0 (IDX_B) and the parity P (IDX_P), and the physical
 # offset of column 0's first sector on its device (PHYS_B).  The geometry is
 # btrfs_map_block()'s: data column c of full stripe n on stripe (n + c) %
-# num_stripes, P after the data.  IDX_C is the device of column 1.
+# num_stripes, P after the data.  IDX_C is the device of column 1, DEV_C its
+# path and PHYS_C the physical offset of its first sector (the same row).
+# DEV_P and PHYS_P are the same for the parity P.  On RAID6 also IDX_Q, DEV_Q
+# and PHYS_Q: the same for Q, the stripe after P.  With three data columns or
+# more also FO_D, IDX_D, DEV_D and PHYS_D: the same for column 2.
 import re
 import subprocess
 import sys
@@ -66,9 +70,17 @@ for c in chunks:
         m = re.search(r'(\d+)$', d)
         return m.group(1)
     ib, ic, ip = (row + 0) % num, (row + 1) % num, (row + nd) % num
+    iq = (row + nd + 1) % num
     print(f'FULL={fss} NDATA={nd} FO_B={f0 + fss - p0} FO_C={f0 + fss - p0 + SL} '
           f'IDX_B={idx(ib)} IDX_C={idx(ic)} IDX_P={idx(ip)} DEV_B={devpath[c["stripes"][ib][0]]} '
-          f'PHYS_B={c["stripes"][ib][1] + row * SL}')
+          f'PHYS_B={c["stripes"][ib][1] + row * SL} '
+          f'DEV_C={devpath[c["stripes"][ic][0]]} PHYS_C={c["stripes"][ic][1] + row * SL} '
+          f'DEV_P={devpath[c["stripes"][ip][0]]} PHYS_P={c["stripes"][ip][1] + row * SL}'
+          + (f' IDX_Q={idx(iq)} DEV_Q={devpath[c["stripes"][iq][0]]} '
+             f'PHYS_Q={c["stripes"][iq][1] + row * SL}' if npar == 2 else '')
+          + (f' FO_D={f0 + fss - p0 + 2 * SL} IDX_D={idx((row + 2) % num)} '
+             f'DEV_D={devpath[c["stripes"][(row + 2) % num][0]]} '
+             f'PHYS_D={c["stripes"][(row + 2) % num][1] + row * SL}' if nd >= 3 else ''))
     break
 else:
     sys.exit('file not in any chunk')

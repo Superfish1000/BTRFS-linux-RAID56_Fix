@@ -30,6 +30,11 @@ ENTRY_NARROW = struct.Struct("<QQQ")          # bytenr, bitmap, error
 ENTRY_WIDE = struct.Struct("<QQQQQQ")         # + stale, stale_par, gen
 FLAG_STALE = 1 << 0                           # BTRFS_WIB_FLAG_STALE: wide entries
 FLAGS_SUPPORTED = FLAG_STALE                  # BTRFS_WIB_FLAGS_SUPPORTED
+# The last 8 bytes of a slot (BTRFS_WIB_TRAILER_OFFSET): BTRFS_WIB_TORN_MARKING
+# when the writer marks the records that may hide a torn write.  Without it,
+# the kernel reads every error record of the block as possibly torn.
+TRAILER_OFFSET = SLOT_SIZE - 8
+TORN_MARKING = 0x4b52414d4e524f54             # "TORNMARK"
 SUPER_OFFSET = 64 * 1024
 SUPER_MAGIC = b"_BHRfS_M"
 CSUM_NAMES = {0: "crc32c", 1: "xxhash64", 2: "sha256", 3: "blake2b"}
@@ -96,9 +101,11 @@ def dump(path):
                 state = "OK" if csum[:len(calc)] == calc else "BAD"
             wide = bool(flags & FLAG_STALE)
             ent = ENTRY_WIDE if wide else ENTRY_NARROW
+            marks = struct.unpack_from("<Q", blk, TRAILER_OFFSET)[0] == TORN_MARKING
             print(f"{path} slot {slot}: seq {seq} entries {nr} block_shift {shift} "
                   f"flags 0x{flags:x} {'wide' if wide else 'narrow'} "
-                  f"fsid {fsid.hex()} csum {state}")
+                  f"fsid {fsid.hex()} csum {state} "
+                  f"{'marks-torn' if marks else 'unmarked (error records read as possibly torn)'}")
             # Refuse rather than guess, which is what the kernel does with a
             # flag it does not know (BTRFS_WIB_FLAGS_SUPPORTED).  A bit we have
             # never seen may well move the fields we are about to read, and a

@@ -4,7 +4,10 @@
 set -u
 T=${BTRFS_TEST_DIR:?}; K=$1; TAG=$2; PROFILE=$3; NDEV=${4:-4}; OMIT=${5:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
-mkdir -p $T/umltest; cp $HERE/init-final3.sh $T/umltest/init-final3.sh
+mkdir -p $T/umltest
+# Copied under a temporary name and renamed: a guest may be reading it.
+cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ &&
+	mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh
 D=$T/umltest/$TAG; rm -rf $D; mkdir -p $D; rm -f $T/umltest/results.$TAG
 ubds=""
 for i in $(seq 0 $((NDEV-1))); do

@@ -19,7 +19,9 @@ NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-alert.sh.$$ && mv -f $T/umltest/init-alert.sh.$$ $T/umltest/init-alert.sh	# atomic: a guest may be reading it
-cp $HERE/raid56_layout.py $HERE/raid56_alert_listen.py $T/umltest/
+for f in raid56_layout.py raid56_alert_listen.py; do
+	cp $HERE/$f $T/umltest/$f.$$ && mv -f $T/umltest/$f.$$ $T/umltest/$f
+done
 ulimit -c 0
 
 boot() {	# arm control

@@ -16,7 +16,8 @@ NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-torn.sh.$$ && mv -f $T/umltest/init-torn.sh.$$ $T/umltest/init-torn.sh	# atomic: a guest may be reading it
-cp $HERE/raid56_layout.py $T/umltest/raid56_layout.py
+cp $HERE/raid56_layout.py $T/umltest/raid56_layout.py.$$ &&
+	mv -f $T/umltest/raid56_layout.py.$$ $T/umltest/raid56_layout.py
 ulimit -c 0
 arm() {	# name control
 	local tag=rmw-torn-$1 ubds=""

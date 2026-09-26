@@ -22,6 +22,13 @@
 #   rw       -o rw,degraded: the tree roots are read before the recovery runs
 #   ro-ctl   ro, btrfs.raid56_no_early_record=1 (the old behaviour)
 #   rw-ctl   rw, the same
+#   ro-all   ro, btrfs.raid56_wf_all_records_torn=1: every record is taken for
+#            a write that may have been torn, as stage 0 first did, so the
+#            rebuilds of the omitted device's data columns are refused (ro:
+#            btrfs_wib_unrecovered(); rw: scrub_raid56_recover_absent())
+#            although the records are of plain failed writes and the parity
+#            rebuilds them exactly
+#   rw-all   rw, the same
 # The triggered repair is kept out of the prep so the stale columns survive to
 # be read.
 set -u
@@ -73,16 +80,25 @@ arm ro ro
 arm rw rw
 arm ro-ctl ro btrfs.raid56_no_early_record=1
 arm rw-ctl rw btrfs.raid56_no_early_record=1
+arm ro-all ro btrfs.raid56_wf_all_records_torn=1
+arm rw-all rw btrfs.raid56_wf_all_records_torn=1
 
 R=$(verdict ro); W=$(verdict rw); RC=$(verdict ro-ctl); WC=$(verdict rw-ctl)
-S=$(( $(splats ro) + $(splats rw) + $(splats ro-ctl) + $(splats rw-ctl) ))
-echo "  ro,degraded: $R   (control: $RC)"
-echo "  rw,degraded: $W   (control: $WC)"
+RA=$(verdict ro-all); WA=$(verdict rw-all)
+S=$(( $(splats ro) + $(splats rw) + $(splats ro-ctl) + $(splats rw-ctl) +
+      $(splats ro-all) + $(splats rw-all) ))
+echo "  ro,degraded: $R   (control: $RC, every record torn: $RA)"
+echo "  rw,degraded: $W   (control: $WC, every record torn: $WA)"
 echo "  splats: $S"
 grep -h "open_ctree failed\|failed to load\|Q syndrome" $T/umltest/early-*-ctl/log.stale_parity_verify 2>/dev/null |
 	sed 's/^/    control: /' | head -3
+grep -h "refusing a read\|possibly torn" \
+	$T/umltest/early-*-all/log.stale_parity_verify 2>/dev/null |
+	sed 's/^/    every record torn: /' | head -3
 echo
-case "$R$W$RC$WC" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+case "$R$W$RC$WC$RA$WA" in
+*'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
+esac
 [ "$S" -eq 0 ] || { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 if [ "$RC" = CORRECT ] && [ "$WC" = CORRECT ]; then
 	echo "RESULT: INCONCLUSIVE -- the old behaviour read everything correctly"
@@ -93,5 +109,21 @@ fi
 	echo "RESULT: FAIL -- with the record consulted from the first read: ro $R, rw $W"
 	exit 1
 }
+# The all-records arms are there to show a refusal.  A wrong read under the
+# rules for possibly torn records is a bug in those rules, which production
+# applies to every record that really is possibly torn; a mount failure or a
+# correct read shows nothing about telling plain failed writes apart.
+if [ "$RA" = SILENT ] || [ "$WA" = SILENT ]; then
+	echo "RESULT: FAIL -- taking every record for a torn write returned wrong data:" \
+	     "ro $RA, rw $WA"
+	exit 1
+fi
+if [ "$RA" != REFUSED ] && [ "$WA" != REFUSED ]; then
+	echo "RESULT: INCONCLUSIVE -- taking every record for a torn write refused nothing"
+	echo "        (ro $RA, rw $WA), so this run does not show that plain failed writes"
+	echo "        are told apart"
+	exit 2
+fi
 echo "RESULT: PASS -- with the record consulted from the first read both mounts"
-echo "        come up and read the file correctly; without it: ro $RC, rw $WC"
+echo "        come up and read the file correctly; without it: ro $RC, rw $WC;"
+echo "        taking every record for a torn write: ro $RA, rw $WA"

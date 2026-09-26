@@ -6,7 +6,8 @@ KERNEL=$1; TAG=$2; FAIL=$3; NDEV=5
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
 cp $HERE/init-final3.sh $T/umltest/init-final3.sh.$$ && mv -f $T/umltest/init-final3.sh.$$ $T/umltest/init-final3.sh	# atomic: a guest may be reading it
-cp $HERE/../raid56_wib_dump.py $T/umltest/ 2>/dev/null || true
+cp $HERE/../raid56_wib_dump.py $T/umltest/raid56_wib_dump.py.$$ 2>/dev/null &&
+	mv -f $T/umltest/raid56_wib_dump.py.$$ $T/umltest/raid56_wib_dump.py
 D=$T/umltest/$TAG
 rm -rf $D; mkdir -p $D; rm -f $T/umltest/results.$TAG $T/umltest/*.md5.$TAG
 for i in $(seq 0 $((NDEV-1))); do truncate -s 1G $D/disk$i.img; done
