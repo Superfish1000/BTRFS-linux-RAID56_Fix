@@ -6409,7 +6409,8 @@ static int wib_slot_io(struct block_device *bdev, unsigned int slot, void *buf,
 
 /*
  * Put the latched alerts in the log although this mount has written no block
- * of its own to carry them (@last): its recovery stopped before it wrote one.
+ * of its own to carry them (@last): the log is not enabled at this mount, or
+ * its recovery stopped before it wrote one.
  * The devices that hold the newest block of all get it again, the alerts
  * updated and one sequence number on, in their other slot.  Every block lists
  * what it did, the next mount still takes the stale marks from the newest one,
@@ -6507,6 +6508,22 @@ out:
 }
 
 /*
+ * Testing only: write the latched alerts, and an acknowledgment, only while
+ * the log is enabled, as before: once it is disabled -- the feature cleared,
+ * or mounted with -o noraid56_write_intent -- the alerts its last block
+ * carries come back at every mount, and an ack of them never reaches it.
+ * The negative control for the disabled plan of uml/alert_latch.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool latch_needs_log;
+module_param_named(raid56_wf_latch_needs_log, latch_needs_log, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_latch_needs_log,
+		 "Write the raid56 alerts that wait for an acknowledgment, and their acknowledgment, to the write-intent log only while it is enabled, so that an ack with the log disabled never sticks (testing only: restores the old behaviour)");
+#else
+static const bool latch_needs_log;
+#endif
+
+/*
  * Put the latched alerts in the log (wib_write_latch_locked()) -- or, where
  * this mount has written no block to carry them and @stamp,
  * wib_stamp_latch_locked().
@@ -6524,22 +6541,25 @@ static void wib_write_latch(struct btrfs_wib *wib, bool stamp)
 /*
  * The latched alerts changed (a new one, or an acknowledgment): put them in the
  * log now, not with whatever block comes next -- on an idle filesystem that may
- * be none before a crash, and after a commit that failed none at all.  A
- * filesystem a failed commit made read-only is written all the same, nothing
- * else being written there any more; a frozen one is not, nor one mounted or
- * remounted read-only: the next block a read-write mount writes carries them.
+ * be none before a crash, after a commit that failed none at all, and with the
+ * log disabled none ever: its last block carries the alerts it had then, and a
+ * mount takes them back whether the log is enabled or not.  A filesystem a
+ * failed commit made read-only is written all the same, nothing else being
+ * written there any more; a frozen one is not, nor one mounted or remounted
+ * read-only: an unmount of it writes nothing, and an acknowledgment made there
+ * lasts as long as the mount does (btrfs_raid56_health_ack()).
  */
 static void wib_latch_work(struct work_struct *work)
 {
 	struct btrfs_wib *wib = container_of(work, struct btrfs_wib, latch_work);
 	struct super_block *sb = wib->fs_info->sb;
+	const bool enabled = READ_ONCE(wib->enabled);
 
-	if (!READ_ONCE(wib->enabled) || sb->s_writers.frozen != SB_UNFROZEN ||
+	if ((!enabled && READ_ONCE(latch_needs_log)) ||
+	    sb->s_writers.frozen != SB_UNFROZEN ||
 	    (sb_rdonly(sb) && !BTRFS_FS_ERROR(wib->fs_info)))
 		return;
-	mutex_lock(&wib->commit_mutex);
-	wib_write_latch_locked(wib);
-	mutex_unlock(&wib->commit_mutex);
+	wib_write_latch(wib, !enabled);
 }
 
 /*
@@ -6574,8 +6594,12 @@ void btrfs_wib_unmount(struct btrfs_fs_info *fs_info)
 	spin_lock_irqsave(&wib->lock, flags);
 	enabled = wib->enabled;
 	spin_unlock_irqrestore(&wib->lock, flags);
-	if (!enabled)
+	/* Nothing in flight to drop, only an acknowledgment to keep. */
+	if (!enabled) {
+		if (!READ_ONCE(latch_needs_log))
+			wib_write_latch(wib, true);
 		return;
+	}
 
 	mutex_lock(&wib->commit_mutex);
 	hdr = wib->last;

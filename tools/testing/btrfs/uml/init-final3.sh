@@ -2439,12 +2439,23 @@ alert_latch)
 	# lists more than 164 and every one carries the alert.  CONTROL=1 sets
 	# raid56_wf_latch_full_narrow=1: the newest block lists 165 regions and
 	# no alert, and the mount after the crash reads none.
+	#
+	# PLAN=disabled (PHASE=draise, then dcheck): the alert raised as above,
+	# then the feature cleared (the log disabled: its last block carries the
+	# alert), an unmount, and a mount with -o noraid56_write_intent: the
+	# alert is back; it is acknowledged, and the machine stops.  Mounted so
+	# again, fixed, nothing stands; CONTROL=1 (raid56_wf_latch_needs_log=1):
+	# the ack never reached the log, and the alert is back again.
 	case "${PLAN:-}:${CONTROL:-0}" in
 	narrow:1)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_full_narrow 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: raid56_wf_latch_full_narrow=1";;
-	narrow:*) ;;
+	disabled:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_needs_log 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_needs_log=1";;
+	narrow:*|disabled:*) ;;
 	*:1)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_volatile 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
@@ -2460,6 +2471,57 @@ alert_latch)
 		sleep 60
 	}
 	case "$PHASE" in
+	draise)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		for i in 0 1 2; do dm_error_writes_range $i $((512 * 1024)) 8192; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_heal $i; done
+		sync
+		F=$(ls -d /sys/fs/btrfs/*-*-*/features 2>/dev/null | head -1)
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		echo 0 > $F/raid56_write_intent || log "DISABLE_FAIL"
+		# The disable completes at the commit after the one whose
+		# superblock lacks the flag: see btrfs_wib_commit().
+		for i in 1 2 3; do touch $MNT/m$i; sync; done
+		en0=$(awk '$1 == "enabled" {print $2}' $W)
+		u0=$(unack)
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw,noraid56_write_intent /dev/mapper/d0
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		en1=$(awk '$1 == "enabled" {print $2}' $W)
+		u1=$(unack)
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 3
+		u2=$(unack)
+		kmsg "alerts an earlier mount|acknowledged|write-intent log disabled" 3
+		log "AL draise: first write $w1; disabled (enabled $en0), unacknowledged $u0;" \
+		    "mounted again (enabled $en1): $u1; after the ack $u2"
+		echo "$w1 $en0 ${u0:-none} $en1 ${u1:-none} ${u2:-none}" > $T/umltest/al.$TAG.draise
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		crash
+		;;
+	dcheck)
+		do_mount rw,noraid56_write_intent $MNTDEV
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		en=$(awk '$1 == "enabled" {print $2}' $W)
+		u3=$(unack)
+		kmsg "alerts an earlier mount" 1
+		log "AL dcheck: after the ack and a crash (enabled $en): $u3"
+		echo "$en ${u3:-none}" > $T/umltest/al.$TAG.dcheck
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
 	nraise)
 		# 4.3 MiB apart: each block in a 4 MiB region of its own.
 		AL_REGIONS=${AL_REGIONS:-165}

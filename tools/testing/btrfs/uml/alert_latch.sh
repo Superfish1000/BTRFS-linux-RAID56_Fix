@@ -33,11 +33,22 @@
 #            alert from the device's other slot
 # The host reads the log slots of the images between the boots
 # (raid56_wib_dump.py).
+#
+#   alert_latch.sh <kernel> disabled
+#
+# The alert raised the same way, then the feature cleared: the log's last
+# block carries the alert, and it is not written again.  Mounted with
+# -o noraid56_write_intent, the alert is back; it is acknowledged, and the
+# machine stops.  Mounted so again:
+#   fixed    nothing stands: the ack went to the log, the newest block written
+#            again with it (wib_stamp_latch_locked())
+#   control  raid56_wf_latch_needs_log=1: nothing wrote the ack, and the alert
+#            is back -- at every mount, for good
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: alert_latch.sh <kernel> [narrow]}
+KERNEL=${1:?usage: alert_latch.sh <kernel> [narrow|disabled]}
 PLAN=${2:-latch}
-case $PLAN in latch|narrow) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in latch|narrow|disabled) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
@@ -67,6 +78,61 @@ arm() {	# name control
 	boot final rw $2
 	rm -f $D/disk*.img
 }
+if [ $PLAN = disabled ]; then
+	darm() {	# name control
+		tag=al-d$1
+		D=$T/umltest/$tag
+		rm -rf $D; mkdir -p $D
+		rm -f $T/umltest/al.$tag.* $T/umltest/results.$tag
+		for i in $(seq 0 $((NDEV-1))); do truncate -s 256M $D/disk$i.img; done
+		boot draise rw,commit=600 $2
+		boot dcheck rw $2
+		rm -f $D/disk*.img
+	}
+	darm fixed 0
+	darm control 1
+	for a in fixed control; do
+		grep -ahE "control:|AL |alerts an earlier mount|acknowledged|disabled|KERNEL_SPLAT|WATCHDOG|_FAIL" \
+			$T/umltest/al-d$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
+	done
+	res() { cat $T/umltest/al.al-d$1.$2 2>/dev/null || echo "? ? ? ? ? ?"; }
+	read -r f_w1 f_en0 f_u0 f_en1 f_u1 f_u2 <<<"$(res fixed draise)"
+	read -r c_w1 c_en0 c_u0 c_en1 c_u1 c_u2 <<<"$(res control draise)"
+	read -r f_en3 f_u3 <<<"$(res fixed dcheck)"
+	read -r c_en3 c_u3 <<<"$(res control dcheck)"
+	echo "  unacknowledged, disabled / mounted again / after the ack / after the crash" \
+	     "(log enabled then):"
+	echo "    fixed   $f_u0 / $f_u1 / $f_u2 / $f_u3 ($f_en0 $f_en1 $f_en3)"
+	echo "    control $c_u0 / $c_u1 / $c_u2 / $c_u3 ($c_en0 $c_en1 $c_en3)"
+	case "$f_w1$c_w1$f_u3$c_u3" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/al-d*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/al-d*/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/al-dcontrol/log.* &&
+		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
+	has() { case ",$1," in *,log_write_failed,*) return 0;; esac; return 1; }
+	for v in "$f_w1:$f_en0:$f_en1:$f_en3" "$c_w1:$c_en0:$c_en1:$c_en3"; do
+		[ "$v" = eio:0:0:0 ] || {
+			echo "RESULT: INCONCLUSIVE -- the write did not fail, or the log was enabled ($v)"
+			exit 2
+		}
+	done
+	if ! has "$f_u1" || ! has "$c_u1" || [ "$f_u2" != none ] || [ "$c_u2" != none ]; then
+		echo "RESULT: INCONCLUSIVE -- the disabled log's alert was not back, or the ack" \
+		     "did not clear it (fixed $f_u1/$f_u2, control $c_u1/$c_u2)"
+		exit 2
+	fi
+	if ! has "$c_u3"; then
+		echo "RESULT: INCONCLUSIVE -- the control's ack stuck ($c_u3): it did not reproduce"
+		exit 2
+	fi
+	if [ "$f_u3" != none ]; then
+		echo "RESULT: FAIL -- with the log disabled, the acknowledged alert came back ($f_u3)"
+		exit 1
+	fi
+	echo "RESULT: PASS -- with the log disabled, the alert its last block carries was"
+	echo "        acknowledged for good; control: it came back after the crash"
+	exit 0
+fi
 if [ $PLAN = narrow ]; then
 	cp $HERE/../raid56_wib_dump.py $T/umltest/raid56_wib_dump.py.$$ &&
 		mv -f $T/umltest/raid56_wib_dump.py.$$ $T/umltest/raid56_wib_dump.py
