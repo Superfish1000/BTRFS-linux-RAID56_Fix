@@ -27,7 +27,8 @@
 #            said was stale: the block reads back as it was before the write,
 #            with no error
 # INCONCLUSIVE unless the log listed more than 82 regions at the degraded
-# mount and the control acknowledged the write and read it back old.
+# mount and the control acknowledged the write and read it back old ('A',
+# with no error: a refused read, or one of anything else, is not K3).
 #
 # Where the read-write mount is refused, the filesystem is mounted read-only,
 # degraded, as recovery_log_full says, then remounted read-write, which is
@@ -182,13 +183,14 @@ if [ $PLAN = logio ] || [ $PLAN = disable ]; then
 	exit 0
 fi
 if [ $PLAN = replay ]; then
-	arm fixed 0 no
-	arm advice 4 no
+	# Tags of their own: the full plan's arms are cf-fixed and the like.
+	arm replay-fixed 0 no
+	arm replay-advice 4 no
 	for a in fixed advice; do
 		grep -ahE "control:|CF |KERNEL_SPLAT|WATCHDOG|_FAIL|could not keep the record" \
-			$T/umltest/cf-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
+			$T/umltest/cf-replay-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
 	done
-	res() { cat $T/umltest/cf-$2.cf-$1 2>/dev/null || echo "? ? ? ? ?"; }
+	res() { cat $T/umltest/cf-$2.cf-replay-$1 2>/dev/null || echo "? ? ? ? ?"; }
 	read -r f_ov f_commit f_lroot <<<"$(res fixed prep)"
 	read -r a_ov a_commit a_lroot <<<"$(res advice prep)"
 	read -r f_ref f_opts f_ok f_got f_dead <<<"$(res fixed deg)"
@@ -199,9 +201,11 @@ if [ $PLAN = replay ]; then
 	     "(target $f_got), advice '-o $a_opts' mounted $a_ok"
 	echo "  says no mount can make it writable without the device: fixed $f_dead, advice $a_dead"
 	case "$f_ov$a_ov$f_ref$a_ref" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
-	grep -lq KERNEL_SPLAT $T/umltest/cf-{fixed,advice}/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
-	grep -lq WATCHDOG $T/umltest/cf-{fixed,advice}/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
-	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-advice/log.* &&
+	grep -lq KERNEL_SPLAT $T/umltest/cf-replay-{fixed,advice}/log.* &&
+		{ echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/cf-replay-{fixed,advice}/log.* &&
+		{ echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-replay-advice/log.* &&
 		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
 	if [ "${f_lroot:-0}" = 0 ] || [ "${a_lroot:-0}" = 0 ] || [ "$f_commit$a_commit" != 00 ]; then
 		echo "RESULT: INCONCLUSIVE -- no tree log was left to replay, or a commit ran"
@@ -263,9 +267,11 @@ echo "  control (raid56_wf_recovery_full_legacy): $h_roun, $h_roact; after the r
 case "$f_ov$r_ov$c_ov$f_regs$r_regs$c_regs$f_got$r_got$c_got$h_regs" in
 *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
 esac
-grep -lq KERNEL_SPLAT $T/umltest/cf-*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
-grep -lq WATCHDOG $T/umltest/cf-*/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
-grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-*/log.* && {
+grep -lq KERNEL_SPLAT $T/umltest/cf-{fixed,health,r2,control}/log.* &&
+	{ echo "RESULT: FAIL -- kernel splat"; exit 1; }
+grep -lq WATCHDOG $T/umltest/cf-{fixed,health,r2,control}/log.* &&
+	{ echo "RESULT: FAIL -- a guest hung"; exit 1; }
+grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-{fixed,health,r2,control}/log.* && {
 	echo "RESULT: INCONCLUSIVE -- a raid56_wf_* knob is not there"
 	echo "        (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2
 }
@@ -278,7 +284,7 @@ for n in $f_regs $r_regs $c_regs; do
 		echo "        than a wide block describes (82)"; exit 2
 	}
 done
-if [ "$c_ref" != 0 ] || [ "$c_ack" != 1 ] || [ "$c_got" = C ]; then
+if [ "$c_ref" != 0 ] || [ "$c_ack" != 1 ] || [ "$c_got" != A ]; then
 	echo "RESULT: INCONCLUSIVE -- the control did not mount read-write, acknowledge the write"
 	echo "        and read it back old (refused $c_ref, acknowledged $c_ack, reads $c_got):"
 	echo "        it did not reproduce K3"
