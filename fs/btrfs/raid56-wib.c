@@ -349,6 +349,11 @@ bool btrfs_wib_torn_no_persist(void)
 	return READ_ONCE(torn_no_persist);
 }
 
+bool btrfs_wib_stale_no_persist(void)
+{
+	return wib_no_persist();
+}
+
 bool btrfs_wib_log_unmarked(void)
 {
 	return READ_ONCE(log_unmarked);

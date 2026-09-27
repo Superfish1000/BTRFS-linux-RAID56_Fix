@@ -477,6 +477,7 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 	}
 	{
 		const u32 nr = le32_to_cpu(hdr->nr_entries);
+		const bool no_persist = btrfs_wib_stale_no_persist();
 		struct btrfs_wib_entry before[8];
 		int victim = -1;
 
@@ -522,9 +523,10 @@ static int test_torn_block(struct btrfs_fs_info *fs_info)
 				test_err("entry %u did not survive widening", i);
 				goto out;
 			}
+			/* raid56_stale_no_persist=1: written as zero, as before. */
 			if (e.bytenr == wib->entries[victim].bytenr &&
-			    (e.stale != wib->entries[victim].stale ||
-			     e.stale_par != wib->entries[victim].stale_par)) {
+			    (e.stale != (no_persist ? 0 : wib->entries[victim].stale) ||
+			     e.stale_par != (no_persist ? 0 : wib->entries[victim].stale_par))) {
 				test_err("the stale record did not round-trip");
 				goto out;
 			}
@@ -5671,8 +5673,10 @@ static int test_suspect_narrow(struct btrfs_fs_info *fs_info)
 			break;
 		e.stale_par = 0;
 	}
+	/* raid56_stale_no_persist=1: written as zero, as before. */
 	if (!(le64_to_cpu(((struct btrfs_wib_disk_header *)block)->flags) &
-	      BTRFS_WIB_FLAG_STALE) || e.stale_par != 0x100) {
+	      BTRFS_WIB_FLAG_STALE) ||
+	    e.stale_par != (btrfs_wib_stale_no_persist() ? 0 : 0x100)) {
 		test_err("a wide block did not carry the verdict: stale_par 0x%llx",
 			 e.stale_par);
 		goto out;

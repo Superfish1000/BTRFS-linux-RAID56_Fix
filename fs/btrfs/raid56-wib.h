@@ -1071,6 +1071,7 @@ bool btrfs_wib_full_stripe_clears_hold(void);
 bool btrfs_wib_unlogged_repairs_refused(void);
 bool btrfs_wib_all_records_torn(void);
 bool btrfs_wib_torn_no_persist(void);
+bool btrfs_wib_stale_no_persist(void);
 bool btrfs_wib_log_unmarked(void);
 bool btrfs_wib_trust_unmarked_log(void);
 bool btrfs_wib_missing_parity_keeps_torn(void);
