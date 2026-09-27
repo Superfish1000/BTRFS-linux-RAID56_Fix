@@ -40,6 +40,9 @@ TORN_MARKING = 0x4b52414d4e524f54             # "TORNMARK"
 # half -- only where the entries leave them free.
 LATCH_OFFSET = TRAILER_OFFSET - 8
 LATCH_MAGIC = 0x4843544c
+# The 16 bytes before it (BTRFS_WIB_LATCH_DEVS_OFFSET): the devids of up to
+# two devices those alerts named, 0 for none.
+LATCH_DEVS_OFFSET = LATCH_OFFSET - 16
 EVENTS = ["device_write_failed", "write_refused", "write_refused_not_durable",
           "stripe_undecidable", "write_failed", "repair_gave_up", "log_full",
           "record_dropped", "read_unverifiable", "log_write_failed", "repair_dropped",
@@ -102,7 +105,12 @@ def latch(blk, nr, ent):
         return "none"
     bits = word & 0xffffffff
     names = [EVENTS[i] if i < len(EVENTS) else f"event{i}" for i in range(32) if bits & (1 << i)]
-    return " ".join(names) if names else "none"
+    if not names:
+        return "none"
+    devs = []
+    if HEADER.size + nr * ent.size <= LATCH_DEVS_OFFSET:
+        devs = [d for d in struct.unpack_from("<QQ", blk, LATCH_DEVS_OFFSET) if d]
+    return " ".join(names) + (" (devid " + ", ".join(map(str, devs)) + ")" if devs else "")
 
 
 def dump(path):

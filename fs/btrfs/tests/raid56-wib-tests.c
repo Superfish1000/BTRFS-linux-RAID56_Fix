@@ -1794,11 +1794,31 @@ out:
  * log never admits (test_latch_narrow_cap()), is written without them.  Under
  * raid56_wf_latch_volatile=1 no block carries them, as before.
  */
+/*
+ * Do the devices @block keeps with its latched alerts
+ * (BTRFS_WIB_LATCH_DEVS_OFFSET) read back as @a and @b?
+ */
+static bool check_latch_devs(const void *block, u64 a, u64 b)
+{
+	u64 devs[BTRFS_WIB_LATCH_DEVS];
+
+	btrfs_wib_block_latched_devs(block, devs);
+	if (devs[0] == a && devs[1] == b)
+		return true;
+	test_err("the block keeps devids %llu %llu with its alerts, expected %llu %llu",
+		 devs[0], devs[1], a, b);
+	return false;
+}
+
 static int test_latch_block(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
 	const u32 latched = BIT(BTRFS_RAID56_EV_COMMIT_FAILED) | BIT(BTRFS_RAID56_EV_DROPPED);
 	const u32 want = btrfs_wib_latch_volatile() ? 0 : latched;
+	/* The devices the alerts named, kept with them (raid56_wf_latch_no_devs: none). */
+	const bool devs = want && !btrfs_wib_latch_no_devs();
+	const u64 dev_a = devs ? 7 : 0;
+	const u64 dev_b = devs ? 9 : 0;
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	const u64 base = 6600;
 	unsigned long flags;
@@ -1810,10 +1830,13 @@ static int test_latch_block(struct btrfs_fs_info *fs_info)
 		return -ENOMEM;
 	spin_lock_irqsave(&wib->alert_lock, flags);
 	wib->alert_latched = latched;
+	wib->latch_devs[0].devid = 7;
+	wib->latch_devs[1].devid = 9;
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 
 	if (btrfs_wib_build_block(wib, block, 1, NULL) ||
-	    !btrfs_wib_block_valid(fs_info, block) || btrfs_wib_block_latched(block) != want) {
+	    !btrfs_wib_block_valid(fs_info, block) || btrfs_wib_block_latched(block) != want ||
+	    !check_latch_devs(block, dev_a, dev_b)) {
 		test_err("an empty block carries alerts 0x%x, expected 0x%x",
 			 btrfs_wib_block_latched(block), want);
 		goto out;
@@ -1825,7 +1848,8 @@ static int test_latch_block(struct btrfs_fs_info *fs_info)
 	    !(le64_to_cpu(((struct btrfs_wib_disk_header *)block)->flags) &
 	      BTRFS_WIB_FLAG_STALE) ||
 	    !btrfs_wib_block_valid(fs_info, block) || btrfs_wib_block_latched(block) != want ||
-	    check_block_entry(block, 0, base * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+	    check_block_entry(block, 0, base * BTRFS_WIB_ENTRY_SIZE, 0, 0x1) ||
+	    !check_latch_devs(block, dev_a, dev_b)) {
 		test_err("a wide block carries alerts 0x%x, expected 0x%x",
 			 btrfs_wib_block_latched(block), want);
 		goto out;
@@ -1841,17 +1865,23 @@ static int test_latch_block(struct btrfs_fs_info *fs_info)
 		if (btrfs_wib_build_block(wib, block, 3 + i, NULL) ||
 		    !btrfs_wib_block_valid(fs_info, block) ||
 		    block_nr_entries(block) != i + 1 || btrfs_wib_block_latched(block) != room ||
-		    check_block_entry(block, i, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+		    check_block_entry(block, i, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1) ||
+		    !check_latch_devs(block, room ? dev_a : 0, room ? dev_b : 0)) {
 			test_err("a narrow block of %u regions carries alerts 0x%x", i + 1,
 				 btrfs_wib_block_latched(block));
 			goto out;
 		}
 	}
-	/* Acknowledged. */
+	/* Acknowledged, with no latch work to write it: there are no devices. */
 	spin_lock_irqsave(&wib->alert_lock, flags);
-	wib->alert_latched = 0;
+	wib->alert_stopped = true;
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
-	if (btrfs_wib_build_block(wib, block, 200, NULL) || btrfs_wib_block_latched(block)) {
+	btrfs_raid56_health_ack(fs_info, false, 0);
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_stopped = false;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	if (btrfs_wib_build_block(wib, block, 200, NULL) || btrfs_wib_block_latched(block) ||
+	    !check_latch_devs(block, 0, 0)) {
 		test_err("an acknowledged alert is still carried");
 		goto out;
 	}
@@ -1859,6 +1889,7 @@ static int test_latch_block(struct btrfs_fs_info *fs_info)
 out:
 	spin_lock_irqsave(&wib->alert_lock, flags);
 	wib->alert_latched = 0;
+	memset(wib->latch_devs, 0, sizeof(wib->latch_devs));
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++)
 		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);

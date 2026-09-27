@@ -155,6 +155,8 @@
 
 static void raid56_alert_kick(struct btrfs_wib *wib, unsigned long delay);
 static u32 raid56_latched_now(struct btrfs_wib *wib);
+static void raid56_latched_devs(struct btrfs_wib *wib, u64 *devs);
+static void raid56_alert_note_dev(struct btrfs_wib *wib, u64 devid, const char *name);
 static void raid56_alert_failed(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event ev,
 				u64 logical, const struct btrfs_wib_flush_failed *failed);
 
@@ -399,10 +401,13 @@ static_assert(sizeof(struct btrfs_wib_disk_header) +
 static_assert(sizeof(struct btrfs_wib_disk_header) +
 	      BTRFS_WIB_MAX_ENTRIES * sizeof(struct btrfs_wib_disk_entry) <=
 	      BTRFS_WIB_LATCH_OFFSET);
-/* And so does every narrow block this kernel builds. */
+/* And so does every narrow block this kernel builds, the devices they name too. */
 static_assert(sizeof(struct btrfs_wib_disk_header) +
 	      BTRFS_WIB_NARROW_WRITE_MAX * sizeof(struct btrfs_wib_disk_entry_v1) <=
-	      BTRFS_WIB_LATCH_OFFSET);
+	      BTRFS_WIB_LATCH_DEVS_OFFSET);
+static_assert(sizeof(struct btrfs_wib_disk_header) +
+	      BTRFS_WIB_MAX_ENTRIES * sizeof(struct btrfs_wib_disk_entry) <=
+	      BTRFS_WIB_LATCH_DEVS_OFFSET);
 static_assert(BTRFS_RAID56_NR_EVENTS <= 32);
 /*
  * @stale is a strict subset of @error, and btrfs_wib_block_valid() enforces
@@ -1421,17 +1426,26 @@ static void wib_write_entry(void *block, u32 i, const struct btrfs_wib_entry *e)
 	}
 }
 
-/*
- * Do the entries of @block leave its latch word free (BTRFS_WIB_LATCH_OFFSET)?
- * @nr_entries must be set.
- */
-static bool wib_block_has_latch(const void *block)
+/* Where the entries of @block end.  @nr_entries must be set. */
+static size_t wib_block_entries_end(const void *block)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
 	const size_t size = wib_block_is_v1(block) ? sizeof(struct btrfs_wib_disk_entry_v1) :
 						     sizeof(struct btrfs_wib_disk_entry);
 
-	return sizeof(*hdr) + le32_to_cpu(hdr->nr_entries) * size <= BTRFS_WIB_LATCH_OFFSET;
+	return sizeof(*hdr) + le32_to_cpu(hdr->nr_entries) * size;
+}
+
+/* Do the entries of @block leave its latch word free (BTRFS_WIB_LATCH_OFFSET)? */
+static bool wib_block_has_latch(const void *block)
+{
+	return wib_block_entries_end(block) <= BTRFS_WIB_LATCH_OFFSET;
+}
+
+/* And the devices it names (BTRFS_WIB_LATCH_DEVS_OFFSET)? */
+static bool wib_block_has_latch_devs(const void *block)
+{
+	return wib_block_entries_end(block) <= BTRFS_WIB_LATCH_DEVS_OFFSET;
 }
 
 /* The latched alerts @block carries: none if it has no room for them. */
@@ -1446,11 +1460,31 @@ u32 btrfs_wib_block_latched(const void *block)
 	return upper_32_bits(word) == BTRFS_WIB_LATCH_MAGIC ? lower_32_bits(word) : 0;
 }
 
-static void wib_block_set_latched(void *block, u32 latched)
+/*
+ * The devices the latched alerts of @block name, @devs[BTRFS_WIB_LATCH_DEVS]:
+ * 0 for none.
+ */
+EXPORT_FOR_TESTS
+void btrfs_wib_block_latched_devs(const void *block, u64 *devs)
 {
-	if (wib_block_has_latch(block))
-		*(__le64 *)(block + BTRFS_WIB_LATCH_OFFSET) =
-			latched ? cpu_to_le64((u64)BTRFS_WIB_LATCH_MAGIC << 32 | latched) : 0;
+	const __le64 *d = block + BTRFS_WIB_LATCH_DEVS_OFFSET;
+	const bool any = wib_block_has_latch_devs(block) && btrfs_wib_block_latched(block);
+
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++)
+		devs[i] = any ? le64_to_cpu(d[i]) : 0;
+}
+
+static void wib_block_set_latched(void *block, u32 latched, const u64 *devs)
+{
+	__le64 *d = block + BTRFS_WIB_LATCH_DEVS_OFFSET;
+
+	if (!wib_block_has_latch(block))
+		return;
+	*(__le64 *)(block + BTRFS_WIB_LATCH_OFFSET) =
+		latched ? cpu_to_le64((u64)BTRFS_WIB_LATCH_MAGIC << 32 | latched) : 0;
+	if (wib_block_has_latch_devs(block))
+		for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++)
+			d[i] = cpu_to_le64(latched ? devs[i] : 0);
 }
 
 /* Does @block carry any stale record at all? */
@@ -1480,6 +1514,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	unsigned long flags;
 	struct btrfs_fs_info *fs_info = wib->fs_info;
 	struct btrfs_wib_disk_header *hdr = block;
+	u64 devs[BTRFS_WIB_LATCH_DEVS];
 	u32 max, nr = 0;
 	bool v2 = false;
 
@@ -1596,7 +1631,8 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 	hdr->nr_entries = cpu_to_le32(nr);
 	hdr->block_shift = cpu_to_le32(BTRFS_WIB_BLOCK_SHIFT);
 	/* Where the entries leave room: see BTRFS_WIB_LATCH_OFFSET. */
-	wib_block_set_latched(block, raid56_latched_now(wib));
+	raid56_latched_devs(wib, devs);
+	wib_block_set_latched(block, raid56_latched_now(wib), devs);
 	/*
 	 * This kernel marks what may hide a torn write, whatever this block
 	 * lists -- raid56_wf_torn_no_persist=1 included, which is a writer that
@@ -6330,6 +6366,7 @@ static int wib_persist_all_slots(struct btrfs_wib *wib, int nr_slots)
 static void wib_write_latch_locked(struct btrfs_wib *wib)
 {
 	struct btrfs_wib_disk_header *hdr = wib->block;
+	u64 devs[BTRFS_WIB_LATCH_DEVS];
 	unsigned long flags;
 	int nr_errors;
 
@@ -6337,9 +6374,11 @@ static void wib_write_latch_locked(struct btrfs_wib *wib)
 	if (le64_to_cpu(((struct btrfs_wib_disk_header *)wib->last)->magic) != BTRFS_WIB_MAGIC)
 		return;
 	memcpy(wib->block, wib->last, BTRFS_WIB_SLOT_SIZE);
-	wib_block_set_latched(wib->block, raid56_latched_now(wib));
-	if (!memcmp(wib->block + BTRFS_WIB_LATCH_OFFSET, wib->last + BTRFS_WIB_LATCH_OFFSET,
-		    sizeof(__le64)))
+	raid56_latched_devs(wib, devs);
+	wib_block_set_latched(wib->block, raid56_latched_now(wib), devs);
+	if (!memcmp(wib->block + BTRFS_WIB_LATCH_DEVS_OFFSET,
+		    wib->last + BTRFS_WIB_LATCH_DEVS_OFFSET,
+		    BTRFS_WIB_TRAILER_OFFSET - BTRFS_WIB_LATCH_DEVS_OFFSET))
 		return;
 	spin_lock_irqsave(&wib->lock, flags);
 	hdr->seq = cpu_to_le64(++wib->snap_seq);
@@ -7001,6 +7040,29 @@ bool btrfs_wib_latch_volatile(void)
 }
 #endif
 
+/*
+ * Testing only: keep no device with the latched alerts
+ * (BTRFS_WIB_LATCH_DEVS_OFFSET), and take none back at mount, as before:
+ * after a crash raid56_health lists no device for them, and its action names
+ * none to replace.  The negative control for the health plan of
+ * uml/flush_wedge.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool latch_no_devs;
+module_param_named(raid56_wf_latch_no_devs, latch_no_devs, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_latch_no_devs,
+		 "Keep no device with the raid56 alerts that wait for an acknowledgment in the write-intent log, so that after a crash raid56_health names none (testing only: restores the old behaviour)");
+#else
+static const bool latch_no_devs;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_latch_no_devs(void)
+{
+	return READ_ONCE(latch_no_devs);
+}
+#endif
+
 /* The latched alerts nobody has acknowledged, for the log to keep. */
 static u32 raid56_latched_now(struct btrfs_wib *wib)
 {
@@ -7015,19 +7077,57 @@ static u32 raid56_latched_now(struct btrfs_wib *wib)
 	return latched;
 }
 
+/* The devices the latched alerts named, for the log: none if not kept. */
+static void raid56_latched_devs(struct btrfs_wib *wib, u64 *devs)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++)
+		devs[i] = READ_ONCE(latch_no_devs) || READ_ONCE(latch_volatile) ? 0 :
+			  wib->latch_devs[i].devid;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+}
+
+/* A latched alert named @devid (@name): keep it with them.  alert_lock held. */
+static void raid56_latch_note_dev(struct btrfs_wib *wib, u64 devid, const char *name)
+{
+	struct btrfs_raid56_alert_dev *free = NULL;
+
+	lockdep_assert_held(&wib->alert_lock);
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++) {
+		struct btrfs_raid56_alert_dev *d = &wib->latch_devs[i];
+
+		if (d->devid == devid)
+			return;
+		if (!d->devid && !free)
+			free = d;
+	}
+	if (free) {
+		free->devid = devid;
+		free->events = 1;
+		strscpy(free->name, name, sizeof(free->name));
+	}
+}
+
 /*
  * The newest log block carries alerts an earlier mount latched and nobody
  * acknowledged (BTRFS_WIB_LATCH_OFFSET): they stand as they did then, the
- * state failing, until someone does.  Their explanations went with that
- * mount's kernel log, so say here what they are; an event that happens again
- * is explained again.
+ * state failing, until someone does -- and so do the devices they named
+ * (@devs, BTRFS_WIB_LATCH_DEVS_OFFSET), which raid56_health lists and its
+ * action says to replace.  Their explanations went with that mount's kernel
+ * log, so say here what they are; an event that happens again is explained
+ * again.
  */
-static void raid56_latch_restore(struct btrfs_wib *wib, u32 latched)
+static void raid56_latch_restore(struct btrfs_wib *wib, u32 latched, const u64 *devs)
 {
 	struct btrfs_fs_info *fs_info = wib->fs_info;
 	char names[256] = "";
+	char who[2 * (BTRFS_RAID56_ALERT_NAME + 48)] = "";
+	char dname[BTRFS_WIB_LATCH_DEVS][BTRFS_RAID56_ALERT_NAME];
 	unsigned long flags;
 	int len = 0;
+	int wlen = 0;
 
 	latched &= BTRFS_RAID56_LATCHED_EVENTS;
 	if (!latched || READ_ONCE(latch_volatile))
@@ -7036,17 +7136,46 @@ static void raid56_latch_restore(struct btrfs_wib *wib, u32 latched)
 		if (latched & BIT(i))
 			len += scnprintf(names + len, sizeof(names) - len, " %s",
 					 raid56_event_names[i]);
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++) {
+		struct btrfs_device *dev;
+		const char *n = NULL;
+
+		strscpy(dname[i], "?", sizeof(dname[i]));
+		if (!devs[i] || READ_ONCE(latch_no_devs))
+			continue;
+		rcu_read_lock();
+		list_for_each_entry_rcu(dev, &fs_info->fs_devices->devices, dev_list) {
+			if (dev->devid != devs[i])
+				continue;
+			n = btrfs_dev_name(dev);
+			strscpy(dname[i], n ? n : "?", sizeof(dname[i]));
+			break;
+		}
+		rcu_read_unlock();
+		wlen += scnprintf(who + wlen, sizeof(who) - wlen, "%sdevid %llu (%s)",
+				  wlen ? ", " : " -- they named ", devs[i], dname[i]);
+	}
 	spin_lock_irqsave(&wib->alert_lock, flags);
 	wib->alert_latched |= latched;
 	wib->alert_latch_seq++;
 	wib->alert_failing = true;
 	wib->alert_announce = true;
 	wib->last_event = __ffs(latched);
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++) {
+		if (!devs[i] || READ_ONCE(latch_no_devs))
+			continue;
+		raid56_latch_note_dev(wib, devs[i], dname[i]);
+		raid56_alert_note_dev(wib, devs[i], dname[i]);
+		if (!wib->last_devid) {
+			wib->last_devid = devs[i];
+			strscpy(wib->last_name, dname[i], sizeof(wib->last_name));
+		}
+	}
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 	if (!btrfs_is_testing(fs_info))
 		btrfs_warn(fs_info,
-"raid56: alerts an earlier mount raised that nobody acknowledged:%s -- that mount's kernel log explained them, and the same messages come again if they happen again. Deal with them as raid56_health's action line says, then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'",
-			   names, fs_info->fs_devices->fsid);
+"raid56: alerts an earlier mount raised that nobody acknowledged:%s%s -- that mount's kernel log explained them, and the same messages come again if they happen again. Deal with them as raid56_health's action line says, then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'",
+			   names, who, fs_info->fs_devices->fsid);
 }
 
 /*
@@ -7340,7 +7469,7 @@ static void raid56_alert_kick(struct btrfs_wib *wib, unsigned long delay)
  * first.  Caller holds alert_lock and the RCU read lock.
  */
 static void raid56_alert_dev(struct btrfs_wib *wib, const struct btrfs_device *dev,
-			     u64 *devid, char *name)
+			     u64 *devid, char *name, bool latched)
 {
 	char this[BTRFS_RAID56_ALERT_NAME];
 	const char *n;
@@ -7349,6 +7478,8 @@ static void raid56_alert_dev(struct btrfs_wib *wib, const struct btrfs_device *d
 	n = btrfs_dev_name(dev);
 	strscpy(this, n ? n : "?", sizeof(this));
 	raid56_alert_note_dev(wib, dev->devid, this);
+	if (latched)
+		raid56_latch_note_dev(wib, dev->devid, this);
 	if (!*devid) {
 		*devid = dev->devid;
 		strscpy(name, this, BTRFS_RAID56_ALERT_NAME);
@@ -7384,7 +7515,8 @@ static void raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event 
 			const struct btrfs_device *dev = bioc->stripes[col].dev;
 
 			if (dev)
-				raid56_alert_dev(wib, dev, &devid, name);
+				raid56_alert_dev(wib, dev, &devid, name,
+						 BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS);
 		}
 	}
 	if (failed) {
@@ -7392,7 +7524,8 @@ static void raid56_alert(struct btrfs_fs_info *fs_info, enum btrfs_raid56_event 
 
 		list_for_each_entry_rcu(dev, &fs_info->fs_devices->devices, dev_list)
 			if (wib_flush_failed_dev(failed, dev))
-				raid56_alert_dev(wib, dev, &devid, name);
+				raid56_alert_dev(wib, dev, &devid, name,
+						 BIT(ev) & BTRFS_RAID56_LATCHED_EVENTS);
 	}
 	rcu_read_unlock();
 	first = !(wib->alert_seen & BIT(ev));
@@ -7538,6 +7671,11 @@ static void raid56_alert_work(struct work_struct *work)
 	if (!nr_stale && !nr_sticky && !unrecovered) {
 		wib->alert_seen &= wib->alert_latched;
 		memset(wib->alert_devs, 0, sizeof(wib->alert_devs));
+		/* Except those the alerts still standing named. */
+		for (int i = 0; wib->alert_latched && i < BTRFS_WIB_LATCH_DEVS; i++)
+			if (wib->latch_devs[i].devid)
+				raid56_alert_note_dev(wib, wib->latch_devs[i].devid,
+						      wib->latch_devs[i].name);
 		if (!wib->alert_latched)
 			wib->alert_failing = false;
 	}
@@ -7793,6 +7931,7 @@ int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 s
 	}
 	was = wib->alert_latched;
 	wib->alert_latched = 0;
+	memset(wib->latch_devs, 0, sizeof(wib->latch_devs));
 	/* If it happens again, it is explained again. */
 	wib->alert_seen &= ~was;
 	/* And a mount after a crash must not show it again: see wib_latch_work(). */
@@ -7978,6 +8117,21 @@ static int wib_read_slot(struct btrfs_device *device, unsigned int slot, void *b
 	return ret;
 }
 
+/* Add the devices @from names to @to, as far as it has room. */
+static void wib_merge_devs(u64 *to, const u64 *from)
+{
+	for (int i = 0; i < BTRFS_WIB_LATCH_DEVS; i++) {
+		int j;
+
+		if (!from[i])
+			continue;
+		for (j = 0; j < BTRFS_WIB_LATCH_DEVS && to[j] && to[j] != from[i]; j++)
+			;
+		if (j < BTRFS_WIB_LATCH_DEVS)
+			to[j] = from[i];
+	}
+}
+
 /* Testing only: take stale marks from every device's newest block again. */
 static bool load_unions_stale;
 #ifdef CONFIG_BTRFS_DEBUG
@@ -8064,6 +8218,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	unsigned int nr_valid = 0;
 	unsigned int nr_unmarked = 0;
 	unsigned int nofs_flag;
+	u64 devs[BTRFS_WIB_LATCH_DEVS] = { 0 };
 	u32 latched = 0;
 	void *buf;
 	int ret = 0;
@@ -8099,6 +8254,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 
 	list_for_each_entry(device, &fs_devices->devices, dev_list) {
 		const struct btrfs_wib_disk_header *hdr = buf;
+		u64 slot_devs[BTRFS_WIB_NR_SLOTS][BTRFS_WIB_LATCH_DEVS];
 		u32 slot_latched[BTRFS_WIB_NR_SLOTS] = { 0 };
 		bool slot_room[BTRFS_WIB_NR_SLOTS] = { 0 };
 		u64 dev_seq = 0;
@@ -8128,6 +8284,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			nr_valid++;
 			slot_room[slot] = wib_block_has_latch(buf);
 			slot_latched[slot] = btrfs_wib_block_latched(buf);
+			btrfs_wib_block_latched_devs(buf, slot_devs[slot]);
 			if (dev_slot < 0 || le64_to_cpu(hdr->seq) > dev_seq) {
 				dev_seq = le64_to_cpu(hdr->seq);
 				dev_slot = slot;
@@ -8162,11 +8319,14 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		 * older, rather than none -- an alert that comes back once
 		 * more is only repeated, one that is gone is lost.
 		 */
-		if (newest && slot_room[dev_slot])
-			latched |= slot_latched[dev_slot];
-		else if (newest && !READ_ONCE(latch_full_narrow))
-			for (unsigned int slot = 0; slot < BTRFS_WIB_NR_SLOTS; slot++)
-				latched |= slot_latched[slot];
+		for (unsigned int slot = 0; slot < BTRFS_WIB_NR_SLOTS; slot++) {
+			if (!newest || !slot_latched[slot] ||
+			    (slot != dev_slot &&
+			     (slot_room[dev_slot] || READ_ONCE(latch_full_narrow))))
+				continue;
+			latched |= slot_latched[slot];
+			wib_merge_devs(devs, slot_devs[slot]);
+		}
 	}
 out:
 	mutex_unlock(&fs_devices->device_list_mutex);
@@ -8176,7 +8336,7 @@ out:
 		return ret;
 
 	btrfs_wib_finalize_pending(wib);
-	raid56_latch_restore(wib, latched);
+	raid56_latch_restore(wib, latched, devs);
 
 	/* Continue the sequence. */
 	wib->seq = max_seq;

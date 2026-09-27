@@ -54,6 +54,13 @@
 #              again first, then to replace it, scrub and acknowledge
 #     control  raid56_wf_refusal_health_legacy=1: no device listed, and the
 #              action a scrub, which a read-only filesystem refuses (EROFS)
+#   Then the machine stops, and the filesystem is mounted again: the alert
+#   comes back from the log (BTRFS_WIB_LATCH_OFFSET)
+#     fixed    and so does devid 2 (BTRFS_WIB_LATCH_DEVS_OFFSET): the devices
+#              line lists it, the action says to replace it
+#     nodevs   raid56_wf_latch_no_devs=1: the alert without the device, which
+#              nothing names any more -- the flush errors the device stats
+#              counted never reached a disk
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed|health]}
@@ -87,28 +94,44 @@ arm() {	# name control
 		BTRFS_TEST_DIR=$T MODE=flush_wedge OPTS=$OPTS PROFILE=raid5:raid1 \
 		TAG=$tag NDEV=$NDEV FAIL=$FAIL PLAN=$PLAN CONTROL=$2 < /dev/null > $D/log 2>&1
 	echo "boot rc=$?" >> $D/log
+	# health: the machine stopped after the refused commit; mount it again.
+	[ $PLAN = health ] &&
+		timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+			init=$T/umltest/init-fw.sh $ubds quiet con=null con0=fd:0,fd:1 \
+			BTRFS_TEST_DIR=$T MODE=flush_wedge OPTS=rw PROFILE=raid5:raid1 \
+			TAG=$tag NDEV=$NDEV FAIL=$FAIL PLAN=$PLAN CONTROL=$2 PHASE=reboot \
+			< /dev/null > $D/log.reboot 2>&1
 	rm -f $D/disk*.img
 }
 arm fixed 0
 arm control 1
+[ $PLAN = health ] && arm nodevs 2
 if [ $PLAN = health ]; then
+	grep -ah "control:\|FW \|alerts an earlier\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
+		$T/umltest/fw-$PLAN-nodevs/log* | sed "s/^/  [nodevs] /"
 	for a in fixed control; do
-		grep -ah "control:\|FW \|healed\|in-place overwrites\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
-			$T/umltest/fw-$PLAN-$a/log | sed "s/^/  [$a] /"
+		grep -ah "control:\|FW \|healed\|in-place overwrites\|alerts an earlier\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
+			$T/umltest/fw-$PLAN-$a/log* | sed "s/^/  [$a] /"
 	done
 	hres() { cat $T/umltest/fw.health.fw-$PLAN-$1 2>/dev/null || echo "?"; }
 	read -r f_ok f_ro f_fl f_st f_un f_devs f_act <<<"$(hres fixed)"
 	read -r c_ok c_ro c_fl c_st c_un c_devs c_act <<<"$(hres control)"
+	read -r n_ok n_ro n_fl n_st n_un n_devs n_act <<<"$(hres nodevs)"
+	rres() { cat $T/umltest/fw.reboot.fw-$PLAN-$1 2>/dev/null || echo "?"; }
+	read -r f_rw f_run f_rdevs f_ract <<<"$(rres fixed)"
+	read -r n_rw n_run n_rdevs n_ract <<<"$(rres nodevs)"
 	echo "  after the refused commit: read-only fixed $f_ro control $c_ro; unacknowledged" \
 	     "fixed $f_un control $c_un"
 	echo "  devices: fixed $f_devs, control $c_devs"
 	echo "  action: fixed $f_act, control $c_act"
-	case "$f_ok$c_ok" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	echo "  after the crash (mounted $f_rw/$n_rw): unacknowledged fixed $f_run, nodevs $n_run;" \
+	     "devices fixed $f_rdevs, nodevs $n_rdevs; action fixed $f_ract, nodevs $n_ract"
+	case "$f_ok$c_ok$n_ok$f_rw$n_rw" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 	grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 	grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
-	grep -lq CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-control/log &&
-		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
-	for v in "$f_ok:$f_ro:$f_un" "$c_ok:$c_ro:$c_un"; do
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-{control,nodevs}/log* &&
+		{ echo "RESULT: INCONCLUSIVE -- a control knob is not there"; exit 2; }
+	for v in "$f_ok:$f_ro:$f_un" "$c_ok:$c_ro:$c_un" "$n_ok:$n_ro:$n_un"; do
 		case "$v" in 0:1:*log_flush_unnamed*) ;; *)
 			echo "RESULT: INCONCLUSIVE -- a commit was not refused read-only with" \
 			     "log_flush_unnamed ($v)"; exit 2;;
@@ -124,9 +147,27 @@ if [ $PLAN = health ]; then
 	case "$f_act" in unmount_then_mount-rw_then_replace-devid-2*_then_ack) ;; *)
 		echo "RESULT: FAIL -- the action on the read-only filesystem is $f_act"; exit 1;;
 	esac
+	# After the crash: the alert is back from the log, and with it the device.
+	for v in "$f_run" "$n_run"; do
+		case ",$v," in *,log_flush_unnamed,*) ;; *)
+			echo "RESULT: INCONCLUSIVE -- the alert was not back after the crash ($v)"; exit 2;;
+		esac
+	done
+	case "$n_rdevs" in none) ;; *)
+		echo "RESULT: INCONCLUSIVE -- raid56_wf_latch_no_devs: devices $n_rdevs after the crash"
+		exit 2;;
+	esac
+	case ",$f_rdevs," in *,2:*) ;; *)
+		echo "RESULT: FAIL -- after the crash raid56_health lists devices $f_rdevs, not devid 2"
+		exit 1;;
+	esac
+	case "$f_ract" in *replace-devid-2*) ;; *)
+		echo "RESULT: FAIL -- after the crash the action is $f_ract"; exit 1;;
+	esac
 	echo "RESULT: PASS -- after the refused commit raid56_health lists devid 2 and says to"
-	echo "        unmount and mount again first, then replace it; control: no device, and a"
-	echo "        scrub the read-only filesystem cannot run"
+	echo "        unmount and mount again first, then replace it, and after the crash the"
+	echo "        log still names devid 2 with the alert; controls: no device and a scrub"
+	echo "        the read-only filesystem cannot run, no device after the crash"
 	exit 0
 fi
 for a in fixed control; do

@@ -5209,7 +5209,31 @@ flush_wedge)
 	#              replace it
 	#     control  raid56_wf_refusal_health_legacy=1: no device, and the
 	#              action a scrub, which cannot run on it
+	#   PHASE=reboot, after that stop: mounted again (every device, no
+	#            device-mapper), raid56_health read.  The alert is back from
+	#            the log, and devid 2 with it (BTRFS_WIB_LATCH_DEVS_OFFSET);
+	#            CONTROL=2 (raid56_wf_latch_no_devs=1, both boots): no device.
 	watchdog ${WATCH:-900}
+	if [ "${PHASE:-}" = reboot ]; then
+		# PLAN=health, after the crash: what the log kept.
+		[ "${CONTROL:-0}" = 2 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_no_devs 2>/dev/null ||
+				log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_latch_no_devs=1"
+		}
+		rw=rw
+		mount -o rw /dev/ubda $MNT || { rw=ro; do_mount ro /dev/ubda; }
+		sleep 3
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		devs=$(sed -n 's/^devices *//p' $H | tr ' ' ,)
+		act=$(sed -n 's/^action //p' $H | tr ' ' _)
+		unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+		kmsg "alerts an earlier mount" 2
+		log "FW reboot: mounted $rw, unacknowledged=$unack devices=${devs:-none} action=$act"
+		echo "$rw ${unack:-none} ${devs:-none} $act" > $T/umltest/fw.reboot.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+	fi
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
@@ -5221,7 +5245,8 @@ flush_wedge)
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
 	      FW_REGIONS=${FW_REGIONS:-163};;
 	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-164};;
-	health) knob=raid56_wf_refusal_health_legacy; FW_REGIONS=${FW_REGIONS:-164};;
+	health) knob=raid56_wf_refusal_health_legacy; FW_REGIONS=${FW_REGIONS:-164}
+		[ "${CONTROL:-0}" = 2 ] && { knob=raid56_wf_latch_no_devs; CONTROL=1; };;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
 	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
