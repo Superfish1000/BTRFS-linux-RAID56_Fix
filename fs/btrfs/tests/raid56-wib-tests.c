@@ -4677,6 +4677,60 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 	return readd_clear(rig, 20, 1);
 }
 
+/*
+ * Once a readd refused (@readd_refused), the log on the devices stays as it
+ * is and no repair lands: a failed flush that names a full stripe written
+ * copy-on-write puts the names on, in memory, but asks for no repair -- which
+ * would retry and give up with an alert blaming the device -- and raises no
+ * notice promising one.  Under raid56_wf_unlogged_repairs_refused=1 it does
+ * both, as before.
+ */
+static int readd_unlogged_after_refusal(struct readd_rig *rig)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool asks = btrfs_wib_unlogged_repairs_refused();
+	const bool repairs = !btrfs_raid56_no_repair_on_fault();
+	const u64 notices0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_STALE]);
+	const u64 k = 440;
+	const struct btrfs_wib_entry *e;
+	u64 stale, stale_par;
+	bool queued, noticed;
+	int ret;
+
+	if (btrfs_wib_full_stripe_unnamed()) {
+		test_msg("raid56_wf_full_stripe_unnamed is set: nothing is named, skipping the refused-readd test");
+		return 0;
+	}
+	clear_repairs(wib);
+	readd_full_done(rig, k, readd_issue_full(rig, k));
+	WRITE_ONCE(wib->readd_refused, true);
+	wib->test_flush_fails = true;
+	set_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &rig->devs[READD_FAILED]->dev_state);
+	ret = btrfs_wib_persist_now(fs_info);
+	clear_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &rig->devs[READD_FAILED]->dev_state);
+	wib->test_flush_fails = false;
+	WRITE_ONCE(wib->readd_refused, false);
+	readd_expect(k, &stale, &stale_par);
+	e = find_live_entry(wib, readd_region(k));
+	queued = repair_queued(wib, readd_region(k));
+	noticed = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_STALE]) != notices0;
+	clear_repairs(wib);
+	if (ret != -EIO || !e || e->stale != stale || e->stale_par != stale_par) {
+		test_err("a failed flush after a refused readd: persist %d, region %llu stale 0x%llx 0x%llx, expected -EIO and 0x%llx 0x%llx",
+			 ret, k, e ? e->stale : 0, e ? e->stale_par : 0, stale, stale_par);
+		return -EINVAL;
+	}
+	if ((queued && repairs) != (asks && repairs) || noticed != asks) {
+		test_err("a failed flush after a refused readd: repair asked for %d, notice %d, expected %d",
+			 queued, noticed, asks);
+		return -EINVAL;
+	}
+	if (asks)
+		test_msg("raid56_wf_unlogged_repairs_refused is set: repairs that cannot land asked for, as expected");
+	return readd_clear(rig, k, 1);
+}
+
 static int test_readd_names(struct btrfs_fs_info *fs_info)
 {
 	const bool legacy = btrfs_wib_readd_legacy();
@@ -4731,6 +4785,8 @@ static int test_readd_names(struct btrfs_fs_info *fs_info)
 		ret = readd_names_repair(&rig, legacy);
 	if (!ret)
 		ret = readd_names_full_stripe(&rig);
+	if (!ret)
+		ret = readd_unlogged_after_refusal(&rig);
 	clear_repairs(fs_info->wib);
 	if (!ret && legacy)
 		test_msg("raid56_wf_no_readd_name is set: nothing was named, as expected");

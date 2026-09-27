@@ -807,6 +807,14 @@ struct btrfs_wib {
 	 * @commit_mutex.
 	 */
 	bool unlogged_refused;
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+	/*
+	 * The self tests' devices take no IO: with this set, a flush of the
+	 * log's own fails on the devices marked BTRFS_DEV_STATE_FLUSH_FAILED,
+	 * as a transaction commit's barrier does (wib_flush_all_devices()).
+	 */
+	bool test_flush_fails;
+#endif
 	/*
 	 * Under @commit_mutex: the in-flight bits of the snapshot a flush was
 	 * issued after, sorted by region (wib_load_snapbits()), and how many.
@@ -976,6 +984,7 @@ bool btrfs_wib_readd_legacy(void);
 bool btrfs_wib_name_unwritten(void);
 bool btrfs_wib_full_stripe_unnamed(void);
 bool btrfs_wib_full_stripe_clears_hold(void);
+bool btrfs_wib_unlogged_repairs_refused(void);
 bool btrfs_wib_all_records_torn(void);
 bool btrfs_wib_torn_no_persist(void);
 bool btrfs_wib_log_unmarked(void);

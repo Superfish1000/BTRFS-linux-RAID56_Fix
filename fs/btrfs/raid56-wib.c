@@ -2223,6 +2223,12 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 	memset(failed, 0, sizeof(*failed));
 	if (btrfs_test_opt(wib->fs_info, NOBARRIER))
 		return 0;
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+	if (btrfs_is_testing(wib->fs_info) && wib->test_flush_fails) {
+		wib_barrier_failed(wib->fs_info, failed);
+		return wib_flush_failed_any(failed) ? 1 : 0;
+	}
+#endif
 	atomic64_inc(&wib->stat_commit_flushes);
 	/*
 	 * A flush that could not even be submitted (-ENOMEM) names nobody: no
@@ -2667,9 +2673,21 @@ static bool full_stripe_clears_hold;
 module_param_named(raid56_wf_full_stripe_clears_hold, full_stripe_clears_hold, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_full_stripe_clears_hold,
 		 "Let a full stripe written copy-on-write clear the names a failed flush put on while it was in flight (testing only: restores a known defect)");
+/*
+ * Testing only: a failed flush that names full stripes written copy-on-write
+ * asks for their repair and raises the device_write_failed notice, as before,
+ * after a readd refused (@readd_refused) -- repairs that cannot land, retried
+ * until one gives up with an alert that blames the device.  The negative
+ * control for test_unlogged_after_refusal().
+ */
+static bool unlogged_repairs_refused;
+module_param_named(raid56_wf_unlogged_repairs_refused, unlogged_repairs_refused, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_unlogged_repairs_refused,
+		 "Let a failed flush that names full stripes written copy-on-write ask for repairs after a readd refused, which cannot land (testing only: restores a known defect)");
 #else
 static const bool full_stripe_unnamed;
 static const bool full_stripe_clears_hold;
+static const bool unlogged_repairs_refused;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2681,6 +2699,11 @@ bool btrfs_wib_full_stripe_unnamed(void)
 bool btrfs_wib_full_stripe_clears_hold(void)
 {
 	return READ_ONCE(full_stripe_clears_hold);
+}
+
+bool btrfs_wib_unlogged_repairs_refused(void)
+{
+	return READ_ONCE(unlogged_repairs_refused);
 }
 #endif
 
@@ -4021,7 +4044,15 @@ static void wib_unlogged_name(struct btrfs_wib *wib,
 		WRITE_ONCE(wib->unlogged_refused, true);
 	spin_unlock_irqrestore(&wib->lock, flags);
 
-	if (nr_named) {
+	/*
+	 * Not once a readd refused, in this drop or before (@readd_refused):
+	 * the log on the devices stays as it is, so no repair lands -- each
+	 * would retry and give up with an alert that blames the device -- and
+	 * the notice would promise one.  The names stay, in memory, for the
+	 * reads (see wib_readd_dropped()).
+	 */
+	if (nr_named &&
+	    (!READ_ONCE(wib->readd_refused) || READ_ONCE(unlogged_repairs_refused))) {
 		nofs_flag = memalloc_nofs_save();
 		for (u32 i = 0; i < nr; i++)
 			if (un[i].names.repair)
