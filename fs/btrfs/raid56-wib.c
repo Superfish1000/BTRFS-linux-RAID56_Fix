@@ -2245,6 +2245,13 @@ static const bool name_unwritten;
  * and in a full log a readd owed for them, which fails that commit and every
  * later one with log_flush_unnamed.  The negative control for
  * test_untimed_commit() in the self tests.
+ *
+ * raid56_wf_commit_refuses_owed=1: a transaction commit that finds a failed
+ * flush's readd owed refuses at once, as before wib_commit_readd_settle():
+ * the writes in flight that hold the readd's room wait for the commit's
+ * mutex, and would have gone within milliseconds, and the filesystem goes
+ * read-only for a readd that would have landed.  The negative control for
+ * test_commit_settles_readd() in the self tests.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2295,6 +2302,10 @@ static bool untimed_takes_back;
 module_param_named(raid56_wf_untimed_takes_back, untimed_takes_back, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_untimed_takes_back,
 		 "Let a transaction commit with no snapshot from before its barrier take back what the write-intent log's last block lists as a failed flush would, although every device confirmed the barrier (testing only: restores a known defect)");
+static bool commit_refuses_owed;
+module_param_named(raid56_wf_commit_refuses_owed, commit_refuses_owed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_commit_refuses_owed,
+		 "Let a transaction commit that finds a failed flush's readd owed refuse at once, without waiting for the writes in flight that hold its room in the write-intent log (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2308,6 +2319,7 @@ static const bool remount_ro_keeps_inflight;
 static const bool readd_acks_unnamed;
 static const bool commit_keeps_previous;
 static const bool untimed_takes_back;
+static const bool commit_refuses_owed;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2375,6 +2387,11 @@ bool btrfs_wib_commit_keeps_previous(void)
 bool btrfs_wib_untimed_takes_back(void)
 {
 	return READ_ONCE(untimed_takes_back);
+}
+
+bool btrfs_wib_commit_refuses_owed(void)
+{
+	return READ_ONCE(commit_refuses_owed);
 }
 #endif
 
@@ -4266,6 +4283,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			 */
 			want = wib->snap_seq + 1;
 			enabled = wib->enabled;
+			/* Holding room until its record is written: @nr_marking. */
+			if (enabled)
+				atomic_inc(&wib->nr_marking);
 			spin_unlock_irqrestore(&wib->lock, flags);
 			break;
 		}
@@ -4342,6 +4362,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 */
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_WRITE, logical, NULL, 0);
 	}
+	/* Listed, or gone: a commit waiting on it can plan again. */
+	atomic_dec(&wib->nr_marking);
+	wake_up_all(&wib->wait);
 	return ret;
 }
 
@@ -6514,6 +6537,59 @@ static int wib_unlogged_refused(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * A transaction commit found the readd a failed flush left owed
+ * (WIB_READD_WAIT): the block it has to write does not fit until writes in
+ * flight whose record is not written yet are gone -- and those wait for
+ * @commit_mutex, which the commit holds, to write it or fail
+ * (wib_commit_wait()).  Refused on the spot, the filesystem went read-only for
+ * a readd that would have landed milliseconds later.  So let them have the
+ * mutex, and plan again once they are gone, until @readd_until -- as long as
+ * any of them is still there (@nr_marking): nothing else makes the room.  If
+ * the readd lands, write the block it planned.  Returns @ret, the result of
+ * the commit's own write, or that of the write after the readd.  Called with
+ * @commit_mutex held, which it drops and takes again.
+ */
+static int wib_commit_readd_settle(struct btrfs_wib *wib, int ret)
+{
+	unsigned long flags;
+	unsigned long until;
+	bool planned = false;
+	u64 seq;
+
+	lockdep_assert_held(&wib->commit_mutex);
+
+	spin_lock_irqsave(&wib->lock, flags);
+	until = wib->readd_until;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	while (wib->readd_owed && time_before(jiffies, until)) {
+		const int marking = atomic_read(&wib->nr_marking);
+
+		if (!marking)
+			break;
+		/* Until one of them is done, written or failed. */
+		mutex_unlock(&wib->commit_mutex);
+		wait_event_timeout(wib->wait, atomic_read(&wib->nr_marking) < marking,
+				   max_t(long, (long)(until - jiffies), 1));
+		mutex_lock(&wib->commit_mutex);
+		/*
+		 * Planned here, right after its names were worked out against
+		 * @last, or by a writer meanwhile, which wrote its own block
+		 * after it: then @readd_names no longer matches @last.
+		 */
+		planned = wib->readd_owed;
+		if (planned)
+			wib_readd_dropped(wib, NULL, NULL);
+	}
+	if (wib->readd_owed || READ_ONCE(wib->readd_refused) || ret != -ENOSPC)
+		return ret;
+	spin_lock_irqsave(&wib->lock, flags);
+	seq = ++wib->snap_seq;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return wib_write_block_locked(wib, seq, planned ? wib_readd_base(wib) : wib->last,
+				      false);
+}
+
+/*
  * Called at transaction commit (and log commit) time, after the device
  * barriers and before the superblocks are written.  Persists the current
  * in-flight set, dropping stripes that finished before the snapshot taken
@@ -6686,11 +6762,15 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		    !(barrier_failed && READ_ONCE(readd_legacy)))
 			ret = wib_flush_and_drop_locked(wib, seq, false);
 	}
+	/* Owed: the writes in flight holding its room may be about to go. */
+	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed) &&
+	    !READ_ONCE(commit_refuses_owed))
+		ret = wib_commit_readd_settle(wib, ret);
 	/*
 	 * Still owed: the records a failed flush kept are not in the block yet,
 	 * the names they need not on disk, and the writes they stand for would
-	 * be acknowledged all the same.  The readd waits for writes in flight
-	 * and this commit cannot: refuse it (@readd_refused).
+	 * be acknowledged all the same.  The writes that hold the readd's room
+	 * are stuck: refuse the commit (@readd_refused).
 	 */
 	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed)) {
 		WRITE_ONCE(wib->readd_refused, true);

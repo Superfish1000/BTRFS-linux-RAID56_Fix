@@ -3897,6 +3897,129 @@ out:
 	return ret;
 }
 
+struct readd_settle_work {
+	struct delayed_work work;
+	struct btrfs_fs_info *fs_info;
+	u64 first;
+	u64 nr;
+};
+
+/*
+ * The writes holding an owed readd's room are marks waiting for the commit's
+ * mutex (@nr_marking): given it, each writes its record or fails, and goes.
+ */
+static void readd_settle_fn(struct work_struct *work)
+{
+	struct readd_settle_work *w = container_of(to_delayed_work(work),
+						   struct readd_settle_work, work);
+	struct btrfs_wib *wib = w->fs_info->wib;
+
+	for (u64 k = w->first; k < w->first + w->nr; k++)
+		btrfs_wib_done(w->fs_info, readd_region(k), READD_STRIPE_LEN, false);
+	atomic_sub(w->nr, &wib->nr_marking);
+	wake_up_all(&wib->wait);
+}
+
+/*
+ * The transaction commit whose own barrier failed finds the readd owed: the
+ * set is wide (a stale record), and marks into regions the last block does
+ * not list hold the room until their records are written, for which they wait
+ * on the commit's mutex.  The commit lets them have it and waits for them to
+ * go (wib_commit_readd_settle()), then takes every record back with the names
+ * and goes on.  It used to refuse at once, and the filesystem went read-only
+ * for a readd that would have landed in milliseconds; under
+ * raid56_wf_commit_refuses_owed=1 it still does, which this checks, so that a
+ * pass means the test can see it.  raid56_wf_readd_acks_unnamed=1 lets the
+ * commit go on with the readd still owed, as it did.
+ */
+static int readd_names_settle(struct readd_rig *rig, bool legacy)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool refuses = btrfs_wib_commit_refuses_owed();
+	const bool acks = btrfs_wib_readd_acks_unnamed();
+	struct readd_settle_work w = { .fs_info = fs_info };
+	const u64 k_stale = 5;
+	const u64 first = 10;
+	const u64 nr = 60;
+	const u64 busy = 300;
+	const u64 nr_busy = 30;
+	unsigned long flags;
+	int ret = 0;
+
+	if (legacy)
+		return 0;
+	btrfs_wib_add_sticky(fs_info, readd_region(k_stale), READD_STRIPE_LEN);
+	btrfs_wib_mark_stale(fs_info, readd_region(k_stale), BTRFS_WIB_BLOCK_SIZE);
+	ret = readd_write_done(rig, first, nr);
+	if (ret)
+		goto out;
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u64 k = busy; k < busy + nr_busy && !ret; k++)
+		ret = btrfs_wib_try_mark(wib, readd_region(k), READD_STRIPE_LEN);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (ret) {
+		test_err("in-flight mark failed: %d", ret);
+		goto out;
+	}
+	atomic_add(nr_busy, &wib->nr_marking);
+	w.first = busy;
+	w.nr = nr_busy;
+	INIT_DELAYED_WORK(&w.work, readd_settle_fn);
+	schedule_delayed_work(&w.work, msecs_to_jiffies(20));
+	ret = readd_commit_failed(rig);
+	flush_delayed_work(&w.work);
+	if (refuses || acks) {
+		if (acks ? ret || !wib->readd_owed : ret != -EIO || !wib->readd_refused) {
+			test_err("%s is set, yet the commit returned %d, owed %d, refused %d: the test is blind",
+				 acks ? "raid56_wf_readd_acks_unnamed" :
+				 "raid56_wf_commit_refuses_owed",
+				 ret, wib->readd_owed, wib->readd_refused);
+			ret = -EINVAL;
+			goto out;
+		}
+		test_msg("%s is set: the commit met the readd owed and did not wait for it, as expected",
+			 acks ? "raid56_wf_readd_acks_unnamed" : "raid56_wf_commit_refuses_owed");
+		ret = 0;
+		goto out;
+	}
+	if (ret || wib->readd_owed || wib->readd_refused) {
+		test_err("the commit whose flush failed returned %d, owed %d, refused %d: it did not wait for the writes holding the readd's room",
+			 ret, wib->readd_owed, wib->readd_refused);
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = -EINVAL;
+	for (u64 k = first; k < first + nr; k++) {
+		const struct btrfs_wib_entry *e = find_live_entry(wib, readd_region(k));
+		u64 stale, stale_par;
+
+		readd_expect(k, &stale, &stale_par);
+		if (!e || e->sticky != 0x3 || e->stale != stale || e->stale_par != stale_par) {
+			test_err("region %llu was not taken back with its name", k);
+			goto out;
+		}
+		if (!block_error(wib->last, readd_region(k))) {
+			test_err("region %llu taken back is not in the block written", k);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	WRITE_ONCE(wib->readd_refused, false);
+	btrfs_wib_clear_sticky(fs_info, readd_region(k_stale), READD_STRIPE_LEN);
+	/*
+	 * The readd owed under a knob lands here, before the records go, and
+	 * takes the stale record back with the rest.
+	 */
+	if (!ret)
+		ret = readd_commit(rig);
+	btrfs_wib_clear_sticky(fs_info, readd_region(k_stale), READD_STRIPE_LEN);
+	if (!ret)
+		ret = readd_clear(rig, first, nr);
+	return ret;
+}
+
 /*
  * The set is wide already, and the last block lists more than a wide block
  * describes: no layout will ever hold both.  Take back what fits and refuse
@@ -4436,6 +4559,8 @@ static int test_readd_names(struct btrfs_fs_info *fs_info)
 		ret = readd_names_no_room(&rig, legacy);
 	if (!ret)
 		ret = readd_names_wait(&rig, legacy);
+	if (!ret)
+		ret = readd_names_settle(&rig, legacy);
 	if (!ret)
 		ret = readd_names_lose(&rig, legacy);
 	if (!ret)

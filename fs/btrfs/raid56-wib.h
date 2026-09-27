@@ -728,6 +728,14 @@ struct btrfs_wib {
 	u32 nr_readd_last;
 	u64 *readd_last;
 	unsigned long readd_until;
+	/*
+	 * Writes btrfs_wib_mark() has put in the set whose record is not
+	 * written yet: each waits for @commit_mutex to write it
+	 * (wib_commit_wait()), and holds its room until then.  A transaction
+	 * commit that finds a readd owed waits for them only while there are
+	 * any: nothing else makes that room (wib_commit_readd_settle()).
+	 */
+	atomic_t nr_marking;
 	/* Under @commit_mutex: who failed the flush just issued. */
 	struct btrfs_wib_flush_failed flush_failed;
 	/*
@@ -987,6 +995,7 @@ bool btrfs_wib_readd_admits_busy(void);
 bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_commit_keeps_previous(void);
 bool btrfs_wib_untimed_takes_back(void);
+bool btrfs_wib_commit_refuses_owed(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
