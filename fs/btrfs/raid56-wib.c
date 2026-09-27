@@ -399,6 +399,10 @@ static_assert(sizeof(struct btrfs_wib_disk_header) +
 static_assert(sizeof(struct btrfs_wib_disk_header) +
 	      BTRFS_WIB_MAX_ENTRIES * sizeof(struct btrfs_wib_disk_entry) <=
 	      BTRFS_WIB_LATCH_OFFSET);
+/* And so does every narrow block this kernel builds. */
+static_assert(sizeof(struct btrfs_wib_disk_header) +
+	      BTRFS_WIB_NARROW_WRITE_MAX * sizeof(struct btrfs_wib_disk_entry_v1) <=
+	      BTRFS_WIB_LATCH_OFFSET);
 static_assert(BTRFS_RAID56_NR_EVENTS <= 32);
 /*
  * @stale is a strict subset of @error, and btrfs_wib_block_valid() enforces
@@ -531,6 +535,42 @@ static bool wib_entry_verdict(const struct btrfs_wib_entry *e)
 }
 
 /*
+ * Testing only: build narrow blocks of up to BTRFS_WIB_MAX_ENTRIES_V1 regions
+ * again, whose last entry covers the latched alerts, and take those alerts at
+ * mount from each device's newest block only.  A log that lists that many
+ * then carries none of them, and a crash forgets them unacknowledged.  The
+ * negative control for the narrow plan of uml/alert_latch.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool latch_full_narrow;
+module_param_named(raid56_wf_latch_full_narrow, latch_full_narrow, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_latch_full_narrow,
+		 "Let a narrow write-intent log block list as many regions as its layout holds, leaving no room for the alerts nobody has acknowledged, and take those alerts at mount from each device's newest block only (testing only: restores the old behaviour)");
+#else
+static const bool latch_full_narrow;
+#endif
+
+/*
+ * The most regions a narrow block this kernel builds may list
+ * (BTRFS_WIB_NARROW_WRITE_MAX): one short of the layout, so that every block
+ * carries the latched alerts (BTRFS_WIB_LATCH_OFFSET).  A narrow block of the
+ * full BTRFS_WIB_MAX_ENTRIES_V1 has none -- and it is the log at its busiest,
+ * and the record_dropped of a full one, that listed that many.
+ */
+static u32 wib_narrow_max(void)
+{
+	return READ_ONCE(latch_full_narrow) ? BTRFS_WIB_MAX_ENTRIES_V1 :
+					      BTRFS_WIB_NARROW_WRITE_MAX;
+}
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+u32 btrfs_wib_narrow_max(void)
+{
+	return wib_narrow_max();
+}
+#endif
+
+/*
  * How many entries the log may hold right now.
  *
  * A block carrying a stale record must be written in the wide layout, whose
@@ -559,7 +599,7 @@ static u32 wib_live_max(const struct btrfs_wib *wib)
 		if (wib_entry_used(e) && wib_entry_wide(e))
 			return BTRFS_WIB_MAX_ENTRIES;
 	}
-	return BTRFS_WIB_MAX_ENTRIES_V1;
+	return wib_narrow_max();
 }
 
 static u32 wib_live_count(const struct btrfs_wib *wib)
@@ -1490,6 +1530,12 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 			   == BTRFS_WIB_MAGIC && wib_block_has_stale(base))
 		v2 = true;
 	hdr->flags = v2 ? cpu_to_le64(BTRFS_WIB_FLAG_STALE) : 0;
+	/*
+	 * The live set never holds more than wib_live_max() allows, but it is
+	 * written whatever the layout holds: raid56_wf_latch_full_narrow may
+	 * have been cleared while it held BTRFS_WIB_MAX_ENTRIES_V1.  What
+	 * @base adds stops where every block keeps the latched alerts room.
+	 */
 	max = wib_block_max_entries(block);
 
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
@@ -1530,7 +1576,7 @@ int btrfs_wib_build_block(struct btrfs_wib *wib, void *block, u64 seq, const voi
 					break;
 			}
 			if (j == nr) {
-				if (nr == max)
+				if (nr >= (v2 ? max : wib_narrow_max()))
 					return -ENOSPC;
 				wib_write_entry(block, nr++, &be);
 				continue;
@@ -3452,7 +3498,7 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 		if (wib_entry_used(e) && e->sticky && !test_bit(i, in_last))
 			nr_perm++;
 	}
-	cap = forced_wide ? BTRFS_WIB_MAX_ENTRIES : BTRFS_WIB_MAX_ENTRIES_V1;
+	cap = forced_wide ? BTRFS_WIB_MAX_ENTRIES : wib_narrow_max();
 	if (nr_union <= (naming ? BTRFS_WIB_MAX_ENTRIES : cap))
 		plan = WIB_READD_NAMED;
 	else if (nr_union <= cap)
@@ -8016,6 +8062,8 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 
 	list_for_each_entry(device, &fs_devices->devices, dev_list) {
 		const struct btrfs_wib_disk_header *hdr = buf;
+		u32 slot_latched[BTRFS_WIB_NR_SLOTS] = { 0 };
+		bool slot_room[BTRFS_WIB_NR_SLOTS] = { 0 };
 		u64 dev_seq = 0;
 		int dev_slot = -1;
 		unsigned int nr;
@@ -8041,6 +8089,8 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			if (!btrfs_wib_block_valid(fs_info, buf))
 				continue;
 			nr_valid++;
+			slot_room[slot] = wib_block_has_latch(buf);
+			slot_latched[slot] = btrfs_wib_block_latched(buf);
 			if (dev_slot < 0 || le64_to_cpu(hdr->seq) > dev_seq) {
 				dev_seq = le64_to_cpu(hdr->seq);
 				dev_slot = slot;
@@ -8067,9 +8117,19 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		if (ret < 0)
 			goto out;
 		nr_unmarked += nr;
-		/* The alerts as the newest block has them, as the stale marks. */
-		if (newest)
-			latched |= btrfs_wib_block_latched(buf);
+		/*
+		 * The alerts as the newest block has them, as the stale marks.
+		 * A narrow block listing every region its layout holds, which
+		 * a kernel before BTRFS_WIB_NARROW_WRITE_MAX wrote, has no room
+		 * for them: take them from the device's other block, which is
+		 * older, rather than none -- an alert that comes back once
+		 * more is only repeated, one that is gone is lost.
+		 */
+		if (newest && slot_room[dev_slot])
+			latched |= slot_latched[dev_slot];
+		else if (newest && !READ_ONCE(latch_full_narrow))
+			for (unsigned int slot = 0; slot < BTRFS_WIB_NR_SLOTS; slot++)
+				latched |= slot_latched[slot];
 	}
 out:
 	mutex_unlock(&fs_devices->device_list_mutex);

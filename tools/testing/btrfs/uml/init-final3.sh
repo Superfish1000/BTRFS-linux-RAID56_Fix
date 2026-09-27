@@ -2430,11 +2430,26 @@ alert_latch)
 	# after the ack and the crash that follows it.  CONTROL=1 sets
 	# raid56_wf_latch_volatile=1: the log does not keep it, and the mount
 	# after the crash reads none.
-	[ "${CONTROL:-0}" = 1 ] && {
+	#
+	# PLAN=narrow (PHASE=nraise, then check): the alert raised as above,
+	# a sync, then AL_REGIONS overwrites of one block each, in regions of
+	# their own, finished one after the other and not committed: the log's
+	# block lists every one of them (the union with the last block), 165
+	# being what the narrow layout holds.  Then the crash.  Fixed, no block
+	# lists more than 164 and every one carries the alert.  CONTROL=1 sets
+	# raid56_wf_latch_full_narrow=1: the newest block lists 165 regions and
+	# no alert, and the mount after the crash reads none.
+	case "${PLAN:-}:${CONTROL:-0}" in
+	narrow:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_full_narrow 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_full_narrow=1";;
+	narrow:*) ;;
+	*:1)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_volatile 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
-		log "control: raid56_wf_latch_volatile=1"
-	}
+		log "control: raid56_wf_latch_volatile=1";;
+	esac
 	unack() {
 		local h=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 		sed -n 's/^unacknowledged //p' $h | tr ' ' ,
@@ -2445,6 +2460,51 @@ alert_latch)
 		sleep 60
 	}
 	case "$PHASE" in
+	nraise)
+		# 4.3 MiB apart: each block in a 4 MiB region of its own.
+		AL_REGIONS=${AL_REGIONS:-165}
+		AL_STRIDE=$(( 23 * NOCOW_FS_BLOCKS ))
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		fallocate -l $(( (AL_REGIONS + 41) * AL_STRIDE * 4096 )) $MNT/nocow ||
+			{ log "FALLOCATE_FAIL"; finish; }
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		for i in 0 1 2; do dm_error_writes_range $i $((512 * 1024)) 8192; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_heal $i; done
+		sync
+		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		# A block per row whose full stripe lies in one 4 MiB region, one
+		# row per region: each overwrite is recorded in an entry of its own.
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 $AL_STRIDE \
+			$((AL_REGIONS + 40)) region > /tmp/rows.al 2>&1
+		awk '$3 >= 0 && $5 ~ /:0$/ { r = $5; sub(/:.*/, "", r)
+			if (!(r in seen)) { seen[r] = 1; print $2 } }' /tmp/rows.al |
+			head -n $AL_REGIONS > /tmp/targets.al
+		regs=$(wc -l < /tmp/targets.al)
+		ok=0
+		while read -r b; do
+			dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=$b count=1 \
+			   oflag=direct conv=notrunc status=none 2>/dev/null && ok=$((ok + 1))
+		done < /tmp/targets.al
+		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		u=$(unack)
+		stats "after the overwrites"
+		log "AL nraise: first write $w1, $ok of $AL_REGIONS overwrites in $regs regions," \
+		    "commits $commits0 -> $commits1, unacknowledged $u"
+		echo "$w1 $ok $regs $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $u" \
+			> $T/umltest/al.$TAG.nraise
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		crash
+		;;
 	raise)
 		dm_setup
 		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -5110,14 +5170,15 @@ flush_wedge)
 	#              records, and the writes into new regions succeed
 	#     control  raid56_wf_readd_no_repair=1: nothing retires them, and
 	#              the writes fail at once (log_full)
-	#   PLAN=torn (FW_REGIONS 165: a narrow block holds 165)
+	#   PLAN=torn (FW_REGIONS 164: a narrow block this kernel writes holds
+	#            164, BTRFS_WIB_NARROW_WRITE_MAX)
 	#     fixed    a full log keeps the possibly torn records: the writes
 	#              fail at once (log_full), and its alert says a scrub
 	#              retires them -- after one, a write into a new region
 	#              succeeds
 	#     control  raid56_wf_evict_stage0=1: it spends them, last and with
 	#              the alert (record_dropped), and the writes succeed
-	#   PLAN=busy (FW_REGIONS 164: one slot is left) and, instead of the
+	#   PLAN=busy (FW_REGIONS 163: one slot is left) and, instead of the
 	#            writes one at a time, FW_BUSY at once into rows of new
 	#            regions whose parity FAIL holds, started while FAIL is
 	#            suspended for FW_HOLD_SECS: they queue behind it and are
@@ -5134,7 +5195,7 @@ flush_wedge)
 	#   the default leaves no such log, as unnamed shows.  busy runs with
 	#   raid56_wf_admit_narrow=1 in both arms as well: the default admits no
 	#   write into a log holding more such records than a wide block does.
-	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
+	#   PLAN=unnamed (FW_REGIONS 164, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
 	#              nothing acknowledges the overwrites
@@ -5149,10 +5210,10 @@ flush_wedge)
 	allow_nodatacow
 	case "$PLAN" in
 	named) knob=raid56_wf_readd_no_repair; FW_REGIONS=${FW_REGIONS:-82};;
-	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
+	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-164};;
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
-	      FW_REGIONS=${FW_REGIONS:-164};;
-	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-165};;
+	      FW_REGIONS=${FW_REGIONS:-163};;
+	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-164};;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
 	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
@@ -5163,7 +5224,7 @@ flush_wedge)
 	# may have been torn does: both arms let the readd that cannot name the
 	# device leave them, which unnamed shows the default refuses.  And busy
 	# checks the wait for the one slot a write in flight frees in a log that
-	# holds 164 of them: both arms admit writes against the narrow layout,
+	# holds 163 of them: both arms admit writes against the narrow layout,
 	# which the default does not (commit_full) -- it refuses them all.
 	case "$PLAN" in torn|busy)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
@@ -5871,7 +5932,8 @@ torn_present_read)
 	#                 them), then fails a commit's barrier: the readd takes
 	#                 them back possibly torn, too many to name, and with the
 	#                 recovery's record the log is full of records that say
-	#                 no more than that (n = 164: a narrow block holds 165).
+	#                 no more than that (n = 163: a narrow block this
+	#                 kernel writes holds 164, BTRFS_WIB_NARROW_WRITE_MAX).
 	#                 FILLDEV is healed and one write goes into a new
 	#                 region, with nothing in flight: it spends one of them.
 	#   SCRUB=1       once the mount is done, a scrub runs to its end first.

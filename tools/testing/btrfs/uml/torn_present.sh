@@ -59,7 +59,7 @@
 #   evict       RAID5, three devices, all present: the unreadable arm's
 #               stripe, kept torn by the recovery, B's block 5 still not
 #               reading; then C's device throws its writes away under a
-#               write into each of 164 regions of a second nodatacow file
+#               write into each of 163 regions of a second nodatacow file
 #               and fails a commit's barrier: the readd takes them back
 #               possibly torn, too many to name, and the log is full of
 #               records that say no more than that -- the recovery's first
@@ -184,7 +184,7 @@ arm() {	# scenario name [read-boot kernel args...]
 		read="$read NAMEBY=$([ $scen = readd ] && echo flush || echo write)";;
 	evict)	ndev=3; profile=raid5:raid1
 		fault="TORN=C ROW=5 CRASH=1"
-		read="READCOLS=B_C TORN=C ROW=5 BAD=B FILL=164 FILLDEV=C"
+		read="READCOLS=B_C TORN=C ROW=5 BAD=B FILL=163 FILLDEV=C"
 		# No transaction commit while C's device drops writes.
 		ropts=rw,commit=600;;
 	misspar|decided) ndev=4; profile=raid6:raid1c3

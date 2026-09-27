@@ -60,7 +60,7 @@ static u32 block_nr_entries(const void *block)
  */
 static u32 admit_cap(void)
 {
-	return btrfs_wib_admits_narrow() ? BTRFS_WIB_MAX_ENTRIES_V1 : BTRFS_WIB_MAX_ENTRIES;
+	return btrfs_wib_admits_narrow() ? btrfs_wib_narrow_max() : BTRFS_WIB_MAX_ENTRIES;
 }
 
 /*
@@ -1058,7 +1058,8 @@ static int test_log_full(struct btrfs_fs_info *fs_info)
 	ret = btrfs_wib_commit(fs_info, true);
 	if (ret)
 		return ret;
-	for (u64 i = 0; block_nr_entries(wib->last) < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+	for (u64 i = 0; i < 2 * BTRFS_WIB_NR_ENTRIES &&
+	     block_nr_entries(wib->last) < btrfs_wib_narrow_max(); i++) {
 		ret = btrfs_wib_mark(fs_info, (i + 400) * BTRFS_WIB_ENTRY_SIZE,
 				     BTRFS_WIB_BLOCK_SIZE);
 		if (ret) {
@@ -1621,7 +1622,7 @@ static int test_admit_wide(struct btrfs_fs_info *fs_info)
 	const bool narrow = btrfs_wib_admits_narrow();
 	const bool keeps = btrfs_wib_commit_keeps_previous();
 	const u64 failed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_COMMIT_FAILED]);
-	const u32 want = narrow ? BTRFS_WIB_MAX_ENTRIES_V1 : BTRFS_WIB_MAX_ENTRIES;
+	const u32 want = narrow ? btrfs_wib_narrow_max() : BTRFS_WIB_MAX_ENTRIES;
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	const u64 base = 6000;
 	const u64 target = 6300ULL * BTRFS_WIB_ENTRY_SIZE;
@@ -1789,7 +1790,8 @@ out:
  * builds, where its entries leave them room (BTRFS_WIB_LATCH_OFFSET): a mount
  * after a crash takes them back.  The block stays one every kernel with the
  * log reads as it did -- valid, the same entries -- and a narrow block of
- * BTRFS_WIB_MAX_ENTRIES_V1 regions has no room.  Under
+ * BTRFS_WIB_MAX_ENTRIES_V1 regions has no room: a table that full, which the
+ * log never admits (test_latch_narrow_cap()), is written without them.  Under
  * raid56_wf_latch_volatile=1 no block carries them, as before.
  */
 static int test_latch_block(struct btrfs_fs_info *fs_info)
@@ -1868,6 +1870,74 @@ out:
 		ret = -EINVAL;
 	}
 	kfree(block);
+	return ret;
+}
+
+/*
+ * Every block the log writes carries the latched alerts: the narrow layout
+ * lists at most BTRFS_WIB_NARROW_WRITE_MAX regions, so the union of the
+ * writes finishing one after the other flushes and drops before it would
+ * cover them.  A narrow block of BTRFS_WIB_MAX_ENTRIES_V1 regions, the log at
+ * its busiest, carried none, and a crash then forgot them unacknowledged.
+ * Under raid56_wf_latch_full_narrow=1 the block reaches that again, without
+ * them, as before.
+ */
+static int test_latch_narrow_cap(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const u32 latched = BIT(BTRFS_RAID56_EV_LOG_WRITE);
+	const bool old = btrfs_wib_narrow_max() == BTRFS_WIB_MAX_ENTRIES_V1;
+	const u64 base = 6900;
+	u32 most = 0;
+	u32 bare = 0;
+	unsigned long flags;
+	int ret;
+
+	if (btrfs_wib_latch_volatile()) {
+		test_msg("raid56_wf_latch_volatile is set, skipping the narrow latch test");
+		return 0;
+	}
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched = latched;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	btrfs_wib_commit_prepare(fs_info);
+	ret = btrfs_wib_commit(fs_info, true);
+	if (ret)
+		goto out;
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1 + 4; i++) {
+		const u64 logical = (base + i) * BTRFS_WIB_ENTRY_SIZE;
+
+		ret = btrfs_wib_mark(fs_info, logical, BTRFS_WIB_BLOCK_SIZE);
+		if (ret) {
+			test_err("mark %u filling the on-disk block failed: %d", i, ret);
+			goto out;
+		}
+		btrfs_wib_done(fs_info, logical, BTRFS_WIB_BLOCK_SIZE, false);
+		most = max(most, block_nr_entries(wib->last));
+		if (btrfs_wib_block_latched(wib->last) != latched)
+			bare++;
+	}
+	if (old ? (most != BTRFS_WIB_MAX_ENTRIES_V1 || !bare) :
+		  (most != BTRFS_WIB_NARROW_WRITE_MAX || bare)) {
+		test_err("the on-disk block listed up to %u regions, %u block(s) without the alerts%s",
+			 most, bare, old ? " (raid56_wf_latch_full_narrow=1)" : "");
+		ret = -EINVAL;
+		goto out;
+	}
+	if (old)
+		test_msg("raid56_wf_latch_full_narrow is set: a block of %u regions carried no alerts, as before",
+			 most);
+out:
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	wib->alert_latched = 0;
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	btrfs_wib_commit_prepare(fs_info);
+	if (btrfs_wib_commit(fs_info, true) && !ret)
+		ret = -EIO;
+	if (!ret && block_nr_entries(wib->last) != 0) {
+		test_err("log not empty after the narrow latch test");
+		ret = -EINVAL;
+	}
 	return ret;
 }
 
@@ -2004,7 +2074,7 @@ static int test_torn_spent_last(struct btrfs_fs_info *fs_info)
 	const u64 vague = 4199ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 fresh = 4400ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 base = 4200;
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u32 nr = btrfs_wib_narrow_max();
 	unsigned long flags;
 	u32 left = 0;
 	int ret;
@@ -2140,7 +2210,7 @@ static int test_torn_waits_for_write(struct btrfs_fs_info *fs_info)
 	const u64 flying = 4600ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 fresh = 4601ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 base = 4610;
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u32 nr = btrfs_wib_narrow_max();
 	const u64 extra = 4602ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 fresh2 = 4603ULL * BTRFS_WIB_ENTRY_SIZE;
 	struct wib_done_later later = { .fs_info = fs_info, .logical = flying };
@@ -2282,7 +2352,7 @@ static int test_kept_torn_spent_last(struct btrfs_fs_info *fs_info)
 	const u64 kept = 5000ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 fresh = 5001ULL * BTRFS_WIB_ENTRY_SIZE;
 	const u64 base = 5010;
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u32 nr = btrfs_wib_narrow_max();
 	struct btrfs_wib_entry *e;
 	unsigned long flags;
 	u32 left = 0;
@@ -2770,7 +2840,7 @@ static int test_readd_busy_region(struct btrfs_fs_info *fs_info)
 	const u64 unflushed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
 	const bool admits = btrfs_wib_readd_admits_busy();
 	const u64 done_base = 4400;
-	const u32 nr = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u32 nr = btrfs_wib_narrow_max();
 	const u64 busy = (done_base + nr) * BTRFS_WIB_ENTRY_SIZE;
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	unsigned long flags;
@@ -4550,7 +4620,7 @@ static int test_capacity_follows_layout(struct btrfs_fs_info *fs_info)
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 base = 2000;
 	const u32 wide = BTRFS_WIB_MAX_ENTRIES;
-	const u32 narrow = BTRFS_WIB_MAX_ENTRIES_V1;
+	const u32 narrow = btrfs_wib_narrow_max();
 	const u64 named = (base + narrow - 1) * BTRFS_WIB_ENTRY_SIZE;
 	void *block;
 	u32 live = 0;
@@ -5777,6 +5847,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_latch_block(fs_info);
+	if (ret)
+		goto out;
+	ret = test_latch_narrow_cap(fs_info);
 	if (ret)
 		goto out;
 	ret = test_failed_named_before_spent(fs_info);

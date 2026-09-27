@@ -18,14 +18,14 @@
 #     control  raid56_wf_readd_no_repair=1: nothing retires them, and the
 #              new writes fail at once (log_full)
 #   The named control's log_full explanation must name scrub as the remedy.
-#   torn   165 regions: too many to name, the readd marks them possibly torn,
+#   torn   164 regions: too many to name, the readd marks them possibly torn,
 #          which fills a narrow block
 #     fixed    a full log keeps them: the new writes fail at once (log_full),
 #              its explanation says a scrub retires them, and after one a
 #              write into a new region succeeds; nothing is dropped
 #     control  raid56_wf_evict_stage0=1: it spends them, last and with the
 #              alert (record_dropped), and every new write succeeds
-#   busy   164 regions, one slot left, and instead of FW_FRESH writes one at a
+#   busy   163 regions, one slot left, and instead of FW_FRESH writes one at a
 #          time, FW_BUSY (8) at once into new regions whose parity device 1
 #          holds, started while device 1 is suspended: they queue behind it
 #          and go together once it is back, the first to be recorded takes the
@@ -40,7 +40,7 @@
 #   sets raid56_wf_admit_narrow=1 in both arms too: the default admits no
 #   write into a log holding more of those records than a wide block
 #   describes, and refuses all eight (commit_full.sh).
-#   unnamed (CUR-4)  165 regions, as torn: too many to name device 1 in
+#   unnamed (CUR-4)  164 regions, as torn: too many to name device 1 in
 #     fixed    the commit whose barrier failed fails instead (read-only), with
 #              the log_flush_unnamed alert: the overwrites are never
 #              acknowledged, and each block reads back as written or as it was
