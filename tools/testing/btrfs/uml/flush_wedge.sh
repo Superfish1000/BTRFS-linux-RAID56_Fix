@@ -35,7 +35,15 @@
 #              record is spent, every write succeeds
 #     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
 #              each spends one at once (sticky_evicted, record_dropped)
-#   torn and busy set raid56_wf_readd_acks_unnamed=1 in both arms: the
+#   hot    165 regions, as torn, and instead of FW_FRESH writes one at a
+#          time, a write into one of the recorded regions held in flight once
+#          its bios have completed (raid56_write_hold_ms), then one write into
+#          a new region
+#     fixed    it fails at once (log_full): the write in flight leaves a
+#              record that may not be spent, and frees nothing
+#     control  raid56_wf_room_any_write=1: it waits for the write in flight
+#              to finish, then fails the same way
+#   torn, busy and hot set raid56_wf_readd_acks_unnamed=1 in both arms: the
 #   default refuses the commit that would leave such a log (unnamed).  busy
 #   sets raid56_wf_admit_narrow=1 in both arms too: the default admits no
 #   write into a log holding more of those records than a wide block
@@ -49,9 +57,9 @@
 #              the acknowledged write, with no error
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed]}
+KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|hot|unnamed]}
 PLAN=${2:-named}
-case $PLAN in named|torn|busy|unnamed) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in named|torn|busy|hot|unnamed) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OPTS=rw,commit=600
 # More RMW workers than the three one CPU gets, or no more than three writes
 # are ever recorded at once (rmw_workers).
@@ -104,6 +112,41 @@ if [ "$f_commit" != 0 ] || [ "$c_commit" != 0 ]; then
 fi
 if [ "${f_fl:-0}" = 0 ] || [ "${c_fl:-0}" = 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- no flush failed (flush_io_errs fixed=$f_fl control=$c_fl)"; exit 2
+fi
+if [ $PLAN = hot ]; then
+	read -r fh_held fh_rc fh_secs fh_hrc fh_full fh_drop fh_tb < $T/umltest/fw.hot.res.fw-hot-fixed \
+		2>/dev/null || fh_held=?
+	read -r ch_held ch_rc ch_secs ch_hrc ch_full ch_drop ch_tb < $T/umltest/fw.hot.res.fw-hot-control \
+		2>/dev/null || ch_held=?
+	case "$fh_held$ch_held" in *'?'*) echo "RESULT: INCONCLUSIVE -- a hot phase did not report"; exit 2;; esac
+	grep -lq HOLD_KNOB_FAIL $T/umltest/fw-hot-*/log &&
+		{ echo "RESULT: INCONCLUSIVE -- raid56_write_hold_ms is not there"; exit 2; }
+	echo "  possibly torn records: fixed $fh_tb, control $ch_tb; writes held: fixed $fh_held, control $ch_held"
+	echo "  the new write: fixed $fh_rc in ${fh_secs}s, control $ch_rc in ${ch_secs}s;" \
+	     "the held write: fixed $fh_hrc, control $ch_hrc; log_full +$fh_full/+$ch_full," \
+	     "record_dropped $fh_drop/$ch_drop"
+	for a in fh ch; do
+		eval "held=\$${a}_held tb=\$${a}_tb hrc=\$${a}_hrc rc=\$${a}_rc"
+		if [ "${held:-0}" = 0 ] || [ "${tb:-0}" = 0 ] || [ "$hrc" != ok ] || [ "$rc" != eio ]; then
+			echo "RESULT: INCONCLUSIVE -- $a: no write held ($held), no possibly torn record ($tb),"
+			echo "        the held write failed ($hrc) or the new one went in ($rc)"
+			exit 2
+		fi
+	done
+	if [ "${ch_secs:-0}" -lt 10 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control failed the new write in ${ch_secs}s: it did not wait"
+		echo "        for the write in flight, so a quick fixed arm proves nothing"
+		exit 2
+	fi
+	if [ "${fh_secs:-99}" -gt 3 ] || [ "${fh_full:-0}" = 0 ] || [ "${fh_drop:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- the new write into a log full of records that must stay took ${fh_secs}s"
+		echo "        to fail (log_full +$fh_full, record_dropped $fh_drop)"
+		exit 1
+	fi
+	echo "RESULT: PASS -- with only a write into a recorded region in flight, a write into a new region"
+	echo "        of a log full of possibly torn records failed in ${fh_secs}s (log_full); waiting for it"
+	echo "        (control) took ${ch_secs}s to fail the same way"
+	exit 0
 fi
 if [ $PLAN = busy ]; then
 	read -r fb_ok fb_eio fb_evh fb_ev fb_dr fb_tb fb_secs < $T/umltest/fw.busy.res.fw-busy-fixed 2>/dev/null ||

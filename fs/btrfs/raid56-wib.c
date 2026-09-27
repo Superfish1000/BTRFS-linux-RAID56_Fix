@@ -1247,43 +1247,68 @@ enum wib_room {
 	WIB_ROOM_WRITE,
 };
 
-static enum wib_room wib_room_source_locked(struct btrfs_wib *wib)
+/*
+ * Testing only: any write in flight counts as room a full log waits for, as
+ * before -- one into a region whose record the log may not spend too, which
+ * frees nothing when it finishes: a write into a new region of a log full of
+ * such records waited BTRFS_WIB_FULL_TIMEOUT for the same refusal whenever
+ * one was in flight.  The negative control for uml/flush_wedge.sh (hot).
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool room_any_write;
+module_param_named(raid56_wf_room_any_write, room_any_write, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_room_any_write,
+		 "Let a write into a full write-intent log wait for any write in flight, one whose record stays when it finishes too (testing only: restores a known defect)");
+#else
+static const bool room_any_write;
+#endif
+
+/*
+ * Does the write in flight into @e make room when it finishes?  One into a
+ * region the log holds no record of frees its slot, one into a record the log
+ * may spend leaves room to spend (wib_evictable()) -- with every device there,
+ * one that only says a write may have been torn only if @spend_torn.  One into
+ * a record naming a member, or saying a write may have been torn, leaves it,
+ * and frees nothing.  Caller holds wib->lock, after wib_policy_locked().
+ */
+static bool wib_write_frees_room(const struct btrfs_wib *wib,
+				 const struct btrfs_wib_entry *e, bool spend_torn)
+{
+	if (!e->bitmap)
+		return false;
+	if (READ_ONCE(room_any_write))
+		return spend_torn || !e->sticky;
+	return wib->may_evict_naming || !wib_entry_names_member(e) ||
+	       (spend_torn && wib_entry_torn_only(e));
+}
+
+/*
+ * Can room come -- without spending a record that only says a write may have
+ * been torn, unless @spend_torn?  From a write in flight that makes some
+ * (wib_write_frees_room()), or from a repair.  With neither, waiting cannot
+ * help: a log full of records that must stay, with writes in flight only into
+ * those, used to make every write into a new region wait a minute for the same
+ * refusal.
+ */
+static enum wib_room wib_room_source_locked(struct btrfs_wib *wib, bool spend_torn)
 {
 	lockdep_assert_held(&wib->lock);
 
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
-		if (wib->entries[i].bitmap)
+		if (wib_write_frees_room(wib, &wib->entries[i], spend_torn))
 			return WIB_ROOM_WRITE;
 	if (atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr))
 		return WIB_ROOM_REPAIR;
 	return WIB_ROOM_NONE;
 }
 
-/*
- * Can room come without spending a record that only says a write may have been
- * torn?  From a repair, or from a write in flight into a region the log holds
- * no record of: its slot is free once it finishes.  A write into a recorded
- * region leaves the record, and frees nothing.
- */
-static bool wib_room_without_torn_locked(struct btrfs_wib *wib)
-{
-	lockdep_assert_held(&wib->lock);
-
-	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
-		if (wib->entries[i].bitmap && !wib->entries[i].sticky)
-			return true;
-	return atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr);
-}
-
-/* Unless @spend_torn, see wib_room_without_torn_locked(). */
 static bool wib_can_make_room(struct btrfs_wib *wib, bool spend_torn)
 {
 	unsigned long flags;
 	bool ret;
 
 	spin_lock_irqsave(&wib->lock, flags);
-	ret = spend_torn ? wib_room_source_locked(wib) != WIB_ROOM_NONE :
-			   wib_room_without_torn_locked(wib);
+	ret = wib_room_source_locked(wib, spend_torn) != WIB_ROOM_NONE;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return ret;
 }
@@ -4310,16 +4335,17 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			 * nothing left to wait for, and fail a write that now
 			 * fits.
 			 */
-			room = wib_room_source_locked(wib);
 			/*
 			 * Nothing else can make room: spend a record that only
 			 * says a write may have been torn, if there is one
 			 * (wib_entry_torn_only()).
 			 */
-			if (!owed && !spend_torn && !wib_room_without_torn_locked(wib)) {
+			if (!owed && !spend_torn &&
+			    wib_room_source_locked(wib, false) == WIB_ROOM_NONE) {
 				spend_torn = true;
 				ret = wib_try_mark_locked(wib, logical, len, true);
 			}
+			room = wib_room_source_locked(wib, spend_torn);
 		}
 		if (ret == 0) {
 			/*
@@ -4358,7 +4384,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * neither, the log is full of records that must stay -- they
 		 * name stale data on a device that keeps failing -- and waiting
 		 * would only make every write take a minute to fail.  Fail it
-		 * now, and wait below only while something can still finish.
+		 * now, and wait below only while something can still finish
+		 * that makes room: not a write into one of those records,
+		 * which leaves it (wib_write_frees_room()).
 		 */
 		if (room == WIB_ROOM_NONE) {
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL, logical, NULL, 0);

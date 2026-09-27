@@ -5186,6 +5186,15 @@ flush_wedge)
 	#   the default leaves no such log, as unnamed shows.  busy runs with
 	#   raid56_wf_admit_narrow=1 in both arms as well: the default admits no
 	#   write into a log holding more such records than a wide block does.
+	#   PLAN=hot (FW_REGIONS 165, as torn): instead of the writes one at a
+	#            time, a write into one of the recorded regions, held in
+	#            flight FW_HOLD_MS once its bios have completed
+	#            (raid56_write_hold_ms), then one write into a new region
+	#     fixed    that write fails at once (log_full): the write in flight
+	#              leaves its record, which may not be spent, and frees
+	#              nothing
+	#     control  raid56_wf_room_any_write=1: it waits for the write in
+	#              flight to finish before it fails the same way
 	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
@@ -5202,6 +5211,7 @@ flush_wedge)
 	case "$PLAN" in
 	named) knob=raid56_wf_readd_no_repair; FW_REGIONS=${FW_REGIONS:-82};;
 	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
+	hot) knob=raid56_wf_room_any_write; FW_REGIONS=${FW_REGIONS:-165};;
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
 	      FW_REGIONS=${FW_REGIONS:-164};;
 	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-165};;
@@ -5217,7 +5227,7 @@ flush_wedge)
 	# checks the wait for the one slot a write in flight frees in a log that
 	# holds 164 of them: both arms admit writes against the narrow layout,
 	# which the default does not (commit_full) -- it refuses them all.
-	case "$PLAN" in torn|busy)
+	case "$PLAN" in torn|busy|hot)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 	esac
@@ -5299,6 +5309,41 @@ flush_wedge)
 	log "FW repairs after ${t}s: queued=$(wv repair_queued) ok=$(wv repair_ok)" \
 	    "failed=$(wv repair_failed) dropped=$(wv repair_dropped) gave_up=$(hv repair_gave_up)" \
 	    "sticky_blocks=$(wv sticky_blocks) stale_marks=$(hv stale_marks)"
+	if [ "$PLAN" = hot ]; then
+		b0=$(head -1 $T/umltest/fw.acked.$TAG)
+		fb=$(awk -v n=$FW_REGIONS '$1 == n {print $3}' $T/umltest/fw.targets.$TAG)
+		tb=$(wv torn_blocks); full0=$(hv log_full)
+		echo ${FW_HOLD_MS:-20000} > /sys/module/btrfs/parameters/raid56_write_hold_ms ||
+			log "HOLD_KNOB_FAIL"
+		( dd if=$BB of=$MNT/nocow bs=4096 seek=${b0:-0} count=1 oflag=direct \
+		     conv=notrunc status=none 2>/dev/null && echo ok || echo eio ) \
+			> $T/umltest/fw.hres.$TAG &
+		hpid=$!
+		sleep 3
+		held=$(dmesg | grep -c "with its bios completed")
+		echo 0 > /sys/module/btrfs/parameters/raid56_write_hold_ms
+		log "a write into recorded block $b0 held in flight ($held), torn_blocks $tb;" \
+		    "a write into new block $fb"
+		start=$(date +%s)
+		dd if=$BB of=$MNT/nocow bs=4096 seek=${fb:-0} count=1 oflag=direct conv=notrunc \
+		   status=none 2>/dev/null && frc=ok || frc=eio
+		secs=$(( $(date +%s) - start ))
+		# Not a bare wait: the watchdog is a child too.
+		wait $hpid
+		hrc=$(cat $T/umltest/fw.hres.$TAG 2>/dev/null)
+		kmsg "write-intent log full|still full|raid56:" 6
+		log "FW hot new write $frc in ${secs}s, held write ${hrc:-?}, log_full $full0 -> $(hv log_full)," \
+		    "record_dropped $(hv record_dropped), torn_blocks $(wv torn_blocks)"
+		echo "${held:-0} $frc $secs ${hrc:-?} $(( $(hv log_full) - ${full0:-0} )) $(hv record_dropped) $tb" \
+			> $T/umltest/fw.hot.res.$TAG
+		echo "$acked $fl ${named:-0} ${torn:-0} 0 0 0 0 0 0 0 0 $(hv log_full)" \
+		     "$(hv record_dropped) $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs" \
+			> $T/umltest/fw.$TAG
+		rm -f $BB $T/umltest/fw.hres.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		dmsetup remove_all 2>/dev/null
+		finish
+	fi
 	if [ "$PLAN" = busy ]; then
 		# Rows past the targets' whose full stripe lies in one region
 		# and whose parity FAIL holds.
