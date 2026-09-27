@@ -4465,6 +4465,65 @@ scrub_uncommitted)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+refusal_marks)
+	# Does a refused repair clear the record's marks?  RAID6 over four
+	# devices, a nodatacow block 'B' overwritten in place while the devices
+	# of its column AND of Q fail writes: two faults, within the tolerance,
+	# acknowledged; the record names B's column stale and Q bad.  Q is
+	# healed, B's device keeps failing writes.  The repair queued on the
+	# fault (DELAY ms later) reads the stripe, rebuilds B from P, and its
+	# write-back of B (phase A, rmw_repair_first()) fails: the repair is
+	# refused.  Then B is read cold: it must be rebuilt from P, Q's bad mark
+	# standing.  DELAY=600000 keeps the repair out: the setup check, which
+	# must read 'B'.
+	#
+	# Where the repair's write-back comes before it is recorded in flight
+	# (the default), a refused one never reaches the record at all.  With
+	# raid56_rmw_mark_before_repair=1 it is recorded first, and its refusal
+	# takes rmw_rbio()'s path through the record's update -- which, with
+	# raid56_refusal_clears_marks=1, clears Q's mark although Q was never
+	# rewritten: the read of B then fails the cross-check against the stale
+	# Q (read_parities_disagree, EIO) or, with raid56_read_trusts_ambiguous=1
+	# as well, returns the old 'A', silently.
+	dm_setup
+	mkfs.btrfs -K -q -f -d raid6 -m raid1c3 $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	echo ${DELAY:-1000} > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	eval "$L"
+	{ [ -n "${FO_B:-}" ] && [ -n "${IDX_Q:-}" ]; } || { log "LAYOUT_FAIL"; finish; }
+	watchdog 300
+	dm_error_writes $IDX_B
+	dm_error_writes $IDX_Q
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_B / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
+	dm_heal $IDX_Q
+	sleep ${WAIT:-6}
+	W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	failed=$(awk '$1 == "repair_failed" {print $2}' $W 2>/dev/null)
+	kmsg "could not write back|refusing|raid56:" 6
+	echo 3 > /proc/sys/vm/drop_caches
+	dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none of=/tmp/rm.b 2>/dev/null
+	rc=$?
+	nb=$(tr -cd 'B' < /tmp/rm.b | wc -c)
+	na=$(tr -cd 'A' < /tmp/rm.b | wc -c)
+	pd=$(awk '$1 == "read_parities_disagree" {print $2}' $H 2>/dev/null)
+	log "RFM read_B=$nb read_A=$na rc=$rc repairs_failed=${failed:-?}" \
+	    "read_parities_disagree=${pd:-?} state=$(awk '$1 == "state" {print $2}' $H)"
+	echo "$nb $na $rc ${failed:-0}" > $T/umltest/rfm.$TAG
+	dm_heal $IDX_B
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
 detach_flush)
 	# A device detached while the filesystem is mounted -- a surprise
 	# removal, an enclosure that drops off the bus -- takes its volatile
