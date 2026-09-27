@@ -2540,6 +2540,12 @@ static unsigned long scrub_replace_read(struct scrub_stripe *stripe,
  * Open a record for the full stripe at @full_stripe_start that a member of it
  * can then be named in.  Returns NULL, or why no record can be kept that
  * outlives this mount.
+ *
+ * The record stays in flight until the caller has named the member and ends
+ * it (scrub_replace_end_record()), as a failed write's does
+ * (btrfs_wib_try_add_failed()): naming nothing in between, it was the first
+ * thing a full log spent, and the name then found no entry -- the replace
+ * aborted for a record the log had room for.
  */
 static const char *scrub_replace_add_record(struct btrfs_fs_info *fs_info,
 					    u64 full_stripe_start, int nr_data)
@@ -2549,10 +2555,17 @@ static const char *scrub_replace_add_record(struct btrfs_fs_info *fs_info,
 	/* See btrfs_wib_stripe_state(): no one would be told. */
 	if (nr_data > 64)
 		return "the write-intent log cannot describe a full stripe that wide";
-	if (btrfs_wib_try_add_sticky(fs_info, full_stripe_start,
+	if (btrfs_wib_try_add_failed(fs_info, full_stripe_start,
 				     btrfs_stripe_nr_to_offset(nr_data)) < 0)
 		return "the write-intent log is full";
 	return NULL;
+}
+
+/* The member is named, or will not be: see scrub_replace_add_record(). */
+static void scrub_replace_end_record(struct btrfs_fs_info *fs_info,
+				     u64 full_stripe_start, int nr_data)
+{
+	btrfs_wib_done(fs_info, full_stripe_start, btrfs_stripe_nr_to_offset(nr_data), false);
 }
 
 /*
@@ -2610,6 +2623,7 @@ static int scrub_replace_record_lost(struct scrub_ctx *sctx,
 	const int nr = bitmap_weight(&lost, stripe->nr_sectors);
 	const char *why = NULL;
 	unsigned long data;
+	bool added;
 	int nr_data;
 
 	bitmap_and(&data, &lost, &has_extent, stripe->nr_sectors);
@@ -2618,6 +2632,7 @@ static int scrub_replace_record_lost(struct scrub_ctx *sctx,
 
 	why = scrub_replace_add_record(fs_info, stripe->raid56_full_stripe,
 				       stripe->raid56_nr_data);
+	added = !why;
 	/*
 	 * Marking can make the log shrink to fit (the first stale bit halves
 	 * what a block holds); a record that did not survive that is no
@@ -2627,6 +2642,9 @@ static int scrub_replace_record_lost(struct scrub_ctx *sctx,
 	    !btrfs_wib_replace_mark_stale(fs_info, stripe->logical,
 					  !READ_ONCE(replace_keeps_marks)))
 		why = "the write-intent log could not keep the record";
+	if (added)
+		scrub_replace_end_record(fs_info, stripe->raid56_full_stripe,
+					 stripe->raid56_nr_data);
 	btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPLACE_LOST,
 			   stripe->raid56_full_stripe, NULL, 0);
 	if (why) {
@@ -3607,6 +3625,7 @@ static int scrub_replace_copy_parity(struct scrub_ctx *sctx,
 	const char *why;
 	struct page *page;
 	void *buf;
+	bool added;
 	u64 physical = 0;
 	u32 lost = 0;
 	u32 nr_lost;
@@ -3665,6 +3684,7 @@ static int scrub_replace_copy_parity(struct scrub_ctx *sctx,
 	nr_lost = DIV_ROUND_UP(lost, fs_info->sectorsize);
 	atomic64_add(nr_lost, &fs_info->dev_replace.num_uncorrectable_read_errors);
 	why = scrub_replace_add_record(fs_info, full_stripe_start, data_stripes);
+	added = !why;
 	/*
 	 * Parity p is recorded in block p of the full stripe (see
 	 * btrfs_wib_disk_entry::stale_par), so a stripe with fewer data
@@ -3678,6 +3698,8 @@ static int scrub_replace_copy_parity(struct scrub_ctx *sctx,
 		 !btrfs_wib_replace_mark_parity(fs_info, full_stripe_start, parity,
 						!READ_ONCE(replace_keeps_marks)))
 		why = "the write-intent log could not keep the record";
+	if (added)
+		scrub_replace_end_record(fs_info, full_stripe_start, data_stripes);
 	btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_REPLACE_LOST,
 			   full_stripe_start, NULL, 0);
 	if (why) {
