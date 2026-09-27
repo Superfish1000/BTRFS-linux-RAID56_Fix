@@ -54,6 +54,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_COMMIT_FAILED,	/* a commit could not write the log: read-only */
 	BTRFS_RAID56_EV_SCRUB_UNCOMMITTED, /* a scrub left a stripe newer than its tree */
 	BTRFS_RAID56_EV_FLUSH_UNLOGGED,	/* a failed flush left full stripe writes unnamed */
+	BTRFS_RAID56_EV_REPLACE_UNFLUSHED, /* a replace's new device failed a flush: it fails */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -611,6 +612,14 @@ struct btrfs_wib {
 	 * not finish (btrfs_wib_replace_marks_lost()); cleared when it ends.
 	 */
 	bool replace_marks_lost;
+	/*
+	 * The running device replace's new device did not confirm a flush
+	 * (wib_replace_target_unflushed()): what was copied to it may be gone
+	 * from its cache, and no record says so -- it is no member yet, and
+	 * the old device, which does hold it all, was flushed.  The replace
+	 * must not finish, as for @replace_marks_lost; cleared when it ends.
+	 */
+	bool replace_tgt_unflushed;
 
 	/* Sequence number of the last successful commit. */
 	u64 seq;
@@ -1005,6 +1014,7 @@ bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_commit_keeps_previous(void);
 bool btrfs_wib_untimed_takes_back(void);
 bool btrfs_wib_commit_refuses_owed(void);
+bool btrfs_wib_replace_trusts_target(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);

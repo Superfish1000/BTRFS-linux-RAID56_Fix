@@ -3280,8 +3280,13 @@ replace_target_fail)
 	# and write its superblock), then 'btrfs replace start -B'.  The copy of
 	# every sector goes to the target and is lost; a replace that finishes
 	# anyway swaps in a device with holes where the source had data.
-	# CONTROL=1 sets scrub_replace_ignores_write_errors=1, the old
-	# behaviour: then a read-only scrub afterwards finds them.
+	# CONTROL=1 sets scrub_replace_ignores_write_errors=1 and
+	# raid56_wf_replace_trusts_target=1, the old behaviour: then a read-only
+	# scrub afterwards finds them.  CONTROL=2 sets only the first: the
+	# target fails the flushes too (error_writes fails them), and a replace
+	# whose new device failed a flush fails all the same
+	# (replace_target_unflushed).  CONTROL=3 sets only the second: the
+	# write errors alone fail it.
 	watchdog ${WATCH:-900}
 	dm_setup
 	set -- $DMDEVS
@@ -3289,11 +3294,17 @@ replace_target_fail)
 	TGT=$5
 	btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $1 $2 $3 $4 >/dev/null 2>&1
 	do_mount $OPTS $1
-	[ "${CONTROL:-0}" = 1 ] && {
+	case "${CONTROL:-0}" in 1|2)
 		echo 1 > /sys/module/btrfs/parameters/scrub_replace_ignores_write_errors 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: target write errors ignored"
-	}
+	esac
+	case "${CONTROL:-0}" in 1|3)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_replace_trusts_target 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a target that failed a flush is trusted"
+	esac
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 	head -c 96M /dev/urandom > $MNT/data
 	sync
 	want=$(md5sum < $MNT/data | awk '{print $1}')
@@ -3319,8 +3330,11 @@ replace_target_fail)
 	got=$(md5sum < $MNT/data 2>/dev/null | awk '{print $1}')
 	log "scrub: $(tr '\n' ' ' < /tmp/scrub.out | grep -o 'Error summary:.*' | cut -c1-120)"
 	kmsg "replace|scrub: device replace could not write" 6
-	log "RTF rrc=$rrc inuse=$inuse md5ok=$([ "$got" = "$want" ] && echo 1 || echo 0) csum=${csum:-0}"
-	echo "$rrc $inuse $([ "$got" = "$want" ] && echo 1 || echo 0) ${csum:-0}" > $T/umltest/rtf.$TAG
+	unfl=$(awk '$1 == "replace_target_unflushed" {print $2}' $H 2>/dev/null)
+	log "RTF rrc=$rrc inuse=$inuse md5ok=$([ "$got" = "$want" ] && echo 1 || echo 0) csum=${csum:-0}" \
+	    "replace_target_unflushed=${unfl:-?}"
+	echo "$rrc $inuse $([ "$got" = "$want" ] && echo 1 || echo 0) ${csum:-0} ${unfl:-0}" \
+		> $T/umltest/rtf.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
 	finish

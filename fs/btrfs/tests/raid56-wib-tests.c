@@ -4672,6 +4672,78 @@ static int test_forget_range(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * A running device replace whose new device fails a flush -- a transaction
+ * commit's barrier here -- may have lost from its cache what was copied to
+ * it, and nothing records that: the device is in no chunk map, so no name
+ * falls on it.  The replace must not finish (wib_replace_target_unflushed()):
+ * its copy stops (btrfs_wib_replace_marks_lost()) and its end fails, the old
+ * device staying, with the replace_target_unflushed alert.  Under
+ * raid56_wf_replace_trusts_target=1 it finishes, as it did, which this checks,
+ * so that a pass means the test can see it.
+ */
+static int test_replace_target_unflushed(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool trusts = btrfs_wib_replace_trusts_target();
+	const u64 alerts0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_REPLACE_UNFLUSHED]);
+	struct btrfs_device *tgt;
+	bool lost;
+	int ret = -EINVAL;
+	int end;
+	int cret;
+
+	tgt = btrfs_alloc_dummy_device(fs_info);
+	if (IS_ERR(tgt)) {
+		test_err("cannot allocate device");
+		return PTR_ERR(tgt);
+	}
+	/* Not WRITEABLE: the log writes nothing to it. */
+	tgt->devid = BTRFS_DEV_REPLACE_DEVID;
+	set_bit(BTRFS_DEV_STATE_REPLACE_TGT, &tgt->dev_state);
+	set_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &tgt->dev_state);
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, false);
+	clear_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &tgt->dev_state);
+	if (cret) {
+		test_err("the commit whose barrier the new device failed returned %d", cret);
+		goto out;
+	}
+	lost = btrfs_wib_replace_marks_lost(fs_info);
+	end = btrfs_wib_replace_end(fs_info, true);
+	if (trusts) {
+		if (lost || end ||
+		    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_REPLACE_UNFLUSHED]) != alerts0) {
+			test_err("raid56_wf_replace_trusts_target is set, yet the replace stopped (%d) or failed (%d): the test is blind",
+				 lost, end);
+			goto out;
+		}
+		test_msg("raid56_wf_replace_trusts_target is set: the replace finished, as expected");
+	} else if (!lost || end != -EIO ||
+		   atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_REPLACE_UNFLUSHED]) !=
+		   alerts0 + 1) {
+		test_err("a replace whose new device failed a flush went on (stopped %d) or finished (%d)",
+			 lost, end);
+		goto out;
+	}
+	ret = 0;
+out:
+	btrfs_wib_replace_end(fs_info, false);
+	clear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &tgt->dev_state);
+	if (!ret && btrfs_wib_replace_marks_lost(fs_info)) {
+		test_err("the replace's end did not clear what stopped it");
+		ret = -EINVAL;
+	}
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (!ret && (cret || block_nr_entries(wib->last) != 0)) {
+		test_err("log not empty after the replace target test: commit %d, %u regions",
+			 cret, block_nr_entries(wib->last));
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
  * A device replace's own stale marks (btrfs_wib_replace_mark_stale()): left
  * out of the queries while the replace runs, since the source still serves the
  * column; kept through a retirement that did not look at them; handed over
@@ -6072,6 +6144,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_replace_marks(fs_info);
+	if (ret)
+		goto out;
+	ret = test_replace_target_unflushed(fs_info);
 	if (ret)
 		goto out;
 	ret = test_disable_ordering(fs_info);

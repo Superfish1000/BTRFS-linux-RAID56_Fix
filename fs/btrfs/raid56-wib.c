@@ -1914,6 +1914,76 @@ static void wib_flush_failed_describe(const struct btrfs_wib_flush_failed *faile
 }
 
 /*
+ * Testing only.  raid56_wf_replace_trusts_target=1: a running device replace
+ * whose new device failed a flush finishes all the same, as before
+ * wib_replace_target_unflushed(): the new device serves what it may have lost
+ * from its cache, in place of the old one that holds it.  The negative
+ * control for test_replace_target_unflushed() in the self tests.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_trusts_target;
+module_param_named(raid56_wf_replace_trusts_target, replace_trusts_target, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_trusts_target,
+		 "Let a device replace finish although its new device failed a cache flush while it ran (testing only: restores a known defect)");
+#else
+static const bool replace_trusts_target;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_replace_trusts_target(void)
+{
+	return READ_ONCE(replace_trusts_target);
+}
+#endif
+
+/*
+ * @dev, the new device of a running replace, did not confirm a flush: a
+ * transaction commit's barrier or one of the log's own.  The copy writes and
+ * the writes duplicated to it (RMW phase B, the log's own blocks) may be gone
+ * from its cache.  Nothing records that -- the device is in no chunk map, so
+ * no name falls on it (wib_name_region()), and barrier_all_devices() does not
+ * count it -- and once the replace finishes it serves them in place of the
+ * old device, which holds them, flushed: data without a checksum reads back
+ * wrong, with no error.  So the replace must not finish: it stops copying
+ * (btrfs_wib_replace_marks_lost(), which also has the item resume from the
+ * start, as the latched alert does after a crash), and fails at its end
+ * (btrfs_wib_replace_end()), the old device staying as it was.  Nothing is
+ * lost, and the replace can be started again.  RCU read side.
+ */
+static void wib_replace_target_unflushed(struct btrfs_fs_info *fs_info,
+					 const struct btrfs_device *dev)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	struct btrfs_wib_flush_failed failed = { 0 };
+	unsigned long flags;
+	bool was;
+
+	if (!wib || READ_ONCE(replace_trusts_target) ||
+	    !test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &dev->dev_state))
+		return;
+	spin_lock_irqsave(&wib->lock, flags);
+	was = wib->replace_tgt_unflushed;
+	wib->replace_tgt_unflushed = true;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (was)
+		return;
+	wib_flush_failed_add(&failed, dev->devid);
+	raid56_alert_failed(fs_info, BTRFS_RAID56_EV_REPLACE_UNFLUSHED, 0, &failed);
+}
+
+/* A transaction commit's barrier: see wib_replace_target_unflushed(). */
+static void wib_replace_target_barrier(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_device *device;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(device, &fs_info->fs_devices->devices, dev_list)
+		if (test_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &device->dev_state))
+			wib_replace_target_unflushed(fs_info, device);
+	rcu_read_unlock();
+}
+
+/*
  * The devices whose barrier failed in this transaction commit, which is
  * running write_all_supers() under device_list_mutex: barrier_all_devices()
  * has just set BTRFS_DEV_STATE_FLUSH_FAILED on exactly those.
@@ -2019,6 +2089,8 @@ static void wib_update_targets(struct btrfs_fs_info *fs_info, struct file **file
 			if (!with_data) {
 				if (!ok[i] && failed)
 					wib_flush_failed_add(failed, device->devid);
+				if (!ok[i])
+					wib_replace_target_unflushed(fs_info, device);
 			} else if (ok[i]) {
 				WRITE_ONCE(device->wib_next_slot,
 					   (slots[i] + 1) % BTRFS_WIB_NR_SLOTS);
@@ -4861,7 +4933,15 @@ int btrfs_wib_replace_end(struct btrfs_fs_info *fs_info, bool finished)
 "raid56: device replace FAILED: the write-intent log, full with a device missing, had to drop its record of zeros the replace put on the new device where it could neither copy nor rebuild the old one, so the new device is not used; see the replace_record_dropped alert");
 		return -EIO;
 	}
+	if (finished && READ_ONCE(wib->replace_tgt_unflushed)) {
+		spin_unlock_irqrestore(&wib->lock, flags);
+		if (!btrfs_is_testing(fs_info))
+			btrfs_err(fs_info,
+"device replace FAILED: the new device did not confirm a cache flush, so it may not hold what was copied to it, and it is not used; the old device stays; see the replace_target_unflushed alert");
+		return -EIO;
+	}
 	WRITE_ONCE(wib->replace_marks_lost, false);
+	WRITE_ONCE(wib->replace_tgt_unflushed, false);
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		struct btrfs_wib_entry *e = &wib->entries[i];
 		const u64 stale = e->stale & e->replace_stale;
@@ -4907,7 +4987,8 @@ int btrfs_wib_replace_end(struct btrfs_fs_info *fs_info, bool finished)
  */
 bool btrfs_wib_replace_marks_lost(struct btrfs_fs_info *fs_info)
 {
-	return fs_info->wib && READ_ONCE(fs_info->wib->replace_marks_lost);
+	return fs_info->wib && (READ_ONCE(fs_info->wib->replace_marks_lost) ||
+				READ_ONCE(fs_info->wib->replace_tgt_unflushed));
 }
 
 /*
@@ -4927,7 +5008,23 @@ bool btrfs_wib_replace_marks_lost(struct btrfs_fs_info *fs_info)
  */
 bool btrfs_wib_replace_resume_rewinds(struct btrfs_fs_info *fs_info, u64 nr_uncopyable)
 {
-	return nr_uncopyable && fs_info->wib && !READ_ONCE(replace_keeps_added_only);
+	struct btrfs_wib *wib = fs_info->wib;
+	unsigned long flags;
+	bool unflushed;
+
+	if (!wib)
+		return false;
+	if (nr_uncopyable && !READ_ONCE(replace_keeps_added_only))
+		return true;
+	/*
+	 * Its new device failed a flush before the crash or the unmount, and
+	 * the item may hold a cursor past what it lost: copy again from the
+	 * start (wib_replace_target_unflushed()).
+	 */
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	unflushed = wib->alert_latched & BIT(BTRFS_RAID56_EV_REPLACE_UNFLUSHED);
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	return unflushed && !READ_ONCE(replace_trusts_target);
 }
 
 /*
@@ -6691,6 +6788,9 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 
 	if (!wib)
 		return 0;
+	/* Log or no log: a replace whose new device failed the barrier fails. */
+	if (!flushed)
+		wib_replace_target_barrier(fs_info);
 	if (READ_ONCE(wib->unlogged_refused))
 		return wib_unlogged_refused(fs_info);
 
@@ -7093,6 +7193,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_COMMIT_FAILED] = "log_commit_failed",
 	[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED] = "scrub_uncommitted",
 	[BTRFS_RAID56_EV_FLUSH_UNLOGGED] = "full_stripe_flush_unnamed",
+	[BTRFS_RAID56_EV_REPLACE_UNFLUSHED] = "replace_target_unflushed",
 };
 
 /*
@@ -7117,7 +7218,8 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED) |	\
 					 BIT(BTRFS_RAID56_EV_RECOVERY_FULL) |	\
 					 BIT(BTRFS_RAID56_EV_COMMIT_FAILED) |	\
-					 BIT(BTRFS_RAID56_EV_FLUSH_UNLOGGED))
+					 BIT(BTRFS_RAID56_EV_FLUSH_UNLOGGED) |	\
+					 BIT(BTRFS_RAID56_EV_REPLACE_UNFLUSHED))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -7434,6 +7536,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 "raid56: a transaction commit FAILED and the filesystem is now read-only, because the write-intent log could not be written: it records more regions than a log block describes, or too few devices took the block (the message before this one says which). Going on would have acknowledged writes whose records -- which copy of a stripe a failed write left stale -- exist only in memory, and after a crash the old data would have read back with no error. What was written since the last commit is not acknowledged (fsync returned an error), and the log on the devices still lists every stripe the next mount's recovery has to check. Unmount and mount again (-o degraded if a device is missing); if a device keeps failing writes, replace it ('btrfs replace start <devid> <new device> <mountpoint>') and run 'btrfs scrub start <mountpoint>'. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
+	case BTRFS_RAID56_EV_REPLACE_UNFLUSHED:
+		btrfs_err(fs_info,
+"raid56: a device replace FAILED: its new device (%s) did not confirm a cache flush, so what the replace copied to it may never have reached its disk. Finishing would have it serve those sectors in place of the old device, which still holds them, and data without a checksum would read back wrong with no error. So the replace stops, and the old device stays as it was: nothing is lost. Check the new device (cabling, power, its kernel messages), then start the replace again ('btrfs replace start <devid> <new device> <mountpoint>'). If the machine goes down before the replace has stopped and it resumes at the next mount, it copies again from the start where the write-intent log is enabled; otherwise cancel it ('btrfs replace cancel <mountpoint>') and start it again. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+			  name && name[0] ? name : "?", fsid);
+		break;
 	case BTRFS_RAID56_EV_REPLACE_ABORTED:
 		btrfs_err(fs_info,
 "raid56: a device replace was ABORTED at full stripe %llu: it could neither copy nor rebuild part of it for the new device, and could not record that -- the write-intent log is not enabled, is full, or cannot describe that stripe; the message before this one says which -- so it stopped rather than leave zeros on the new device that would read back as data. The old device stays in the filesystem, as it was, and nothing is lost that was not lost already. Mount without noraid56_write_intent if the log is off, run 'btrfs scrub start <mountpoint>' so that its records retire if it is full, and bring back or fix the device whose read failed if you can; then start the replace again ('btrfs replace start <devid> <new device> <mountpoint>') and acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
@@ -7703,7 +7810,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep, %llu commits that could not write the log, %llu full stripes a scrub left to the next one, %llu failed flushes the log could not name full stripe writes in; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep, %llu commits that could not write the log, %llu full stripes a scrub left to the next one, %llu failed flushes the log could not name full stripe writes in, %llu replaces whose new device failed a flush; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -7726,6 +7833,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_COMMIT_FAILED],
 			   pending[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED],
 			   pending[BTRFS_RAID56_EV_FLUSH_UNLOGGED],
+			   pending[BTRFS_RAID56_EV_REPLACE_UNFLUSHED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
