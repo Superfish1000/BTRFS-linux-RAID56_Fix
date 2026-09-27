@@ -89,6 +89,15 @@ static struct btrfs_wib_entry *put_entry(struct btrfs_wib *wib, u64 bytenr, u64 
 	return e;
 }
 
+/*
+ * raid56_wf_flush_drop_asserts=1 on a kernel with CONFIG_BTRFS_ASSERT: a
+ * commit of a set no block describes is a BUG(), as it was.
+ */
+static bool flush_drop_would_bug(void)
+{
+	return IS_ENABLED(CONFIG_BTRFS_ASSERT) && btrfs_wib_flush_drop_asserts();
+}
+
 static int test_range_mask(void)
 {
 	const u64 base = 3 * BTRFS_WIB_ENTRY_SIZE;
@@ -1635,6 +1644,10 @@ static int test_admit_wide(struct btrfs_fs_info *fs_info)
 		test_msg("raid56_evict_naming is set, skipping the admission test");
 		return 0;
 	}
+	if (narrow && flush_drop_would_bug()) {
+		test_msg("raid56_wf_flush_drop_asserts is set on a CONFIG_BTRFS_ASSERT kernel: the commit would BUG(), skipping the admission test");
+		return 0;
+	}
 	/* Writes in flight into as many regions as are admitted. */
 	spin_lock_irqsave(&wib->lock, flags);
 	while (admitted < BTRFS_WIB_MAX_ENTRIES_V1 &&
@@ -1715,6 +1728,330 @@ out:
 }
 
 /*
+ * A write into a region the log records only as room to spend (a sticky-only
+ * record, wib_evictable()) takes that region out of what may be spent, as a
+ * write into a new region takes a slot: it is charged (wib_count_entries_locked()).
+ * Uncharged, it was admitted however many regions that may not be spent the
+ * set already held -- the room came out at nothing, and nothing more was
+ * needed -- and could leave more of them than a wide block describes.  Under
+ * raid56_wf_admit_recorded_free=1 it is admitted, as before.
+ */
+static int test_admit_recorded(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool free = btrfs_wib_admits_recorded_free();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6200;
+	const u32 nr_vague = 4;
+	const u64 first_vague = (base + BTRFS_WIB_MAX_ENTRIES - 1) * BTRFS_WIB_ENTRY_SIZE;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r1, r2;
+
+	if (btrfs_wib_evicts_naming() || btrfs_wib_admits_narrow()) {
+		test_msg("raid56_evict_naming or raid56_wf_admit_narrow is set, skipping the recorded-region admission test");
+		return 0;
+	}
+	/* One region short of a wide block in flight, and a few vague records. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1 + nr_vague; i++) {
+		const bool vague = i >= BTRFS_WIB_MAX_ENTRIES - 1;
+
+		if (!put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, vague ? 0 : 0x1,
+			       vague ? 0x1 : 0)) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+	}
+	/* The first vague region takes the last slot; the second has none. */
+	spin_lock_irqsave(&wib->lock, flags);
+	r1 = btrfs_wib_try_mark(wib, first_vague, blk);
+	r2 = btrfs_wib_try_mark(wib, first_vague + BTRFS_WIB_ENTRY_SIZE, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (r1) {
+		test_err("a write into a recorded region with a slot left was refused: %d", r1);
+		goto out;
+	}
+	if (free) {
+		if (r2) {
+			test_err("raid56_wf_admit_recorded_free is set, yet the write was refused: %d", r2);
+			goto out;
+		}
+		test_msg("raid56_wf_admit_recorded_free is set: %u regions that may not be spent admitted, as expected",
+			 (unsigned int)BTRFS_WIB_MAX_ENTRIES + 1);
+	} else if (r2 != -ENOSPC ||
+		   btrfs_wib_can_mark(wib, first_vague + BTRFS_WIB_ENTRY_SIZE, blk)) {
+		test_err("a write into a recorded region past what a wide block describes was admitted: %d",
+			 r2);
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1 + nr_vague; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	return ret;
+}
+
+/*
+ * A write into a stripe whose record names a column writes that column back
+ * with FUA and clears the name (rmw_repair_first()), and only then marks the
+ * stripe in flight: in between the record says only that a write failed
+ * there, which is what a full log spends first.  Spent, and the log not
+ * written -- the put-back after a failed persist -- the name finds no entry:
+ * memory says the column is clean while the log on disk still names it.  So
+ * the record is pinned in between (btrfs_wib_pin()), and a write into a new
+ * region of the full log is refused instead.  Under
+ * raid56_wf_repair_leaves_unpinned=1 nothing is pinned, and the record is
+ * spent.
+ */
+static int test_pin_keeps_record(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool unpinned = btrfs_wib_repair_leaves_unpinned();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6500;
+	const u64 named = (base + BTRFS_WIB_MAX_ENTRIES - 1) * BTRFS_WIB_ENTRY_SIZE;
+	const u64 fresh = (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE;
+	const struct btrfs_wib_entry *e;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the pinned-record test");
+		return 0;
+	}
+	/*
+	 * A wide log, full: writes in flight, one record naming a column of
+	 * another region, and the record the write is about to repair.
+	 */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		struct btrfs_wib_entry *p = put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+						      i < BTRFS_WIB_MAX_ENTRIES - 2 ? 0x1 : 0,
+						      i < BTRFS_WIB_MAX_ENTRIES - 2 ? 0 : 0x1);
+
+		if (!p) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+		if (i >= BTRFS_WIB_MAX_ENTRIES - 2) {
+			spin_lock_irqsave(&wib->lock, flags);
+			p->stale = 0x1;
+			atomic_inc(&wib->nr_stale);
+			spin_unlock_irqrestore(&wib->lock, flags);
+		}
+	}
+	/* rmw_repair_first(): the column written back, its name cleared. */
+	if (!unpinned)
+		btrfs_wib_pin(fs_info, named, blk, true);
+	btrfs_wib_clear_stale(fs_info, named, blk, true);
+	/* A write into a new region of the full log meanwhile. */
+	spin_lock_irqsave(&wib->lock, flags);
+	r = btrfs_wib_try_mark(wib, fresh, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	/* The persist failed: the name goes back. */
+	btrfs_wib_mark_stale(fs_info, named, blk);
+	if (!unpinned)
+		btrfs_wib_pin(fs_info, named, blk, false);
+	e = find_live_entry(wib, named);
+	if (unpinned) {
+		if (r || e) {
+			test_err("raid56_wf_repair_leaves_unpinned is set, yet the record was kept: mark %d, entry %d",
+				 r, !!e);
+			goto out;
+		}
+		test_msg("raid56_wf_repair_leaves_unpinned is set: the record was spent and its name lost, as expected");
+	} else if (r != -ENOSPC || !e || e->stale != 0x1 || e->pin) {
+		test_err("the pinned record: mark %d, entry %d, stale 0x%llx, pin 0x%llx; expected -ENOSPC and the name back",
+			 r, !!e, e ? e->stale : 0, e ? e->pin : 0);
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the pinned-record test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
+ * A degraded mount's recovery keeps a RAID6 stripe straddling two regions,
+ * with a data column named in each (btrfs_wib_readd_record()), in a narrow
+ * log full of records that name nothing.  The first name makes every block
+ * wide, which spends records to fit -- and the half whose name has yet to go
+ * on names nothing so far: spent, its name found no entry, and the mount went
+ * on without it.  Pinned while the names go on, both stay.  Under
+ * raid56_wf_recover_names_unpinned=1 the second half is spent -- if
+ * raid56_wf_spend_straddling_half=1 as well: the half of a stripe whose other
+ * half names a member is not spent either way (wib_entry_half_named()).
+ */
+static int test_recover_names_pinned(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool unpinned = btrfs_wib_recover_names_unpinned() &&
+			      btrfs_wib_spends_straddling_half();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6700;
+	/* Three data columns: the last two blocks of R1, the first of R2. */
+	const u64 r1 = (base + BTRFS_WIB_MAX_ENTRIES_V1) * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r2 = r1 + BTRFS_WIB_ENTRY_SIZE;
+	const u64 start = r2 - 2 * blk;
+	const struct btrfs_wib_entry *e1, *e2;
+	int ret = -EINVAL;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the recovery naming test");
+		return 0;
+	}
+	/* The log read at mount names column 0 in R1 and column 2 in R2. */
+	ret = btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = r1, .sticky = BIT_ULL(62) | BIT_ULL(63), .stale = BIT_ULL(62) });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = r2, .sticky = 0x1, .stale = 0x1 });
+	if (ret) {
+		test_err("add_pending failed");
+		ret = -EINVAL;
+		goto out;
+	}
+	btrfs_wib_finalize_pending(wib);
+	ret = -EINVAL;
+	/* A narrow log full of records that name nothing. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+		if (!put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+	}
+	WRITE_ONCE(wib->recovery_full, false);
+	WRITE_ONCE(wib->recovery_running, true);
+	if (!btrfs_wib_readd_record(fs_info, start, 3 * blk)) {
+		test_err("the recovery found no room for a stripe in a log it may spend");
+		goto out;
+	}
+	e1 = find_live_entry(wib, r1);
+	e2 = find_live_entry(wib, r2);
+	if (unpinned) {
+		if (e2 && (e2->stale & 0x1)) {
+			test_err("raid56_wf_recover_names_unpinned and raid56_wf_spend_straddling_half are set, yet the second half kept its name");
+			goto out;
+		}
+		test_msg("raid56_wf_recover_names_unpinned and raid56_wf_spend_straddling_half are set: the second half was spent and its name lost, as expected");
+	} else if (!e1 || !(e1->stale & BIT_ULL(62)) || !e2 || e2->stale != 0x1 ||
+		   e1->pin || e2->pin) {
+		test_err("the stripe's names: R1 %d stale 0x%llx, R2 %d stale 0x%llx; expected both",
+			 !!e1, e1 ? e1->stale : 0, !!e2, e2 ? e2->stale : 0);
+		goto out;
+	}
+	ret = 0;
+out:
+	WRITE_ONCE(wib->recovery_running, false);
+	WRITE_ONCE(wib->recovery_full, false);
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1 + 2; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_ENTRY_SIZE);
+	kvfree(wib->pending);
+	wib->pending = NULL;
+	wib->nr_pending = 0;
+	wib->max_pending = 0;
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the recovery naming test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
+ * A full stripe straddling two regions is recorded in two entries, and a
+ * name goes on the entry of the block it names: the other half names nothing.
+ * A full log spent it as a record that names nothing -- a record_dropped
+ * nothing warranted, and a stripe a scrub then declines as only partly
+ * recorded.  It is kept now, both ways across a boundary
+ * (wib_entry_half_named()); under raid56_wf_spend_straddling_half=1 it is
+ * spent.
+ */
+static int test_straddling_half_kept(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool spends = btrfs_wib_spends_straddling_half();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 7000;
+	/* Forward: R1 unnamed at its last blocks, R2 named at its first. */
+	const u64 r1 = base * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r2 = r1 + BTRFS_WIB_ENTRY_SIZE;
+	/* Backward: R3 named at its last block, R4 unnamed at its first. */
+	const u64 r3 = r2 + 2 * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r4 = r3 + BTRFS_WIB_ENTRY_SIZE;
+	const u64 fresh = (base + 200) * BTRFS_WIB_ENTRY_SIZE;
+	struct btrfs_wib_entry *e;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r[2];
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the straddling-half test");
+		return 0;
+	}
+	if (!put_entry(wib, r1, 0, BIT_ULL(62) | BIT_ULL(63)) || !put_entry(wib, r4, 0, 0x3)) {
+		test_err("no room for the unnamed halves");
+		goto out;
+	}
+	e = put_entry(wib, r2, 0, 0x1);
+	if (!e)
+		goto out;
+	spin_lock_irqsave(&wib->lock, flags);
+	e->stale = 0x1;
+	atomic_inc(&wib->nr_stale);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (!put_entry(wib, r3, 0, BIT_ULL(63)))
+		goto out;
+	/* Parity 0 of the stripe starting at R3's last block. */
+	btrfs_wib_update_stale_parity(fs_info, r3 + 63 * blk, 0, true);
+	/* A wide log, full with writes in flight. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 4; i++) {
+		if (!put_entry(wib, (base + 10 + i) * BTRFS_WIB_ENTRY_SIZE, 0x1, 0)) {
+			test_err("no room for write %u", i);
+			goto out;
+		}
+	}
+	spin_lock_irqsave(&wib->lock, flags);
+	r[0] = btrfs_wib_try_mark(wib, fresh, blk);
+	r[1] = btrfs_wib_try_mark(wib, fresh + BTRFS_WIB_ENTRY_SIZE, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (spends) {
+		if (r[0] || r[1] || find_live_entry(wib, r1) || find_live_entry(wib, r4)) {
+			test_err("raid56_wf_spend_straddling_half is set, yet the halves were kept: %d %d",
+				 r[0], r[1]);
+			goto out;
+		}
+		test_msg("raid56_wf_spend_straddling_half is set: both unnamed halves were spent, as expected");
+	} else if (r[0] != -ENOSPC || r[1] != -ENOSPC || !find_live_entry(wib, r1) ||
+		   !find_live_entry(wib, r4) || btrfs_wib_can_mark(wib, fresh, blk)) {
+		test_err("an unnamed half of a named stripe was spent: marks %d %d, R1 %d R4 %d",
+			 r[0], r[1], !!find_live_entry(wib, r1), !!find_live_entry(wib, r4));
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 4; i++)
+		btrfs_wib_done(fs_info, (base + 10 + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+	btrfs_wib_done(fs_info, fresh, 2 * BTRFS_WIB_ENTRY_SIZE, false);
+	for (u64 i = 0; i < 210; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_ENTRY_SIZE);
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the straddling-half test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
  * A transaction commit that cannot write the log fails, so that the
  * transaction aborts (wib_commit_failed()): here more regions name a member
  * than a wide block describes -- no write is admitted into that
@@ -1736,6 +2073,10 @@ static int test_commit_fails_full(struct btrfs_fs_info *fs_info)
 
 	if (btrfs_wib_evicts_naming()) {
 		test_msg("raid56_evict_naming is set, skipping the commit-full test");
+		return 0;
+	}
+	if (flush_drop_would_bug()) {
+		test_msg("raid56_wf_flush_drop_asserts is set on a CONFIG_BTRFS_ASSERT kernel: the commit would BUG(), skipping the commit-full test");
 		return 0;
 	}
 	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++) {
@@ -4372,6 +4713,63 @@ static u64 readd_full_many(struct readd_rig *rig, u64 first, u64 nr, bool finish
 }
 
 /*
+ * The full stripe of region @k, in flight at a failed flush that named its
+ * member on the failed device, has finished on every device: rmw_rbio() then
+ * clears what the record says of the stripe (btrfs_wib_clear_written()) --
+ * but not that name (@hold), which the flush took out of the write's unlogged
+ * record: part of the write may have gone into the cache the device lost.
+ * Cleared, nothing said so any more, and the column read back as it was, with
+ * no error.  The next write of the stripe starts after that flush: it releases
+ * the name, and its own completion clears it.  raid56_wf_full_stripe_clears_hold=1
+ * clears it at once, as before.
+ */
+static int readd_full_stripe_lands(struct readd_rig *rig, u64 k)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool clears = btrfs_wib_full_stripe_clears_hold();
+	const struct btrfs_wib_entry *e;
+	u64 stale, stale_par;
+	u64 noted;
+
+	readd_expect(k, &stale, &stale_par);
+	btrfs_wib_clear_written(fs_info, readd_region(k), READD_STRIPE_LEN);
+	e = find_live_entry(wib, readd_region(k));
+	if (clears) {
+		if (e && (e->stale | e->stale_par)) {
+			test_err("raid56_wf_full_stripe_clears_hold is set, yet region %llu still names 0x%llx 0x%llx",
+				 k, e->stale, e->stale_par);
+			return -EINVAL;
+		}
+		test_msg("raid56_wf_full_stripe_clears_hold is set: the write's completion cleared the name, as expected");
+		return 0;
+	}
+	if (!e || e->sticky != (stale | stale_par) || e->stale != stale ||
+	    e->stale_par != stale_par || (e->hold | e->hold_par) != (stale | stale_par)) {
+		test_err("region %llu after the write in flight landed: sticky 0x%llx stale 0x%llx stale_par 0x%llx hold 0x%llx 0x%llx, expected the name 0x%llx 0x%llx held",
+			 k, e ? e->sticky : 0, e ? e->stale : 0, e ? e->stale_par : 0,
+			 e ? e->hold : 0, e ? e->hold_par : 0, stale, stale_par);
+		return -EINVAL;
+	}
+	noted = readd_issue_full(rig, k);
+	e = find_live_entry(wib, readd_region(k));
+	if (!e || (e->hold | e->hold_par)) {
+		test_err("region %llu: the next write of the stripe did not release the name (hold 0x%llx 0x%llx)",
+			 k, e ? e->hold : 0, e ? e->hold_par : 0);
+		return -EINVAL;
+	}
+	readd_full_done(rig, k, noted);
+	btrfs_wib_clear_written(fs_info, readd_region(k), READD_STRIPE_LEN);
+	e = find_live_entry(wib, readd_region(k));
+	if (e) {
+		test_err("region %llu: the next write of the stripe landed, and its record stayed (sticky 0x%llx stale 0x%llx)",
+			 k, e->sticky, e->stale);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
  * A full stripe written copy-on-write is not recorded, and a failed flush
  * after one named nothing: its member on the device that failed the flush
  * read back old, with no error.  Now the failed flush names it (struct
@@ -4465,6 +4863,11 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 		return -EINVAL;
 	}
 	readd_full_done(rig, k_fly, n_fly);
+	if (!unnamed) {
+		ret = readd_full_stripe_lands(rig, k_fly);
+		if (ret)
+			return ret;
+	}
 	clear_repairs(wib);
 	ret = readd_clear(rig, k_done, ARRAY_SIZE(k_named));
 	if (ret)
@@ -4544,6 +4947,60 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 	return readd_clear(rig, 20, 1);
 }
 
+/*
+ * Once a readd refused (@readd_refused), the log on the devices stays as it
+ * is and no repair lands: a failed flush that names a full stripe written
+ * copy-on-write puts the names on, in memory, but asks for no repair -- which
+ * would retry and give up with an alert blaming the device -- and raises no
+ * notice promising one.  Under raid56_wf_unlogged_repairs_refused=1 it does
+ * both, as before.
+ */
+static int readd_unlogged_after_refusal(struct readd_rig *rig)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool asks = btrfs_wib_unlogged_repairs_refused();
+	const bool repairs = !btrfs_raid56_no_repair_on_fault();
+	const u64 notices0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_STALE]);
+	const u64 k = 440;
+	const struct btrfs_wib_entry *e;
+	u64 stale, stale_par;
+	bool queued, noticed;
+	int ret;
+
+	if (btrfs_wib_full_stripe_unnamed()) {
+		test_msg("raid56_wf_full_stripe_unnamed is set: nothing is named, skipping the refused-readd test");
+		return 0;
+	}
+	clear_repairs(wib);
+	readd_full_done(rig, k, readd_issue_full(rig, k));
+	WRITE_ONCE(wib->readd_refused, true);
+	wib->test_flush_fails = true;
+	set_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &rig->devs[READD_FAILED]->dev_state);
+	ret = btrfs_wib_persist_now(fs_info);
+	clear_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &rig->devs[READD_FAILED]->dev_state);
+	wib->test_flush_fails = false;
+	WRITE_ONCE(wib->readd_refused, false);
+	readd_expect(k, &stale, &stale_par);
+	e = find_live_entry(wib, readd_region(k));
+	queued = repair_queued(wib, readd_region(k));
+	noticed = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_STALE]) != notices0;
+	clear_repairs(wib);
+	if (ret != -EIO || !e || e->stale != stale || e->stale_par != stale_par) {
+		test_err("a failed flush after a refused readd: persist %d, region %llu stale 0x%llx 0x%llx, expected -EIO and 0x%llx 0x%llx",
+			 ret, k, e ? e->stale : 0, e ? e->stale_par : 0, stale, stale_par);
+		return -EINVAL;
+	}
+	if ((queued && repairs) != (asks && repairs) || noticed != asks) {
+		test_err("a failed flush after a refused readd: repair asked for %d, notice %d, expected %d",
+			 queued, noticed, asks);
+		return -EINVAL;
+	}
+	if (asks)
+		test_msg("raid56_wf_unlogged_repairs_refused is set: repairs that cannot land asked for, as expected");
+	return readd_clear(rig, k, 1);
+}
+
 static int test_readd_names(struct btrfs_fs_info *fs_info)
 {
 	const bool legacy = btrfs_wib_readd_legacy();
@@ -4600,6 +5057,8 @@ static int test_readd_names(struct btrfs_fs_info *fs_info)
 		ret = readd_names_repair(&rig, legacy);
 	if (!ret)
 		ret = readd_names_full_stripe(&rig);
+	if (!ret)
+		ret = readd_unlogged_after_refusal(&rig);
 	clear_repairs(fs_info->wib);
 	if (!ret && legacy)
 		test_msg("raid56_wf_no_readd_name is set: nothing was named, as expected");
@@ -6115,6 +6574,18 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_admit_wide(fs_info);
+	if (ret)
+		goto out;
+	ret = test_admit_recorded(fs_info);
+	if (ret)
+		goto out;
+	ret = test_pin_keeps_record(fs_info);
+	if (ret)
+		goto out;
+	ret = test_recover_names_pinned(fs_info);
+	if (ret)
+		goto out;
+	ret = test_straddling_half_kept(fs_info);
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);

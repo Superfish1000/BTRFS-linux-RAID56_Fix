@@ -4246,6 +4246,18 @@ static unsigned int repair_hold_ms;
 module_param_named(raid56_repair_hold_ms, repair_hold_ms, uint, 0644);
 MODULE_PARM_DESC(raid56_repair_hold_ms,
 		 "Hold each repair this many ms before it writes (testing only)");
+
+/*
+ * Testing only: hold every write that is not a repair this many ms once its
+ * bios have completed, before the write-intent log hears of it -- its record,
+ * or a full stripe's unlogged one, stays in flight meanwhile -- for as long as
+ * this is set.  See uml/fullstripe_flush.sh (inflight), uml/flush_wedge.sh
+ * (hot).
+ */
+static unsigned int write_hold_ms;
+module_param_named(raid56_write_hold_ms, write_hold_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_write_hold_ms,
+		 "Hold each write this many ms once its bios have completed, before the write-intent log hears of it (testing only)");
 #else
 /* Constants, not macros: see rmw_no_repair. */
 static const bool no_repair_on_fault;
@@ -4709,7 +4721,7 @@ static u64 rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 }
 
 static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
-			    int crash_point)
+			    int crash_point, bool *pinned)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 	const int data_sectors = rbio->nr_data * rbio->stripe_nsectors;
@@ -4798,7 +4810,20 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 		      full_stripe_start);
 #endif
 
-	/* Each such column matches the parity again; say so, durably. */
+	/*
+	 * Each such column matches the parity again; say so, durably.  And
+	 * keep the record from being spent until this write's own mark makes
+	 * it in flight (rmw_rbio()), or the names are put back: what it says
+	 * then is sticky only, the first thing a full log spends, and spent
+	 * in between, the put-back below finds no entry -- the log on disk
+	 * still names the column, memory does not, and the next write skips
+	 * this phase.
+	 */
+	if (!btrfs_wib_repair_leaves_unpinned()) {
+		btrfs_wib_pin(fs_info, full_stripe_start,
+			      (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT, true);
+		*pinned = true;
+	}
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		const int first = stripe * rbio->stripe_nsectors;
 		bool all = true;
@@ -4842,6 +4867,11 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 						full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
 						BTRFS_STRIPE_LEN);
 		}
+		if (*pinned) {
+			btrfs_wib_pin(fs_info, full_stripe_start,
+				      (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT, false);
+			*pinned = false;
+		}
 		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
 			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
 		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
@@ -4872,6 +4902,8 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	bool refused = false;
 	/* Refused in phase A, before the write was recorded in flight. */
 	bool repair_refused = false;
+	/* Its record kept from being spent until the mark (rmw_repair_first()). */
+	bool pinned = false;
 	/* The data and parity were submitted: the record can be updated. */
 	bool phase_b = false;
 	int crash_point = 0;
@@ -5042,7 +5074,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 #endif
 
 	if (!READ_ONCE(rmw_single_phase)) {
-		ret = rmw_repair_first(rbio, full_stripe_start, crash_point);
+		ret = rmw_repair_first(rbio, full_stripe_start, crash_point, &pinned);
 		if (ret < 0) {
 			refused = true;
 			repair_refused = !logged;
@@ -5056,9 +5088,17 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 */
 	if (record && !logged) {
 		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
+		if (pinned) {
+			btrfs_wib_pin(fs_info, full_stripe_start, full_stripe_len, false);
+			pinned = false;
+		}
 		if (ret < 0)
 			goto out;
 		logged = true;
+	}
+	if (pinned) {
+		btrfs_wib_pin(fs_info, full_stripe_start, full_stripe_len, false);
+		pinned = false;
 	}
 
 	index_rbio_pages(rbio);
@@ -5093,6 +5133,17 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	if (unlikely(crash_point == 1 || crash_point == 2))
 		panic("btrfs: raid56 crash injection %d at full stripe %llu",
 		      crash_point, full_stripe_start);
+	if (unlikely(READ_ONCE(write_hold_ms)) &&
+	    !test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
+		const unsigned int hold = READ_ONCE(write_hold_ms);
+
+		if (hold) {
+			btrfs_info(fs_info,
+		"raid56: write of full stripe %llu holding for %u ms with its bios completed",
+				   full_stripe_start, hold);
+			msleep(hold);
+		}
+	}
 #endif
 
 	/*
@@ -5296,12 +5347,14 @@ out:
 	 * (it was allocated whole), so whatever the record says about it is
 	 * over.  Left in place, a stale mark keeps diverting reads of the new
 	 * data to a rebuild the record then calls undecidable: EIO for good.
-	 * Such a write is not logged, so nothing else would clear it.
+	 * Such a write is not logged, so nothing else would clear it.  But not
+	 * what a flush that failed while its bios were in flight named: the
+	 * write may have gone into the cache the device then lost.
 	 */
 	if (!logged && ret >= 0 && rbio_is_full(rbio) &&
 	    bitmap_empty(rbio->error_bitmap, rbio->nr_sectors) &&
 	    unlikely(btrfs_wib_any_stale(fs_info)))
-		btrfs_wib_clear_sticky(fs_info, full_stripe_start, full_stripe_len);
+		btrfs_wib_clear_written(fs_info, full_stripe_start, full_stripe_len);
 
 	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
 		raid56_repair_finished(rbio, ret, faulted);

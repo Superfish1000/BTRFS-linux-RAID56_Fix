@@ -3116,6 +3116,11 @@ degraded_log_full)
 			log "CONTROL_KNOB_FAIL"
 		log "control: raid56_wf_evict_stage0=1, a full log spends records as stage 0 did"
 	}
+	[ "${CONTROL:-0}" = 2 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_spend_straddling_half 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_spend_straddling_half=1, a full log spends the unnamed half of a named stripe"
+	}
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.dlf
 	: > $T/umltest/dlf.acked.$TAG
@@ -3217,6 +3222,18 @@ degraded_log_full)
 	else
 		dd if=/dev/zero bs=1M count=$(( ${NREG:-120} * 4 + 16 )) status=none | tr '\000' 'A' > $MNT/nocow
 		sync
+		# A full stripe past the regions written below that runs from one
+		# 4 MiB region into the next: written first, its record is two
+		# entries, one of them naming the missing device's member and the
+		# other nothing -- which a full log must not spend as a record
+		# that names nothing (the straddle arm spends it).
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 16 \
+			$(( (${NREG:-120} * 4 + 16) * 16 )) region > $T/umltest/dlf.rows.$TAG 2>&1
+		straddle=$(awk -v from=$(( (${NREG:-120} + 1) * 1024 )) '$2 >= from && $5 ~ /:1$/ {
+			out = ""
+			for (k = 6; k <= NF; k++) { split($k, m, ":"); if (m[1] >= 0) out = out " " m[1] }
+			print out; exit }' $T/umltest/dlf.rows.$TAG)
+		[ -n "$straddle" ] || { log "LAYOUT_FAIL no straddling stripe: $(head -2 $T/umltest/dlf.rows.$TAG | tr '\n' ' ')"; finish; }
 		umount $MNT || { log "UMOUNT_FAIL"; finish; }
 		# Pull the last device: remove its dm node and let btrfs forget it.
 		last=$(( $(echo $DMDEVS | wc -w) - 1 ))
@@ -3228,6 +3245,10 @@ degraded_log_full)
 		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
 		log "mounted degraded without d$last: $(grep " $MNT " /proc/mounts | awk '{print $4}')"
 		ok=0; eio=0
+		for b in $straddle; do
+			if dlf_write $b; then ok=$((ok+1)); else eio=$((eio+1)); fi
+		done
+		log "straddling stripe written first: blocks$straddle (ok=$ok eio=$eio)"
 		for r in $(seq 0 $(( ${NREG:-120} - 1 ))); do
 			for c in 0 1 2; do
 				if dlf_write $(( r * 1024 + c * 16 )); then
@@ -3237,7 +3258,7 @@ degraded_log_full)
 				fi
 			done
 		done
-		log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 ))"
+		log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 + $(echo $straddle | wc -w) ))"
 		# Before the metadata: once a transaction aborts, the tree blocks
 		# it did not write read back as EIO.
 		dlf_read
@@ -3266,7 +3287,7 @@ degraded_log_full)
 		log "DLF after the scrub: a write into a new region $fresh, stale_marks=$(hv stale_marks)"
 	fi
 	echo "$ok $eio $meta $ro $(hv record_dropped) $(hv log_full) $acked $rok $reio $rbad $fresh" \
-	     "$(wv stale_evicted)" > $T/umltest/dlf.$TAG
+	     "$(wv stale_evicted) $(wv sticky_evicted)" > $T/umltest/dlf.$TAG
 	kmsg "raid56|forced readonly|Transaction aborted" 8
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
@@ -4688,18 +4709,40 @@ fullstripe_flush_prep)
 	# never committed.  CONTROL=1 sets raid56_wf_full_stripe_unnamed=1:
 	# nothing is named, the commit goes on, and the blocks of FAIL's column
 	# read back as the zeros on its platter, with no error.
+	#
+	# FF_INFLIGHT=1: the file is FF_KB KiB (three full stripes), written in
+	# one go, and every write held FF_HOLD_MS once its bios have completed
+	# (raid56_write_hold_ms) -- in flight, as far as the log knows.  Then
+	# FAIL fails writes and flushes, and an fsync of another file (notreelog:
+	# a transaction commit, which does not wait for the file's ordered
+	# extent) has its barrier fail on FAIL while the writes are held: the
+	# failed flush names FAIL's member in each full stripe, with the write
+	# in flight.  Once the hold ends, each write finishes on every device,
+	# which clears what the record says of its stripe -- but not that name
+	# (@hold).  FAIL is healed, so the commit that references the file has
+	# a barrier every device confirms, and nothing names FAIL again: every
+	# block reads back as 'B', here and after the crash.
+	# CONTROL=2 sets raid56_wf_full_stripe_clears_hold=1: the completion
+	# clears the name, and the blocks of FAIL's column read back as zeros.
 	watchdog ${WATCH:-900}
 	dm_setup
 	set -- $DMDEVS
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
-	do_mount $OPTS,nossd,nodatasum,commit=600 $1
+	mo=$OPTS,nossd,nodatasum,commit=600
+	[ "${FF_INFLIGHT:-0}" = 1 ] && mo=$mo,notreelog,thread_pool=8
+	do_mount $mo $1
 	echo 600000 > /sys/module/btrfs/parameters/raid56_repair_delay_ms 2>/dev/null ||
 		log "DELAY_KNOB_FAIL"
 	if [ "${CONTROL:-0}" = 1 ]; then
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_full_stripe_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: a failed flush names nothing of the full stripes written copy-on-write"
+	fi
+	if [ "${CONTROL:-0}" = 2 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_full_stripe_clears_hold 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a full stripe's completion clears the names a failed flush put on while it was in flight"
 	fi
 	touch $MNT/marker0
 	sync
@@ -4711,14 +4754,43 @@ fullstripe_flush_prep)
 	dd if=/dev/zero bs=1M count=1 status=none | tr '\000' 'B' > /tmp/B1M
 	c0=$(commits); f0=$(pv full_stripe_writes); s0=$(pv sub_stripe_writes)
 	dm_drop_writes $FAIL; log "device $FAIL drops every write"
-	for i in $(seq 1 $FF_MB); do cat /tmp/B1M; done |
-		dd of=$MNT/full bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
-	wrc=$?
-	c1=$(commits); f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
-	acked=$(stat -c %s $MNT/full 2>/dev/null)
-	log "file of $FF_MB MiB written: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits $((c1 - c0))"
-	log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
-	dm_error_writes $FAIL; log "device $FAIL fails writes and flushes"
+	held=-; fsrc=-; named_fly=-; named_landed=-
+	if [ "${FF_INFLIGHT:-0}" = 1 ]; then
+		echo ${FF_HOLD_MS:-12000} > /sys/module/btrfs/parameters/raid56_write_hold_ms ||
+			log "HOLD_KNOB_FAIL"
+		head -c $((FF_KB * 1024)) /tmp/B1M |
+			dd of=$MNT/full bs=${FF_KB}K iflag=fullblock oflag=direct status=none \
+			2>/dev/null &
+		wpid=$!
+		sleep 3
+		held=$(dmesg | grep -c "with its bios completed")
+		c1=$(commits)
+		dm_error_writes $FAIL; log "device $FAIL fails writes and flushes, $held write(s) held"
+		# Inline: a data write would be held too, and the fsync with it.
+		dd if=/dev/zero of=$MNT/m bs=512 count=1 conv=fsync status=none 2>/dev/null
+		fsrc=$?
+		named_fly=$(hv stale_marks)
+		echo 0 > /sys/module/btrfs/parameters/raid56_write_hold_ms
+		wait $wpid
+		wrc=$?
+		named_landed=$(hv stale_marks)
+		# Its flushes work again: nothing but the names says what the
+		# cache it lost held, the next barrier going through.
+		dm_heal $FAIL
+		f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
+		acked=$(stat -c %s $MNT/full 2>/dev/null)
+		log "file of $FF_KB KiB written, held in flight across an fsync (rc $fsrc) whose barrier failed: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits before $((c1 - c0)), stale marks with the writes in flight $named_fly, once they landed $named_landed"
+		log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
+	else
+		for i in $(seq 1 $FF_MB); do cat /tmp/B1M; done |
+			dd of=$MNT/full bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
+		wrc=$?
+		c1=$(commits); f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
+		acked=$(stat -c %s $MNT/full 2>/dev/null)
+		log "file of $FF_MB MiB written: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits $((c1 - c0))"
+		log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
+		dm_error_writes $FAIL; log "device $FAIL fails writes and flushes"
+	fi
 	sync -f $MNT/full 2>/dev/null
 	src=$?
 	c2=$(commits)
@@ -4732,6 +4804,7 @@ fullstripe_flush_prep)
 	out="$out sync_rc=$src commits_sync=$((c2 - c1)) writable_after=$wr flush_errs=$fl"
 	out="$out stale_marks=$(hv stale_marks) unnamed=$(hv full_stripe_flush_unnamed)"
 	out="$out state=$(hv state) new=$new old=$old eio=$eio other=$other size=$size"
+	out="$out held=$held fsync_rc=$fsrc named_fly=$named_fly named_landed=$named_landed"
 	log "FF_PREP $out"
 	echo "$out" > $T/umltest/ffp.$TAG
 	# No umount: the crash.
@@ -5363,6 +5436,15 @@ flush_wedge)
 	#   the default leaves no such log, as unnamed shows.  busy runs with
 	#   raid56_wf_admit_narrow=1 in both arms as well: the default admits no
 	#   write into a log holding more such records than a wide block does.
+	#   PLAN=hot (FW_REGIONS 165, as torn): instead of the writes one at a
+	#            time, a write into one of the recorded regions, held in
+	#            flight FW_HOLD_MS once its bios have completed
+	#            (raid56_write_hold_ms), then one write into a new region
+	#     fixed    that write fails at once (log_full): the write in flight
+	#              leaves its record, which may not be spent, and frees
+	#              nothing
+	#     control  raid56_wf_room_any_write=1: it waits for the write in
+	#              flight to finish before it fails the same way
 	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
@@ -5384,6 +5466,7 @@ flush_wedge)
 	case "$PLAN" in
 	named) knob=raid56_wf_readd_no_repair; FW_REGIONS=${FW_REGIONS:-82};;
 	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
+	hot) knob=raid56_wf_room_any_write; FW_REGIONS=${FW_REGIONS:-165};;
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
 	      FW_REGIONS=${FW_REGIONS:-164};;
 	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-165};;
@@ -5406,7 +5489,7 @@ flush_wedge)
 	# checks the wait for the one slot a write in flight frees in a log that
 	# holds 164 of them: both arms admit writes against the narrow layout,
 	# which the default does not (commit_full) -- it refuses them all.
-	case "$PLAN" in torn|busy)
+	case "$PLAN" in torn|busy|hot)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 	esac
@@ -5488,6 +5571,41 @@ flush_wedge)
 	log "FW repairs after ${t}s: queued=$(wv repair_queued) ok=$(wv repair_ok)" \
 	    "failed=$(wv repair_failed) dropped=$(wv repair_dropped) gave_up=$(hv repair_gave_up)" \
 	    "sticky_blocks=$(wv sticky_blocks) stale_marks=$(hv stale_marks)"
+	if [ "$PLAN" = hot ]; then
+		b0=$(head -1 $T/umltest/fw.acked.$TAG)
+		fb=$(awk -v n=$FW_REGIONS '$1 == n {print $3}' $T/umltest/fw.targets.$TAG)
+		tb=$(wv torn_blocks); full0=$(hv log_full)
+		echo ${FW_HOLD_MS:-20000} > /sys/module/btrfs/parameters/raid56_write_hold_ms ||
+			log "HOLD_KNOB_FAIL"
+		( dd if=$BB of=$MNT/nocow bs=4096 seek=${b0:-0} count=1 oflag=direct \
+		     conv=notrunc status=none 2>/dev/null && echo ok || echo eio ) \
+			> $T/umltest/fw.hres.$TAG &
+		hpid=$!
+		sleep 3
+		held=$(dmesg | grep -c "with its bios completed")
+		echo 0 > /sys/module/btrfs/parameters/raid56_write_hold_ms
+		log "a write into recorded block $b0 held in flight ($held), torn_blocks $tb;" \
+		    "a write into new block $fb"
+		start=$(date +%s)
+		dd if=$BB of=$MNT/nocow bs=4096 seek=${fb:-0} count=1 oflag=direct conv=notrunc \
+		   status=none 2>/dev/null && frc=ok || frc=eio
+		secs=$(( $(date +%s) - start ))
+		# Not a bare wait: the watchdog is a child too.
+		wait $hpid
+		hrc=$(cat $T/umltest/fw.hres.$TAG 2>/dev/null)
+		kmsg "write-intent log full|still full|raid56:" 6
+		log "FW hot new write $frc in ${secs}s, held write ${hrc:-?}, log_full $full0 -> $(hv log_full)," \
+		    "record_dropped $(hv record_dropped), torn_blocks $(wv torn_blocks)"
+		echo "${held:-0} $frc $secs ${hrc:-?} $(( $(hv log_full) - ${full0:-0} )) $(hv record_dropped) $tb" \
+			> $T/umltest/fw.hot.res.$TAG
+		echo "$acked $fl ${named:-0} ${torn:-0} 0 0 0 0 0 0 0 0 $(hv log_full)" \
+		     "$(hv record_dropped) $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $secs" \
+			> $T/umltest/fw.$TAG
+		rm -f $BB $T/umltest/fw.hres.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		dmsetup remove_all 2>/dev/null
+		finish
+	fi
 	if [ "$PLAN" = busy ]; then
 		# Rows past the targets' whose full stripe lies in one region
 		# and whose parity FAIL holds.

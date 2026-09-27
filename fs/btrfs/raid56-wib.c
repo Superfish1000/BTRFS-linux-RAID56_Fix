@@ -315,6 +315,10 @@ module_param_named(raid56_wf_recovering_stripe_readable, recovering_stripe_reada
 		   0644);
 MODULE_PARM_DESC(raid56_wf_recovering_stripe_readable,
 		 "While the write-intent log recovery decides a full stripe a write may have torn, return rebuilds of it nothing checked to readers other than the recovery (testing only: restores a known defect)");
+static bool recover_names_unpinned;
+module_param_named(raid56_wf_recover_names_unpinned, recover_names_unpinned, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_recover_names_unpinned,
+		 "Let a full write-intent log spend the record of one half of a stripe the recovery keeps while it names the other (testing only: restores a known defect)");
 #else
 static const bool all_records_torn;
 static const bool torn_no_persist;
@@ -328,6 +332,7 @@ static const bool recover_drops_records;
 static const bool missing_parity_keeps_torn;
 static const bool absent_decided_keeps_torn;
 static const bool recovering_stripe_readable;
+static const bool recover_names_unpinned;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -380,6 +385,11 @@ bool btrfs_wib_reload_verdicts_plain(void)
 bool btrfs_wib_recover_drops_records(void)
 {
 	return READ_ONCE(recover_drops_records);
+}
+
+bool btrfs_wib_recover_names_unpinned(void)
+{
+	return READ_ONCE(recover_names_unpinned);
 }
 #endif
 
@@ -541,15 +551,15 @@ static bool wib_entry_verdict(const struct btrfs_wib_entry *e)
  *
  * A set that cannot be described cannot be written.  btrfs_wib_build_block()
  * returns -ENOSPC and leaves the block zeroed with no magic, and its callers
- * are not all in a position to notice: wib_flush_and_drop_locked() asserts
- * that it fits and then hands the block on as the snapshot of what was in
+ * were not all in a position to notice: wib_flush_and_drop_locked() asserted
+ * that it fits and then handed the block on as the snapshot of what was in
  * flight, so on a kernel built without CONFIG_BTRFS_ASSERT an empty snapshot
- * is taken to mean nothing was in flight, and stripes that finished after the
- * flush are dropped from the log without a flush having covered them.  That is
- * the write hole this log exists to close, reopened by a capacity accident.
+ * was taken to mean nothing was in flight, and stripes that finished after the
+ * flush were dropped from the log without a flush having covered them.  That
+ * is the write hole this log exists to close, reopened by a capacity accident.
  *
- * So the live set is capped here instead, and the assertion is allowed to be
- * true.
+ * So the live set is capped here instead -- and where it cannot be, what
+ * cannot be written fails (wib_flush_and_drop_locked(), btrfs_wib_commit()).
  */
 static u32 wib_live_max(const struct btrfs_wib *wib)
 {
@@ -707,6 +717,47 @@ static bool failed_leaves_flight;
 module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
 		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
+/*
+ * raid56_wf_spend_straddling_half=1: a full log spends the half of a stripe
+ * straddling two regions that names nothing while the other half names a
+ * member, as a record that names nothing, as before (wib_entry_half_named()):
+ * a false record_dropped, and a stripe a scrub then declines as partly
+ * recorded.  The negative control for uml/degraded_log_full.sh (straddle).
+ */
+static bool spend_straddling_half;
+module_param_named(raid56_wf_spend_straddling_half, spend_straddling_half, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_spend_straddling_half,
+		 "Let a full write-intent log spend the half of a stripe straddling two regions that names nothing while the other half names a member (testing only: restores a known defect)");
+/*
+ * raid56_wf_repair_leaves_unpinned=1: a write that cleared what the record
+ * names after writing it back (rmw_repair_first()) leaves the record
+ * sticky-only and spendable until its own mark, as before (btrfs_wib_pin()).
+ * The negative control for test_pin_keeps_record().
+ */
+static bool repair_leaves_unpinned;
+module_param_named(raid56_wf_repair_leaves_unpinned, repair_leaves_unpinned, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_repair_leaves_unpinned,
+		 "Let a full write-intent log spend the record a write cleared after writing back what it named, before the write's own mark (testing only: restores a known defect)");
+/*
+ * raid56_wf_admit_recorded_free=1: a write into a region the log records only
+ * as room to spend is admitted uncharged, as before (wib_count_entries_locked()),
+ * and can leave more regions that may not be spent than a wide block
+ * describes.  The negative control for test_admit_wide().
+ */
+static bool admit_recorded_free;
+module_param_named(raid56_wf_admit_recorded_free, admit_recorded_free, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_admit_recorded_free,
+		 "Admit a write into a region the write-intent log records only as room to spend without charging for it (testing only: restores a known defect)");
+/*
+ * raid56_wf_flush_drop_asserts=1: wib_flush_and_drop_locked() asserts, as
+ * before, that the set it snapshots fits a block -- a BUG() on a kernel with
+ * CONFIG_BTRFS_ASSERT where the set is more than a block describes, which a
+ * commit fails instead (R2).
+ */
+static bool flush_drop_asserts;
+module_param_named(raid56_wf_flush_drop_asserts, flush_drop_asserts, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_flush_drop_asserts,
+		 "Assert that the set a flush-and-drop of the write-intent log snapshots fits a block (testing only: restores a crash on CONFIG_BTRFS_ASSERT kernels)");
 #else
 static const bool evict_naming;
 static const bool keep_naming_degraded;
@@ -718,6 +769,10 @@ static const bool torn_spent_eagerly;
 static const bool kept_torn_in_order;
 static const bool admit_narrow;
 static const bool failed_leaves_flight;
+static const bool admit_recorded_free;
+static const bool flush_drop_asserts;
+static const bool repair_leaves_unpinned;
+static const bool spend_straddling_half;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -767,11 +822,32 @@ bool btrfs_wib_admits_narrow(void)
 	return READ_ONCE(admit_narrow);
 }
 
+bool btrfs_wib_admits_recorded_free(void)
+{
+	return READ_ONCE(admit_recorded_free);
+}
+
+bool btrfs_wib_flush_drop_asserts(void)
+{
+	return READ_ONCE(flush_drop_asserts);
+}
+
+bool btrfs_wib_spends_straddling_half(void)
+{
+	return READ_ONCE(spend_straddling_half);
+}
+
 bool btrfs_wib_failed_leaves_flight(void)
 {
 	return READ_ONCE(failed_leaves_flight);
 }
 #endif
+
+/* rmw_repair_first(): see @pin in struct btrfs_wib_entry. */
+bool btrfs_wib_repair_leaves_unpinned(void)
+{
+	return READ_ONCE(repair_leaves_unpinned);
+}
 
 /*
  * May a full log spend a record that names a stale member?  Not while that
@@ -871,15 +947,64 @@ static bool wib_entry_kept_torn(const struct btrfs_wib_entry *e)
 }
 
 /*
+ * Is @e, naming nothing, perhaps the half of a full stripe straddling two
+ * regions whose other half names a member?  A name goes on the entry of the
+ * block it names (wib_name_region(), rmw_update_stale_data()), so the record
+ * of a straddling stripe is two entries, and only one of them may name
+ * anything.  Spent as a record that names nothing, the other half raised a
+ * record_dropped nothing warranted, and made the stripe one only partly
+ * recorded (BTRFS_WIB_STRIPE_PARTIAL_ERROR), which a scrub declines where a
+ * column holds data without a checksum -- the scrub the log_full alert asks
+ * for.
+ *
+ * Told without the chunk map, which is not walked under the lock: a stripe
+ * straddles from the last block of a region into the first of the next, so
+ * the runs of recorded blocks at either side of the boundary are what may be
+ * one stripe; any name in the neighbour's run counts.  More than the stripe,
+ * never less.  Caller holds wib->lock.
+ */
+static bool wib_entry_half_named(struct btrfs_wib *wib, const struct btrfs_wib_entry *e)
+{
+	const struct btrfs_wib_entry *n;
+
+	if (READ_ONCE(spend_straddling_half) || wib_entry_names_member(e))
+		return false;
+	if (e->sticky & BIT_ULL(63)) {
+		n = wib_find_entry(wib, e->bytenr + BTRFS_WIB_ENTRY_SIZE);
+		if (n && (n->sticky & 1)) {
+			const u64 run = n->sticky == U64_MAX ? U64_MAX :
+					(n->sticky ^ (n->sticky + 1)) >> 1;
+
+			if ((n->stale | n->stale_par | n->torn) & run)
+				return true;
+		}
+	}
+	if ((e->sticky & 1) && e->bytenr >= BTRFS_WIB_ENTRY_SIZE) {
+		n = wib_find_entry(wib, e->bytenr - BTRFS_WIB_ENTRY_SIZE);
+		if (n && (n->sticky & BIT_ULL(63))) {
+			const u64 ones = 64 - fls64(~n->sticky);
+			const u64 run = ones >= 64 ? U64_MAX : GENMASK_ULL(63, 64 - ones);
+
+			if ((n->stale | n->stale_par | n->torn) & run)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * May a full log evict @e?  See wib_may_evict_naming().  With every device
  * there, a record that only says a write may have been torn only if
- * @spend_torn: see wib_entry_torn_only().
+ * @spend_torn: see wib_entry_torn_only().  Nor the half of a stripe whose
+ * other half names a member (wib_entry_half_named()).
  */
-static bool wib_evictable(const struct btrfs_wib *wib, const struct btrfs_wib_entry *e,
+static bool wib_evictable(struct btrfs_wib *wib, const struct btrfs_wib_entry *e,
 			  bool spend_torn)
 {
-	return !e->bitmap && (wib->may_evict_naming || !wib_entry_names_member(e) ||
-			      (spend_torn && wib_entry_torn_only(e)));
+	return !e->bitmap && !e->pin &&
+	       (wib->may_evict_naming ||
+		(!wib_entry_names_member(e) && !wib_entry_half_named(wib, e)) ||
+		(spend_torn && wib_entry_torn_only(e)));
 }
 
 static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
@@ -934,9 +1059,10 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			struct btrfs_wib_entry *e = &wib->entries[i];
 			bool lost;
 
-			if (e->bitmap || !e->sticky)
+			if (e->bitmap || e->pin || !e->sticky)
 				continue;
-			if (pass == 0 && wib_entry_names_member(e))
+			if (pass == 0 &&
+			    (wib_entry_names_member(e) || wib_entry_half_named(wib, e)))
 				continue;
 			if (pass >= 1 && !wib->may_evict_naming &&
 			    (!wib_entry_torn_only(e) || (pass == 1 && wib_entry_kept_torn(e))))
@@ -1000,6 +1126,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			e->gen = 0;
 			e->hold = 0;
 			e->hold_par = 0;
+			e->pin = 0;
 			e->torn = 0;
 			e->kept_torn = 0;
 			return e;
@@ -1128,6 +1255,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 		free->gen = 0;
 		free->hold = 0;
 		free->hold_par = 0;
+		free->pin = 0;
 		free->torn = 0;
 		free->kept_torn = 0;
 	}
@@ -1140,6 +1268,15 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
  * sticky-only ones outside the range that can be evicted -- with every
  * device there, those that only say a write may have been torn only if
  * @spend_torn).
+ *
+ * And an entry of the range the log could spend (wib_evictable()) counts as
+ * needed, and as room: once the write is in flight it can no longer be spent,
+ * so it takes a slot of what may not be spent as a new one does.  Not charged,
+ * a write into such a region was admitted whatever was left -- the room came
+ * out at nothing, and nothing more was needed -- and could leave more regions
+ * that may not be spent than a wide block describes: the first name then made
+ * a set no block could describe (wib_admit_max()).  Not so under
+ * raid56_wf_admit_recorded_free=1.
  */
 static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len,
 				     bool spend_torn, unsigned int *needed,
@@ -1151,12 +1288,15 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 	lockdep_assert_held(&wib->lock);
 
 	const u32 max = wib_admit_max(wib);
+	const bool uncharged = READ_ONCE(admit_recorded_free);
 	u32 live = 0, evictable = 0;
 
 	*needed = 0;
 	*avail = 0;
 	for (u64 cur = first; cur <= last; cur += BTRFS_WIB_ENTRY_SIZE) {
-		if (!wib_find_entry(wib, cur))
+		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+
+		if (!e || (!uncharged && wib_evictable(wib, e, spend_torn)))
 			(*needed)++;
 	}
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
@@ -1165,7 +1305,8 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		if (!wib_entry_used(e))
 			continue;
 		live++;
-		if (wib_evictable(wib, e, spend_torn) && (e->bytenr < first || e->bytenr > last))
+		if (wib_evictable(wib, e, spend_torn) &&
+		    (!uncharged || e->bytenr < first || e->bytenr > last))
 			evictable++;
 	}
 	/*
@@ -1202,43 +1343,69 @@ enum wib_room {
 	WIB_ROOM_WRITE,
 };
 
-static enum wib_room wib_room_source_locked(struct btrfs_wib *wib)
+/*
+ * Testing only: any write in flight counts as room a full log waits for, as
+ * before -- one into a region whose record the log may not spend too, which
+ * frees nothing when it finishes: a write into a new region of a log full of
+ * such records waited BTRFS_WIB_FULL_TIMEOUT for the same refusal whenever
+ * one was in flight.  The negative control for uml/flush_wedge.sh (hot).
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool room_any_write;
+module_param_named(raid56_wf_room_any_write, room_any_write, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_room_any_write,
+		 "Let a write into a full write-intent log wait for any write in flight, one whose record stays when it finishes too (testing only: restores a known defect)");
+#else
+static const bool room_any_write;
+#endif
+
+/*
+ * Does the write in flight into @e make room when it finishes?  One into a
+ * region the log holds no record of frees its slot, one into a record the log
+ * may spend leaves room to spend (wib_evictable()) -- with every device there,
+ * one that only says a write may have been torn only if @spend_torn.  One into
+ * a record naming a member, or saying a write may have been torn, leaves it,
+ * and frees nothing.  Caller holds wib->lock, after wib_policy_locked().
+ */
+static bool wib_write_frees_room(struct btrfs_wib *wib,
+				 const struct btrfs_wib_entry *e, bool spend_torn)
+{
+	if (!e->bitmap)
+		return false;
+	if (READ_ONCE(room_any_write))
+		return spend_torn || !e->sticky;
+	return wib->may_evict_naming ||
+	       (!wib_entry_names_member(e) && !wib_entry_half_named(wib, e)) ||
+	       (spend_torn && wib_entry_torn_only(e));
+}
+
+/*
+ * Can room come -- without spending a record that only says a write may have
+ * been torn, unless @spend_torn?  From a write in flight that makes some
+ * (wib_write_frees_room()), or from a repair.  With neither, waiting cannot
+ * help: a log full of records that must stay, with writes in flight only into
+ * those, used to make every write into a new region wait a minute for the same
+ * refusal.
+ */
+static enum wib_room wib_room_source_locked(struct btrfs_wib *wib, bool spend_torn)
 {
 	lockdep_assert_held(&wib->lock);
 
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
-		if (wib->entries[i].bitmap)
+		if (wib_write_frees_room(wib, &wib->entries[i], spend_torn))
 			return WIB_ROOM_WRITE;
 	if (atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr))
 		return WIB_ROOM_REPAIR;
 	return WIB_ROOM_NONE;
 }
 
-/*
- * Can room come without spending a record that only says a write may have been
- * torn?  From a repair, or from a write in flight into a region the log holds
- * no record of: its slot is free once it finishes.  A write into a recorded
- * region leaves the record, and frees nothing.
- */
-static bool wib_room_without_torn_locked(struct btrfs_wib *wib)
-{
-	lockdep_assert_held(&wib->lock);
-
-	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++)
-		if (wib->entries[i].bitmap && !wib->entries[i].sticky)
-			return true;
-	return atomic_read(&wib->repairs_inflight) || READ_ONCE(wib->repair_nr);
-}
-
-/* Unless @spend_torn, see wib_room_without_torn_locked(). */
 static bool wib_can_make_room(struct btrfs_wib *wib, bool spend_torn)
 {
 	unsigned long flags;
 	bool ret;
 
 	spin_lock_irqsave(&wib->lock, flags);
-	ret = spend_torn ? wib_room_source_locked(wib) != WIB_ROOM_NONE :
-			   wib_room_without_torn_locked(wib);
+	ret = wib_room_source_locked(wib, spend_torn) != WIB_ROOM_NONE;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return ret;
 }
@@ -2196,6 +2363,12 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 	memset(failed, 0, sizeof(*failed));
 	if (btrfs_test_opt(wib->fs_info, NOBARRIER))
 		return 0;
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+	if (btrfs_is_testing(wib->fs_info) && wib->test_flush_fails) {
+		wib_barrier_failed(wib->fs_info, failed);
+		return wib_flush_failed_any(failed) ? 1 : 0;
+	}
+#endif
 	atomic64_inc(&wib->stat_commit_flushes);
 	/*
 	 * A flush that could not even be submitted (-ENOMEM) names nobody: no
@@ -2692,14 +2865,49 @@ static bool full_stripe_unnamed;
 module_param_named(raid56_wf_full_stripe_unnamed, full_stripe_unnamed, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_full_stripe_unnamed,
 		 "Let a failed flush name nothing of the full stripes written copy-on-write since the device last confirmed one, and let the commit go on (testing only: restores a known defect)");
+/*
+ * Testing only: a full stripe written copy-on-write that landed everywhere
+ * clears every mark of its stripe, as before, the names a failed flush put on
+ * while it was in flight (@hold) too -- the only record of what the device may
+ * have lost from its cache, the flush having taken them out of the write's
+ * unlogged record: the column reads back as it was, with no error.  The
+ * negative control for uml/fullstripe_flush.sh (inflight).
+ */
+static bool full_stripe_clears_hold;
+module_param_named(raid56_wf_full_stripe_clears_hold, full_stripe_clears_hold, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_full_stripe_clears_hold,
+		 "Let a full stripe written copy-on-write clear the names a failed flush put on while it was in flight (testing only: restores a known defect)");
+/*
+ * Testing only: a failed flush that names full stripes written copy-on-write
+ * asks for their repair and raises the device_write_failed notice, as before,
+ * after a readd refused (@readd_refused) -- repairs that cannot land, retried
+ * until one gives up with an alert that blames the device.  The negative
+ * control for test_unlogged_after_refusal().
+ */
+static bool unlogged_repairs_refused;
+module_param_named(raid56_wf_unlogged_repairs_refused, unlogged_repairs_refused, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_unlogged_repairs_refused,
+		 "Let a failed flush that names full stripes written copy-on-write ask for repairs after a readd refused, which cannot land (testing only: restores a known defect)");
 #else
 static const bool full_stripe_unnamed;
+static const bool full_stripe_clears_hold;
+static const bool unlogged_repairs_refused;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 bool btrfs_wib_full_stripe_unnamed(void)
 {
 	return READ_ONCE(full_stripe_unnamed);
+}
+
+bool btrfs_wib_full_stripe_clears_hold(void)
+{
+	return READ_ONCE(full_stripe_clears_hold);
+}
+
+bool btrfs_wib_unlogged_repairs_refused(void)
+{
+	return READ_ONCE(unlogged_repairs_refused);
 }
 #endif
 
@@ -2775,10 +2983,25 @@ u64 btrfs_wib_note_full_stripe(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(full_stripe_start); cur < end;
 	     cur += BTRFS_WIB_ENTRY_SIZE, i++) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		struct btrfs_wib_unlogged *u = NULL;
 		u64 c = cols;
 		u32 p = par;
 
+		/*
+		 * Release @hold, as a logged write's mark does
+		 * (wib_try_mark_locked()): this write starts after any flush
+		 * that failed while an earlier one was in flight, and rewrites
+		 * every member, so the marks its completion clears
+		 * (btrfs_wib_clear_written()) are its to clear.
+		 */
+		if (e && !READ_ONCE(full_stripe_clears_hold)) {
+			const u64 mask = btrfs_wib_range_mask(cur, full_stripe_start,
+							      end - full_stripe_start);
+
+			e->hold &= ~mask;
+			e->hold_par &= ~mask;
+		}
 		/* A column past the 64th has no bit to be named by. */
 		if (wib->enabled && nr_data <= 64)
 			u = wib_unlogged_get(wib, cur);
@@ -4141,7 +4364,15 @@ static void wib_unlogged_name(struct btrfs_wib *wib,
 	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 
-	if (nr_named) {
+	/*
+	 * Not once a readd refused, in this drop or before (@readd_refused):
+	 * the log on the devices stays as it is, so no repair lands -- each
+	 * would retry and give up with an alert that blames the device -- and
+	 * the notice would promise one.  The names stay, in memory, for the
+	 * reads (see wib_readd_dropped()).
+	 */
+	if (nr_named &&
+	    (!READ_ONCE(wib->readd_refused) || READ_ONCE(unlogged_repairs_refused))) {
 		nofs_flag = memalloc_nofs_save();
 		for (u32 i = 0; i < nr; i++)
 			if (un[i].names.repair)
@@ -4388,18 +4619,22 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 		 */
 		ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
 		/*
-		 * The in-memory set always fits: wib_live_max() caps it at what
-		 * the current layout can describe, and wib_enforce_capacity_locked()
-		 * re-establishes that whenever a stale bit halves the cap.
+		 * The in-memory set may be more than a block describes: the
+		 * first name makes every block wide, and wib_enforce_capacity_locked()
+		 * gets the set there only by spending what may be spent, which
+		 * with every record naming a member, in flight or saying a write
+		 * may have been torn is nothing (wib_admit_max()).  The caller
+		 * fails then, and a transaction commit with it, read-only
+		 * (btrfs_wib_commit()): not a BUG().
 		 *
-		 * Check it anyway rather than only asserting.  ASSERT() compiles
-		 * away without CONFIG_BTRFS_ASSERT, and the block handed on from
-		 * here is the snapshot of what was in flight: a failed build
-		 * leaves it zeroed with no magic, which reads as "nothing was in
-		 * flight" and drops stripes that no flush covered.  Refusing the
-		 * commit costs a failed write; continuing costs the write hole.
+		 * And the block handed on from here is the snapshot of what was
+		 * in flight: a failed build leaves it zeroed with no magic, which
+		 * reads as "nothing was in flight" and drops stripes that no
+		 * flush covered.  Refusing the commit costs a failed write;
+		 * continuing costs the write hole.
 		 */
-		ASSERT(ret == 0);
+		if (READ_ONCE(flush_drop_asserts))
+			ASSERT(ret == 0);
 		if (ret)
 			return ret;
 		flush = wib_flush_all_devices(wib, &wib->flush_failed);
@@ -4548,16 +4783,17 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			 * nothing left to wait for, and fail a write that now
 			 * fits.
 			 */
-			room = wib_room_source_locked(wib);
 			/*
 			 * Nothing else can make room: spend a record that only
 			 * says a write may have been torn, if there is one
 			 * (wib_entry_torn_only()).
 			 */
-			if (!owed && !spend_torn && !wib_room_without_torn_locked(wib)) {
+			if (!owed && !spend_torn &&
+			    wib_room_source_locked(wib, false) == WIB_ROOM_NONE) {
 				spend_torn = true;
 				ret = wib_try_mark_locked(wib, logical, len, true);
 			}
+			room = wib_room_source_locked(wib, spend_torn);
 		}
 		if (ret == 0) {
 			/*
@@ -4599,7 +4835,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * neither, the log is full of records that must stay -- they
 		 * name stale data on a device that keeps failing -- and waiting
 		 * would only make every write take a minute to fail.  Fail it
-		 * now, and wait below only while something can still finish.
+		 * now, and wait below only while something can still finish
+		 * that makes room: not a write into one of those records,
+		 * which leaves it (wib_write_frees_room()).
 		 */
 		if (room == WIB_ROOM_NONE) {
 			btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_FULL, logical, NULL, 0);
@@ -4730,6 +4968,26 @@ void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	wib_write_done(fs_info, logical, len, true, !READ_ONCE(failed_leaves_flight));
 }
 
+/* See btrfs_wib_pin().  Caller holds wib->lock. */
+static void wib_pin_locked(struct btrfs_wib *wib, u64 logical, u64 len, bool pin)
+{
+	const u64 end = logical + len;
+
+	lockdep_assert_held(&wib->lock);
+
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const u64 mask = btrfs_wib_range_mask(cur, logical, len);
+
+		if (!e)
+			continue;
+		if (pin)
+			e->pin |= mask;
+		else
+			e->pin &= ~mask;
+	}
+}
+
 static int wib_try_add(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
 		       bool naming)
 {
@@ -4778,7 +5036,8 @@ int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len
 	return wib_try_add(fs_info, logical, len, true);
 }
 
-void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+/* btrfs_wib_add_sticky(), the record pinned (btrfs_wib_pin()) if @pin and kept. */
+static void wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -4789,6 +5048,8 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 
 	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, logical, len);
+	if (!ret && pin)
+		wib_pin_locked(wib, logical, len, true);
 	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret < 0) {
 		if (READ_ONCE(wib->recovery_running) && !READ_ONCE(recover_drops_records)) {
@@ -4804,6 +5065,11 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		return;
 	}
 	btrfs_wib_done(fs_info, logical, len, true);
+}
+
+void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_add_sticky(fs_info, logical, len, false);
 }
 
 /* [@logical, @logical + @len) was fully recovered, forget its error record. */
@@ -4854,6 +5120,33 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	/* The first stale bit halves the capacity; make the set fit it. */
 	wib_enforce_capacity_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
+ * Keep the records of [@logical, @logical + @len) from being spent (@pin), or
+ * let them be again: see @pin in struct btrfs_wib_entry.  Nothing new is
+ * recorded, and a region with no record is left alone.  Unpinned, a record
+ * may be spent again, and the set may be over what the layout of the moment
+ * describes -- a name while it was pinned -- so the capacity is enforced, and
+ * a write waiting for room is told.
+ *
+ * rmw_repair_first() under raid56_wf_repair_leaves_unpinned=1 pins nothing.
+ */
+void btrfs_wib_pin(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+
+	if (!wib)
+		return;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	wib_pin_locked(wib, logical, len, pin);
+	if (!pin)
+		wib_enforce_capacity_locked(wib);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (!pin)
+		wake_up_all(&wib->wait);
 }
 
 /*
@@ -5882,7 +6175,14 @@ bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	return ret;
 }
 
-void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+/*
+ * The stripes of [@logical, @logical + @len) are consistent again: forget what
+ * the record says about them -- but, if @keep_hold, not the names a failed
+ * flush put on while the write that rewrote them was in flight (@hold,
+ * @hold_par in struct btrfs_wib_entry).
+ */
+static void wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
+			     bool keep_hold)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -5913,15 +6213,17 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	}
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const u64 range = btrfs_wib_range_mask(cur, logical, len);
+		u64 mask, mask_par;
 
 		if (!e)
 			continue;
-		e->sticky &= ~btrfs_wib_range_mask(cur, logical, len);
-		if (e->stale & btrfs_wib_range_mask(cur, logical, len)) {
-			atomic_sub(hweight64(e->stale &
-					     btrfs_wib_range_mask(cur, logical, len)),
-				   &wib->nr_stale);
-			e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
+		mask = range & ~(keep_hold ? e->hold : 0);
+		mask_par = range & ~(keep_hold ? e->hold_par : 0);
+		e->sticky &= ~(mask & mask_par);
+		if (e->stale & mask) {
+			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
+			e->stale &= ~mask;
 		}
 		/*
 		 * The stripe is consistent again, so its parity describes the
@@ -5930,16 +6232,14 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * conservative rather than dangerous, but wrong, and it does
 		 * not clear itself.
 		 */
-		wib_set_stale_par(wib, e, e->stale_par &
-				  ~btrfs_wib_range_mask(cur, logical, len));
-		e->hold &= ~btrfs_wib_range_mask(cur, logical, len);
-		e->hold_par &= ~btrfs_wib_range_mask(cur, logical, len);
+		wib_set_stale_par(wib, e, e->stale_par & ~mask_par);
+		e->hold &= ~mask;
+		e->hold_par &= ~mask_par;
 		/* Rewritten or found consistent: nothing in it is torn. */
-		e->torn &= ~btrfs_wib_range_mask(cur, logical, len);
-		e->kept_torn &= ~btrfs_wib_range_mask(cur, logical, len);
-		wib_replace_disown(e, btrfs_wib_range_mask(cur, logical, len),
-				   btrfs_wib_range_mask(cur, logical, len));
-		e->replace_keep &= ~btrfs_wib_range_mask(cur, logical, len);
+		e->torn &= ~range;
+		e->kept_torn &= ~range;
+		wib_replace_disown(e, mask, mask_par);
+		e->replace_keep &= ~mask;
 		if (!wib_entry_used(e))
 			freed = true;
 	}
@@ -5949,6 +6249,27 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	/* That may have been the last one: say so now, not in a minute. */
 	if (READ_ONCE(wib->health) != BTRFS_RAID56_HEALTH_OK)
 		raid56_alert_kick(wib, 0);
+}
+
+void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_clear_sticky(fs_info, logical, len, false);
+}
+
+/*
+ * A full stripe written copy-on-write at [@logical, @logical + @len) landed
+ * on every device: it rewrote every member, so what the record says about
+ * the stripe is over -- except what a flush that failed while its bios were
+ * in flight named (@hold): part of the write may have gone into the cache
+ * the device then lost, and the name, which that flush took out of the
+ * write's unlogged record (wib_unlogged_name()), is all that says so.
+ * Cleared, the column read back as it was, with no error.  A later write of
+ * the stripe releases it (btrfs_wib_note_full_stripe(), wib_try_mark_locked()),
+ * as does a write-back with FUA (btrfs_wib_clear_stale()).
+ */
+void btrfs_wib_clear_written(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_clear_sticky(fs_info, logical, len, !READ_ONCE(full_stripe_clears_hold));
 }
 
 /*
@@ -8778,6 +9099,38 @@ static void wib_readd_stale(struct btrfs_fs_info *fs_info, u64 start, u64 len)
 	}
 }
 
+/*
+ * Keep the stripe at [@start, @start + @len) recorded, with the names the
+ * recovered log carried for it (btrfs_wib_add_sticky(), wib_readd_stale()).
+ * False if the log had no room (@recovery_full).
+ *
+ * Pinned while the names go on (btrfs_wib_pin()).  They go on one at a time,
+ * and the first can make every block wide, which spends what may be spent to
+ * fit (wib_enforce_capacity_locked()) -- the half of a stripe straddling two
+ * regions whose names have yet to go on among it, being a record that names
+ * nothing.  Its names then found no entry, and the mount went on read-write
+ * without them.  Not pinned under raid56_wf_recover_names_unpinned=1.
+ */
+static bool wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	const bool pin = !READ_ONCE(recover_names_unpinned);
+
+	wib_add_sticky(fs_info, start, len, pin);
+	if (READ_ONCE(fs_info->wib->recovery_full))
+		return false;
+	wib_readd_stale(fs_info, start, len);
+	if (pin)
+		btrfs_wib_pin(fs_info, start, len, false);
+	return true;
+}
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	return wib_readd_record(fs_info, start, len);
+}
+#endif
+
 struct wib_recovery_stats {
 	unsigned int done;
 	unsigned int skipped;
@@ -9127,14 +9480,11 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				mode = BTRFS_RAID56_RECOVER_VERIFY;
 			else
 				mode = wib_error_mode();
-			if (mode == BTRFS_RAID56_RECOVER_SCRUB) {
-				btrfs_wib_add_sticky(fs_info, start, len);
-				/* Not scrubbed without it: see @recovery_full. */
-				if (READ_ONCE(wib->recovery_full)) {
-					ret = -ENOSPC;
-					goto out;
-				}
-				wib_readd_stale(fs_info, start, len);
+			/* Not scrubbed without it: see @recovery_full. */
+			if (mode == BTRFS_RAID56_RECOVER_SCRUB &&
+			    !wib_readd_record(fs_info, start, len)) {
+				ret = -ENOSPC;
+				goto out;
 			}
 			/*
 			 * Taken over, now that the live table holds what it
@@ -9161,8 +9511,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				if (ret == 0)
 					btrfs_wib_clear_sticky(fs_info, last_start, last_len);
 			} else if (ret == 1) {
-				btrfs_wib_add_sticky(fs_info, start, len);
-				wib_readd_stale(fs_info, start, len);
+				wib_readd_record(fs_info, start, len);
 			}
 			/*
 			 * Kept, and possibly torn as loaded: it stays so, or

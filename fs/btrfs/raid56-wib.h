@@ -328,18 +328,30 @@ struct btrfs_wib_entry {
 	/*
 	 * In memory only.  The @stale (@hold) and @stale_par (@hold_par) bits
 	 * a failed flush named while the block had a write in flight
-	 * (wib_readd_dropped()).  That write may have landed part of itself
-	 * on the device before the flush failed, into the cache the device
-	 * then lost, and when it completes it clears the marks of every
-	 * column and parity it wrote (rmw_update_stale_data(),
-	 * rmw_update_stale_parity()) -- the very marks that say it may not
-	 * be there.  So those clears leave these bits alone.  A later write
-	 * of the stripe starts after the failed flush and releases them
-	 * (btrfs_wib_try_mark()); so does a write-back with FUA, which no
-	 * lost cache can take away (btrfs_wib_clear_stale(@durable)).
+	 * (wib_readd_dropped(), wib_unlogged_name()).  That write may have
+	 * landed part of itself on the device before the flush failed, into
+	 * the cache the device then lost, and when it completes it clears the
+	 * marks of every column and parity it wrote (rmw_update_stale_data(),
+	 * rmw_update_stale_parity(), btrfs_wib_clear_written()) -- the very
+	 * marks that say it may not be there.  So those clears leave these
+	 * bits alone.  A later write of the stripe starts after the failed
+	 * flush and releases them (btrfs_wib_try_mark(),
+	 * btrfs_wib_note_full_stripe()); so does a write-back with FUA, which
+	 * no lost cache can take away (btrfs_wib_clear_stale(@durable)).
 	 */
 	u64 hold;
 	u64 hold_par;
+	/*
+	 * In memory only.  Blocks whose record a caller keeps from being
+	 * spent for a moment without writing it in flight (btrfs_wib_pin()):
+	 * a write that has cleared what the record names, written back with
+	 * FUA, until its own mark makes it in flight -- or puts the names
+	 * back, if the log cannot say they are cleared; a mount's recovery
+	 * between naming the halves of a stripe that straddles two regions.
+	 * Sticky-only in between, the record was the first a full log spent,
+	 * and what came next found no entry to act on.
+	 */
+	u64 pin;
 	/*
 	 * In memory only.  The @stale (@replace_stale) and @stale_par
 	 * (@replace_stale_par) bits a running device replace set for the
@@ -836,6 +848,14 @@ struct btrfs_wib {
 	 * @commit_mutex.
 	 */
 	bool unlogged_refused;
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+	/*
+	 * The self tests' devices take no IO: with this set, a flush of the
+	 * log's own fails on the devices marked BTRFS_DEV_STATE_FLUSH_FAILED,
+	 * as a transaction commit's barrier does (wib_flush_all_devices()).
+	 */
+	bool test_flush_fails;
+#endif
 	/*
 	 * Under @lock.  The names a readd (@readd_refused) or the naming of
 	 * full stripe writes (@unlogged_refused) refused over could not put on
@@ -1018,11 +1038,15 @@ bool btrfs_wib_evicts_stage0(void);
 bool btrfs_wib_readd_legacy(void);
 bool btrfs_wib_name_unwritten(void);
 bool btrfs_wib_full_stripe_unnamed(void);
+bool btrfs_wib_full_stripe_clears_hold(void);
+bool btrfs_wib_unlogged_repairs_refused(void);
 bool btrfs_wib_all_records_torn(void);
 bool btrfs_wib_torn_no_persist(void);
 bool btrfs_wib_log_unmarked(void);
 bool btrfs_wib_trust_unmarked_log(void);
 bool btrfs_wib_missing_parity_keeps_torn(void);
+bool btrfs_wib_recover_names_unpinned(void);
+bool btrfs_wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len);
 bool btrfs_wib_absent_decided_keeps_torn(void);
 bool btrfs_wib_suspect_as_stale(void);
 bool btrfs_wib_replace_end_clears_verdicts(void);
@@ -1053,6 +1077,9 @@ bool btrfs_wib_admits_narrow(void);
 bool btrfs_wib_latch_volatile(void);
 u32 btrfs_wib_block_latched(const void *block);
 bool btrfs_wib_failed_leaves_flight(void);
+bool btrfs_wib_admits_recorded_free(void);
+bool btrfs_wib_flush_drop_asserts(void);
+bool btrfs_wib_spends_straddling_half(void);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_wib_unrecovered_as_ambiguous(void);
@@ -1107,6 +1134,8 @@ void btrfs_wib_full_stripe_done(struct btrfs_fs_info *fs_info, u64 full_stripe_s
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_pin(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin);
+bool btrfs_wib_repair_leaves_unpinned(void);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
 void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
 			   bool durable);
@@ -1242,6 +1271,7 @@ int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len
 int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_clear_written(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 		       struct btrfs_wib_entry *out);
 
