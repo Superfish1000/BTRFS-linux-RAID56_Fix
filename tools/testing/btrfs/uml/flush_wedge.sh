@@ -47,11 +47,18 @@
 #     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 #              overwrites device 1 dropped read back as the block was before
 #              the acknowledged write, with no error
+#   health  unnamed's refused commit, then raid56_health on the read-only
+#           filesystem
+#     fixed    the log_flush_unnamed alert names device 1 (devid 2): the
+#              devices line lists it, and the action is to unmount and mount
+#              again first, then to replace it, scrub and acknowledge
+#     control  raid56_wf_refusal_health_legacy=1: no device listed, and the
+#              action a scrub, which a read-only filesystem refuses (EROFS)
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed]}
+KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed|health]}
 PLAN=${2:-named}
-case $PLAN in named|torn|busy|unnamed) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in named|torn|busy|unnamed|health) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OPTS=rw,commit=600
 # More RMW workers than the three one CPU gets, or no more than three writes
 # are ever recorded at once (rmw_workers).
@@ -84,6 +91,44 @@ arm() {	# name control
 }
 arm fixed 0
 arm control 1
+if [ $PLAN = health ]; then
+	for a in fixed control; do
+		grep -ah "control:\|FW \|healed\|in-place overwrites\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
+			$T/umltest/fw-$PLAN-$a/log | sed "s/^/  [$a] /"
+	done
+	hres() { cat $T/umltest/fw.health.fw-$PLAN-$1 2>/dev/null || echo "?"; }
+	read -r f_ok f_ro f_fl f_st f_un f_devs f_act <<<"$(hres fixed)"
+	read -r c_ok c_ro c_fl c_st c_un c_devs c_act <<<"$(hres control)"
+	echo "  after the refused commit: read-only fixed $f_ro control $c_ro; unacknowledged" \
+	     "fixed $f_un control $c_un"
+	echo "  devices: fixed $f_devs, control $c_devs"
+	echo "  action: fixed $f_act, control $c_act"
+	case "$f_ok$c_ok" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-control/log &&
+		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
+	for v in "$f_ok:$f_ro:$f_un" "$c_ok:$c_ro:$c_un"; do
+		case "$v" in 0:1:*log_flush_unnamed*) ;; *)
+			echo "RESULT: INCONCLUSIVE -- a commit was not refused read-only with" \
+			     "log_flush_unnamed ($v)"; exit 2;;
+		esac
+	done
+	case "$c_devs:$c_act" in none:scrub_then_ack) ;; *)
+		echo "RESULT: INCONCLUSIVE -- the control did not reproduce the old advice" \
+		     "(devices $c_devs, action $c_act)"; exit 2;;
+	esac
+	case ",$f_devs," in *,2:*) ;; *)
+		echo "RESULT: FAIL -- the refusal's alert does not name devid 2 (devices $f_devs)"; exit 1;;
+	esac
+	case "$f_act" in unmount_then_mount-rw_then_replace-devid-2*_then_ack) ;; *)
+		echo "RESULT: FAIL -- the action on the read-only filesystem is $f_act"; exit 1;;
+	esac
+	echo "RESULT: PASS -- after the refused commit raid56_health lists devid 2 and says to"
+	echo "        unmount and mount again first, then replace it; control: no device, and a"
+	echo "        scrub the read-only filesystem cannot run"
+	exit 0
+fi
 for a in fixed control; do
 	grep -ah "control:\|FW \|FW_\|drops every\|fails writes\|healed\|in-place overwrites\|suspended\|resumed\|KERNEL_SPLAT\|WATCHDOG\|MOUNT_FAIL\|MKFS_FAIL\|LAYOUT_FAIL\|FALLOCATE_FAIL\|DM_RELOAD\|DM_SUSPEND\|DM_RESUME\|KNOB_FAIL" \
 		$T/umltest/fw-$PLAN-$a/log | grep -v FW_READ_BAD | sed "s/^/  [$a] /"

@@ -2281,6 +2281,13 @@ static const bool name_unwritten;
  * wib_commit_failed(): the records only the set holds are acknowledged with
  * nothing on disk.  The negative control for the r2 arm of
  * uml/commit_full.sh.
+ *
+ * raid56_wf_refusal_health_legacy=1: the alerts of a failed flush that fail
+ * every commit from here (log_flush_unnamed, full_stripe_flush_unnamed) name
+ * no device, and raid56_health's action on a filesystem a failed commit made
+ * read-only is what it would be on a writable one -- a scrub, which cannot
+ * run there -- as before.  The negative control for the health plan of
+ * uml/flush_wedge.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2327,6 +2334,10 @@ static bool commit_keeps_previous;
 module_param_named(raid56_wf_commit_keeps_previous, commit_keeps_previous, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_commit_keeps_previous,
 		 "Let a transaction commit that cannot write the write-intent log keep the previous log block and go on (testing only: restores a known defect)");
+static bool refusal_health_legacy;
+module_param_named(raid56_wf_refusal_health_legacy, refusal_health_legacy, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_refusal_health_legacy,
+		 "Name no device in the alerts of a failed flush that fail every commit, and have raid56_health advise a scrub on a filesystem a failed commit made read-only (testing only: restores the old behaviour)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2339,7 +2350,18 @@ static const bool readd_says_each;
 static const bool remount_ro_keeps_inflight;
 static const bool readd_acks_unnamed;
 static const bool commit_keeps_previous;
+static const bool refusal_health_legacy;
 #endif
+
+/*
+ * The devices that did not confirm the flush a refusal is about, for its alert
+ * to name: raid56_health lists them, and its action says which to replace.
+ */
+static const struct btrfs_wib_flush_failed *
+wib_refusal_names(const struct btrfs_wib_flush_failed *failed)
+{
+	return READ_ONCE(refusal_health_legacy) ? NULL : failed;
+}
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 /* The self tests run at load, after the command line has set the knob. */
@@ -3688,13 +3710,17 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 			raid56_alert_failed(fs_info, BTRFS_RAID56_EV_STALE, first,
 					    &wib->readd_owed_failed);
 	}
+	/*
+	 * Latched, both: someone has to look, and acknowledge.  Naming the
+	 * device: refused, nothing else does (no device_write_failed above).
+	 */
+	if (nr_unnamed || refuse)
+		raid56_alert_failed(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0,
+				    wib_refusal_names(&wib->readd_owed_failed));
 	wib_readd_set_owed(wib, plan == WIB_READD_WAIT);
 	if (!wib->readd_owed)
 		memset(&wib->readd_owed_failed, 0, sizeof(wib->readd_owed_failed));
 
-	/* Latched, both: someone has to look, and acknowledge. */
-	if (nr_unnamed || refuse)
-		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
 	if (nr_lost && !refuse)
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_DROPPED, 0, NULL, 0);
 	if (btrfs_is_testing(fs_info))
@@ -3880,7 +3906,8 @@ static void wib_unlogged_name(struct btrfs_wib *wib,
 		btrfs_free_chunk_map(map);
 	/* Latched: someone has to look, and acknowledge. */
 	if (refuse && !was)
-		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_FLUSH_UNLOGGED, 0, NULL, 0);
+		raid56_alert_failed(fs_info, BTRFS_RAID56_EV_FLUSH_UNLOGGED, 0,
+				    wib_refusal_names(failed));
 	if (btrfs_is_testing(fs_info))
 		return;
 	if (nr_named) {
@@ -6686,7 +6713,8 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	 */
 	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed)) {
 		WRITE_ONCE(wib->readd_refused, true);
-		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
+		raid56_alert_failed(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0,
+				    wib_refusal_names(&wib->readd_owed_failed));
 	}
 	owed = wib->readd_owed;
 	mutex_unlock(&wib->commit_mutex);
@@ -7628,6 +7656,7 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 	u64 latch_seq;
 	bool undecidable;
 	bool unrecovered;
+	bool aborted;
 	bool failing;
 	int len = 0;
 
@@ -7704,12 +7733,20 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 			       BIT(BTRFS_RAID56_EV_TORN_UNDECIDABLE))) &&
 		      !READ_ONCE(fs_info->fs_devices->missing_devices) &&
 		      !READ_ONCE(torn_remedy_legacy);
-	len += sysfs_emit_at(buf, len, "action ");
+	/*
+	 * A commit failed and the filesystem is read-only until it is mounted
+	 * again: nothing else can run before that, a scrub or a replace
+	 * least of all.
+	 */
+	aborted = BTRFS_FS_ERROR(fs_info) && !READ_ONCE(refusal_health_legacy);
+	len += sysfs_emit_at(buf, len, "action %s", aborted ? "unmount then mount-rw" : "");
 	if (unrecovered) {
-		len += sysfs_emit_at(buf, len, "mount-rw\n");
+		len += sysfs_emit_at(buf, len, "%s\n", aborted ? "" : "mount-rw");
 	} else if (health == BTRFS_RAID56_HEALTH_FAILING) {
 		bool named = false;
 
+		if (aborted)
+			len += sysfs_emit_at(buf, len, " then ");
 		for (int i = 0; i < BTRFS_RAID56_ALERT_DEVS; i++) {
 			if (!devs[i].devid)
 				continue;
@@ -7723,11 +7760,11 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 				     latched ? " then ack" : "");
 	} else if (health == BTRFS_RAID56_HEALTH_DEGRADED) {
 		/* Once the queue overflowed, waiting will not finish the job. */
-		len += sysfs_emit_at(buf, len, "%s\n",
+		len += sysfs_emit_at(buf, len, "%s%s\n", aborted ? " then " : "",
 				     atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_REPAIR_DROPPED]) ?
 				     "scrub" : "wait-for-repair-or-scrub");
 	} else {
-		len += sysfs_emit_at(buf, len, "none\n");
+		len += sysfs_emit_at(buf, len, "%s\n", aborted ? "" : "none");
 	}
 	return len;
 }

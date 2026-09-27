@@ -5202,6 +5202,13 @@ flush_wedge)
 	#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 	#              overwrites FAIL dropped read back as the block was before,
 	#              with no error
+	#   PLAN=health: unnamed's refused commit, then raid56_health is read on
+	#            the read-only filesystem, and the machine stops
+	#     fixed    the alert names FAIL: the devices line lists it, and the
+	#              action is to unmount and mount again first, then to
+	#              replace it
+	#     control  raid56_wf_refusal_health_legacy=1: no device, and the
+	#              action a scrub, which cannot run on it
 	watchdog ${WATCH:-900}
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -5214,6 +5221,7 @@ flush_wedge)
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
 	      FW_REGIONS=${FW_REGIONS:-163};;
 	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-164};;
+	health) knob=raid56_wf_refusal_health_legacy; FW_REGIONS=${FW_REGIONS:-164};;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
 	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
@@ -5288,6 +5296,23 @@ flush_wedge)
 	btrfs filesystem sync $MNT >/dev/null 2>&1 && fsync_ok=1 || fsync_ok=0
 	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 	fl=$(btrfs device stats $MNT 2>/dev/null | awk '/flush_io_errs/ {s += $2} END {print s + 0}')
+	if [ "$PLAN" = health ]; then
+		sleep 2
+		devs=$(sed -n 's/^devices *//p' $H | tr ' ' ,)
+		act=$(sed -n 's/^action //p' $H | tr ' ' _)
+		unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+		kmsg "did not confirm|write-intent log|raid56:" 6
+		log "FW health after the refused commit: commit_ok=$fsync_ok read_only=$ro" \
+		    "flush_io_errs=$fl state=$(hv state) unacknowledged=$unack devices=${devs:-none}" \
+		    "action=$act"
+		echo "$fsync_ok $ro $fl $(hv state) ${unack:-none} ${devs:-none} $act" \
+			> $T/umltest/fw.health.$TAG
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		sync -f $RES $T/umltest/fw.health.$TAG
+		echo o > /proc/sysrq-trigger
+		sleep 60
+	fi
 	named=$(hv stale_marks); torn=$(wv torn_blocks); queued=$(wv repair_queued)
 	stale1=$(hv device_write_failed)
 	kmsg "did not confirm|write-intent log|raid56:" 6
