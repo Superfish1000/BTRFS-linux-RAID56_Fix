@@ -1881,6 +1881,89 @@ out:
 }
 
 /*
+ * A degraded mount's recovery keeps a RAID6 stripe straddling two regions,
+ * with a data column named in each (btrfs_wib_readd_record()), in a narrow
+ * log full of records that name nothing.  The first name makes every block
+ * wide, which spends records to fit -- and the half whose name has yet to go
+ * on names nothing so far: spent, its name found no entry, and the mount went
+ * on without it.  Pinned while the names go on, both stay.  Under
+ * raid56_wf_recover_names_unpinned=1 the second half is spent.
+ */
+static int test_recover_names_pinned(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool unpinned = btrfs_wib_recover_names_unpinned();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6700;
+	/* Three data columns: the last two blocks of R1, the first of R2. */
+	const u64 r1 = (base + BTRFS_WIB_MAX_ENTRIES_V1) * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r2 = r1 + BTRFS_WIB_ENTRY_SIZE;
+	const u64 start = r2 - 2 * blk;
+	const struct btrfs_wib_entry *e1, *e2;
+	int ret = -EINVAL;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the recovery naming test");
+		return 0;
+	}
+	/* The log read at mount names column 0 in R1 and column 2 in R2. */
+	ret = btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = r1, .sticky = BIT_ULL(62) | BIT_ULL(63), .stale = BIT_ULL(62) });
+	ret |= btrfs_wib_add_pending(wib, &(struct btrfs_wib_entry){
+		.bytenr = r2, .sticky = 0x1, .stale = 0x1 });
+	if (ret) {
+		test_err("add_pending failed");
+		ret = -EINVAL;
+		goto out;
+	}
+	btrfs_wib_finalize_pending(wib);
+	ret = -EINVAL;
+	/* A narrow log full of records that name nothing. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1; i++) {
+		if (!put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, 0, 0x1)) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+	}
+	WRITE_ONCE(wib->recovery_full, false);
+	WRITE_ONCE(wib->recovery_running, true);
+	if (!btrfs_wib_readd_record(fs_info, start, 3 * blk)) {
+		test_err("the recovery found no room for a stripe in a log it may spend");
+		goto out;
+	}
+	e1 = find_live_entry(wib, r1);
+	e2 = find_live_entry(wib, r2);
+	if (unpinned) {
+		if (e2 && (e2->stale & 0x1)) {
+			test_err("raid56_wf_recover_names_unpinned is set, yet the second half kept its name");
+			goto out;
+		}
+		test_msg("raid56_wf_recover_names_unpinned is set: the second half was spent and its name lost, as expected");
+	} else if (!e1 || !(e1->stale & BIT_ULL(62)) || !e2 || e2->stale != 0x1 ||
+		   e1->pin || e2->pin) {
+		test_err("the stripe's names: R1 %d stale 0x%llx, R2 %d stale 0x%llx; expected both",
+			 !!e1, e1 ? e1->stale : 0, !!e2, e2 ? e2->stale : 0);
+		goto out;
+	}
+	ret = 0;
+out:
+	WRITE_ONCE(wib->recovery_running, false);
+	WRITE_ONCE(wib->recovery_full, false);
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES_V1 + 2; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_ENTRY_SIZE);
+	kvfree(wib->pending);
+	wib->pending = NULL;
+	wib->nr_pending = 0;
+	wib->max_pending = 0;
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the recovery naming test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
  * A transaction commit that cannot write the log fails, so that the
  * transaction aborts (wib_commit_failed()): here more regions name a member
  * than a wide block describes -- no write is admitted into that
@@ -6009,6 +6092,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_pin_keeps_record(fs_info);
+	if (ret)
+		goto out;
+	ret = test_recover_names_pinned(fs_info);
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);

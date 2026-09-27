@@ -981,6 +981,8 @@ bool btrfs_wib_torn_no_persist(void);
 bool btrfs_wib_log_unmarked(void);
 bool btrfs_wib_trust_unmarked_log(void);
 bool btrfs_wib_missing_parity_keeps_torn(void);
+bool btrfs_wib_recover_names_unpinned(void);
+bool btrfs_wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len);
 bool btrfs_wib_absent_decided_keeps_torn(void);
 bool btrfs_wib_suspect_as_stale(void);
 bool btrfs_wib_replace_end_clears_verdicts(void);

@@ -315,6 +315,10 @@ module_param_named(raid56_wf_recovering_stripe_readable, recovering_stripe_reada
 		   0644);
 MODULE_PARM_DESC(raid56_wf_recovering_stripe_readable,
 		 "While the write-intent log recovery decides a full stripe a write may have torn, return rebuilds of it nothing checked to readers other than the recovery (testing only: restores a known defect)");
+static bool recover_names_unpinned;
+module_param_named(raid56_wf_recover_names_unpinned, recover_names_unpinned, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_recover_names_unpinned,
+		 "Let a full write-intent log spend the record of one half of a stripe the recovery keeps while it names the other (testing only: restores a known defect)");
 #else
 static const bool all_records_torn;
 static const bool torn_no_persist;
@@ -328,6 +332,7 @@ static const bool recover_drops_records;
 static const bool missing_parity_keeps_torn;
 static const bool absent_decided_keeps_torn;
 static const bool recovering_stripe_readable;
+static const bool recover_names_unpinned;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -380,6 +385,11 @@ bool btrfs_wib_reload_verdicts_plain(void)
 bool btrfs_wib_recover_drops_records(void)
 {
 	return READ_ONCE(recover_drops_records);
+}
+
+bool btrfs_wib_recover_names_unpinned(void)
+{
+	return READ_ONCE(recover_names_unpinned);
 }
 #endif
 
@@ -4534,6 +4544,26 @@ void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	wib_write_done(fs_info, logical, len, true, !READ_ONCE(failed_leaves_flight));
 }
 
+/* See btrfs_wib_pin().  Caller holds wib->lock. */
+static void wib_pin_locked(struct btrfs_wib *wib, u64 logical, u64 len, bool pin)
+{
+	const u64 end = logical + len;
+
+	lockdep_assert_held(&wib->lock);
+
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const u64 mask = btrfs_wib_range_mask(cur, logical, len);
+
+		if (!e)
+			continue;
+		if (pin)
+			e->pin |= mask;
+		else
+			e->pin &= ~mask;
+	}
+}
+
 static int wib_try_add(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
 		       bool naming)
 {
@@ -4582,7 +4612,8 @@ int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len
 	return wib_try_add(fs_info, logical, len, true);
 }
 
-void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+/* btrfs_wib_add_sticky(), the record pinned (btrfs_wib_pin()) if @pin and kept. */
+static void wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -4593,6 +4624,8 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 
 	spin_lock_irqsave(&wib->lock, flags);
 	ret = btrfs_wib_try_mark(wib, logical, len);
+	if (!ret && pin)
+		wib_pin_locked(wib, logical, len, true);
 	spin_unlock_irqrestore(&wib->lock, flags);
 	if (ret < 0) {
 		if (READ_ONCE(wib->recovery_running) && !READ_ONCE(recover_drops_records)) {
@@ -4608,6 +4641,11 @@ void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		return;
 	}
 	btrfs_wib_done(fs_info, logical, len, true);
+}
+
+void btrfs_wib_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_add_sticky(fs_info, logical, len, false);
 }
 
 /* [@logical, @logical + @len) was fully recovered, forget its error record. */
@@ -4674,23 +4712,12 @@ void btrfs_wib_pin(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
-	const u64 end = logical + len;
 
 	if (!wib)
 		return;
 
 	spin_lock_irqsave(&wib->lock, flags);
-	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
-		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
-		const u64 mask = btrfs_wib_range_mask(cur, logical, len);
-
-		if (!e)
-			continue;
-		if (pin)
-			e->pin |= mask;
-		else
-			e->pin &= ~mask;
-	}
+	wib_pin_locked(wib, logical, len, pin);
 	if (!pin)
 		wib_enforce_capacity_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
@@ -8429,6 +8456,38 @@ static void wib_readd_stale(struct btrfs_fs_info *fs_info, u64 start, u64 len)
 	}
 }
 
+/*
+ * Keep the stripe at [@start, @start + @len) recorded, with the names the
+ * recovered log carried for it (btrfs_wib_add_sticky(), wib_readd_stale()).
+ * False if the log had no room (@recovery_full).
+ *
+ * Pinned while the names go on (btrfs_wib_pin()).  They go on one at a time,
+ * and the first can make every block wide, which spends what may be spent to
+ * fit (wib_enforce_capacity_locked()) -- the half of a stripe straddling two
+ * regions whose names have yet to go on among it, being a record that names
+ * nothing.  Its names then found no entry, and the mount went on read-write
+ * without them.  Not pinned under raid56_wf_recover_names_unpinned=1.
+ */
+static bool wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	const bool pin = !READ_ONCE(recover_names_unpinned);
+
+	wib_add_sticky(fs_info, start, len, pin);
+	if (READ_ONCE(fs_info->wib->recovery_full))
+		return false;
+	wib_readd_stale(fs_info, start, len);
+	if (pin)
+		btrfs_wib_pin(fs_info, start, len, false);
+	return true;
+}
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_readd_record(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	return wib_readd_record(fs_info, start, len);
+}
+#endif
+
 struct wib_recovery_stats {
 	unsigned int done;
 	unsigned int skipped;
@@ -8778,14 +8837,11 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				mode = BTRFS_RAID56_RECOVER_VERIFY;
 			else
 				mode = wib_error_mode();
-			if (mode == BTRFS_RAID56_RECOVER_SCRUB) {
-				btrfs_wib_add_sticky(fs_info, start, len);
-				/* Not scrubbed without it: see @recovery_full. */
-				if (READ_ONCE(wib->recovery_full)) {
-					ret = -ENOSPC;
-					goto out;
-				}
-				wib_readd_stale(fs_info, start, len);
+			/* Not scrubbed without it: see @recovery_full. */
+			if (mode == BTRFS_RAID56_RECOVER_SCRUB &&
+			    !wib_readd_record(fs_info, start, len)) {
+				ret = -ENOSPC;
+				goto out;
 			}
 			/*
 			 * Taken over, now that the live table holds what it
@@ -8812,8 +8868,7 @@ int btrfs_wib_recover(struct btrfs_fs_info *fs_info, bool log_replay_pending)
 				if (ret == 0)
 					btrfs_wib_clear_sticky(fs_info, last_start, last_len);
 			} else if (ret == 1) {
-				btrfs_wib_add_sticky(fs_info, start, len);
-				wib_readd_stale(fs_info, start, len);
+				wib_readd_record(fs_info, start, len);
 			}
 			/*
 			 * Kept, and possibly torn as loaded: it stays so, or
