@@ -986,6 +986,7 @@ bool btrfs_wib_readd_disowns_all(void);
 bool btrfs_wib_readd_admits_busy(void);
 bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_commit_keeps_previous(void);
+bool btrfs_wib_untimed_takes_back(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);

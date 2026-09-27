@@ -1785,6 +1785,122 @@ out:
 }
 
 /*
+ * A transaction commit whose snapshot from before its barrier is gone -- a
+ * block written during the barrier found the set and the snapshot together
+ * more than a block describes (wib_fold_prepared_locked()) -- while every
+ * device confirmed the barrier.  The log is wide (a stale record) and its last
+ * block lists as many regions as a wide block holds: the record and writes
+ * that finished; a write into a new region is in flight.  The commit flushes
+ * again behind a snapshot of its own and drops the finished writes.  It used
+ * to take them back as a failed flush does: with the write in flight holding
+ * the room, the readd was owed, and the commit and every later one failed
+ * with log_flush_unnamed although no device failed anything.  Under
+ * raid56_wf_untimed_takes_back=1 the readd is still owed, which this checks,
+ * so that a pass means the test can see it.
+ */
+static int test_untimed_commit(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool takes_back = btrfs_wib_untimed_takes_back();
+	const u64 unflushed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 rec = 5200ULL * BTRFS_WIB_ENTRY_SIZE;
+	const u64 done_base = 5201;
+	const u32 nr_done = BTRFS_WIB_MAX_ENTRIES - 1;
+	const u64 busy = 5300ULL * BTRFS_WIB_ENTRY_SIZE;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int cret;
+
+	if (btrfs_wib_readd_legacy()) {
+		test_msg("raid56_wf_no_readd_name is set, skipping the untimed commit test");
+		return 0;
+	}
+	btrfs_wib_add_sticky(fs_info, rec, blk);
+	btrfs_wib_mark_stale(fs_info, rec, blk);
+	btrfs_wib_commit_prepare(fs_info);
+	cret = btrfs_wib_commit(fs_info, true);
+	if (cret) {
+		test_err("the commit of the stale record failed: %d", cret);
+		goto out;
+	}
+	for (u32 i = 0; i < nr_done; i++) {
+		cret = btrfs_wib_mark(fs_info, (done_base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+		if (cret) {
+			test_err("mark %u failed: %d", i, cret);
+			goto out;
+		}
+		btrfs_wib_done(fs_info, (done_base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+	}
+	if (block_nr_entries(wib->last) != BTRFS_WIB_MAX_ENTRIES) {
+		test_err("the log lists %u regions, expected %u", block_nr_entries(wib->last),
+			 (u32)BTRFS_WIB_MAX_ENTRIES);
+		goto out;
+	}
+
+	/* The snapshot, lost during the barrier, and a write into a new region. */
+	btrfs_wib_commit_prepare(fs_info);
+	wib->prepared_valid = false;
+	spin_lock_irqsave(&wib->lock, flags);
+	cret = btrfs_wib_try_mark(wib, busy, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (cret) {
+		test_err("in-flight mark failed: %d", cret);
+		goto out;
+	}
+	cret = btrfs_wib_commit(fs_info, true);
+	if (takes_back) {
+		if (!wib->readd_owed) {
+			test_err("raid56_wf_untimed_takes_back is set, yet no readd is owed: the test is blind");
+			goto out;
+		}
+		test_msg("raid56_wf_untimed_takes_back is set: the commit whose barrier every device confirmed owes a readd, as expected");
+		ret = 0;
+		goto out;
+	}
+	if (cret || wib->readd_owed || wib->readd_refused ||
+	    atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]) != unflushed0) {
+		test_err("a commit whose barrier every device confirmed returned %d, owed %d, refused %d",
+			 cret, wib->readd_owed, wib->readd_refused);
+		goto out;
+	}
+	for (u32 i = 0; i < nr_done; i++) {
+		const u64 bytenr = (done_base + i) * BTRFS_WIB_ENTRY_SIZE;
+
+		if ((block_bitmap(wib->last, bytenr) | block_error(wib->last, bytenr)) ||
+		    find_live_entry(wib, bytenr)) {
+			test_err("region %u finished before the flush is still recorded", i);
+			goto out;
+		}
+	}
+	if (!block_bitmap(wib->last, busy) || !block_error(wib->last, rec)) {
+		test_err("the commit dropped the write in flight or the record");
+		goto out;
+	}
+	ret = 0;
+out:
+	WRITE_ONCE(wib->readd_refused, false);
+	btrfs_wib_done(fs_info, busy, blk, false);
+	for (int pass = 0; pass < 2; pass++) {
+		btrfs_wib_clear_sticky(fs_info, rec, blk);
+		for (u32 i = 0; i < nr_done; i++)
+			btrfs_wib_clear_sticky(fs_info, (done_base + i) * BTRFS_WIB_ENTRY_SIZE,
+					       blk);
+		btrfs_wib_commit_prepare(fs_info);
+		cret = btrfs_wib_commit(fs_info, true);
+		if (cret && !ret)
+			ret = cret;
+	}
+	if (!ret && (wib->readd_owed || block_nr_entries(wib->last) != 0 ||
+		     btrfs_wib_any_stale(fs_info))) {
+		test_err("log not empty after the untimed commit test: owed %d, %u regions",
+			 wib->readd_owed, block_nr_entries(wib->last));
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
  * The latched alerts nobody has acknowledged ride in every block the log
  * builds, where its entries leave them room (BTRFS_WIB_LATCH_OFFSET): a mount
  * after a crash takes them back.  The block stays one every kernel with the
@@ -5774,6 +5890,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);
+	if (ret)
+		goto out;
+	ret = test_untimed_commit(fs_info);
 	if (ret)
 		goto out;
 	ret = test_latch_block(fs_info);

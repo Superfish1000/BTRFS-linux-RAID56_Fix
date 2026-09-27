@@ -2236,6 +2236,15 @@ static const bool name_unwritten;
  * nothing on disk.  So does the commit that writes the last block of a log
  * being disabled.  The negative control for the r2 arm of uml/commit_full.sh,
  * and for its logio and disable plans.
+ *
+ * raid56_wf_untimed_takes_back=1: a transaction commit with no snapshot from
+ * before its barrier -- a block written during the barrier invalidated it
+ * (wib_fold_prepared_locked()) -- takes back what the last block lists as a
+ * failed flush's readd does, although every device confirmed the barrier, as
+ * before btrfs_wib_commit() flushed again instead: records that name nobody,
+ * and in a full log a readd owed for them, which fails that commit and every
+ * later one with log_flush_unnamed.  The negative control for
+ * test_untimed_commit() in the self tests.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2282,6 +2291,10 @@ static bool commit_keeps_previous;
 module_param_named(raid56_wf_commit_keeps_previous, commit_keeps_previous, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_commit_keeps_previous,
 		 "Let a transaction commit that cannot write the write-intent log keep the previous log block and go on (testing only: restores a known defect)");
+static bool untimed_takes_back;
+module_param_named(raid56_wf_untimed_takes_back, untimed_takes_back, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_untimed_takes_back,
+		 "Let a transaction commit with no snapshot from before its barrier take back what the write-intent log's last block lists as a failed flush would, although every device confirmed the barrier (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2294,6 +2307,7 @@ static const bool readd_says_each;
 static const bool remount_ro_keeps_inflight;
 static const bool readd_acks_unnamed;
 static const bool commit_keeps_previous;
+static const bool untimed_takes_back;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2356,6 +2370,11 @@ bool btrfs_wib_readd_acks_unnamed(void)
 bool btrfs_wib_commit_keeps_previous(void)
 {
 	return READ_ONCE(commit_keeps_previous);
+}
+
+bool btrfs_wib_untimed_takes_back(void)
+{
+	return READ_ONCE(untimed_takes_back);
 }
 #endif
 
@@ -6621,28 +6640,52 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	else
 		memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
 	timed = wib->prepared_valid;
-	if (!timed) {
-		/*
-		 * No snapshot before the flush: don't trust it, drop nothing.
-		 * A set no block describes fails below.
-		 */
-		btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
-		flushed = false;
-	}
 	wib->prepared_valid = false;
-	ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed, false,
-			      timed, wib->prepared_epoch);
-	/*
-	 * Not even the union with the snapshot fits.  The set alone may: drop
-	 * against a snapshot taken now, behind a flush of its own, as a mark's
-	 * commit does (wib_commit_locked()).  Not while a readd is owed: the
-	 * union is what it waits to fit.  Nor after a failed barrier with
-	 * raid56_wf_no_readd_name=1: that readd took back only what fitted, and
-	 * a flush now does not bring back what the failed one may have lost.
-	 */
-	if (ret == -ENOSPC && !wib->readd_owed && !READ_ONCE(commit_keeps_previous) &&
-	    !(barrier_failed && READ_ONCE(readd_legacy)))
-		ret = wib_flush_and_drop_locked(wib, seq, false);
+	if (!timed && flushed && !wib->readd_owed && !READ_ONCE(untimed_takes_back)) {
+		/*
+		 * No snapshot before the barrier -- a block written during it
+		 * found the set and the snapshot together more than a block
+		 * describes (wib_fold_prepared_locked()), or the snapshot
+		 * itself was -- so the barrier cannot say what it made
+		 * durable.  But every device confirmed it: nothing was lost.
+		 * Flush once more behind a snapshot taken now and drop against
+		 * that, as a mark's commit does (wib_commit_locked()), rather
+		 * than take back what the last block lists as a failed flush
+		 * does: records that name nobody, which a full log has no room
+		 * for, and a readd owed for them would fail this commit and
+		 * every later one with log_flush_unnamed although no device
+		 * failed anything.  A set no block describes fails the commit
+		 * (wib_commit_failed()).
+		 */
+		if (btrfs_wib_build_block(wib, wib->prepared, 0, NULL) == 0)
+			ret = wib_flush_and_drop_locked(wib, seq, false);
+		else
+			ret = -ENOSPC;
+	} else {
+		if (!timed) {
+			/*
+			 * No snapshot before a flush a device failed, or a
+			 * readd is owed: drop nothing.  A set no block
+			 * describes fails below.
+			 */
+			btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
+			flushed = false;
+		}
+		ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed,
+				      false, timed, wib->prepared_epoch);
+		/*
+		 * Not even the union with the snapshot fits.  The set alone
+		 * may: drop against a snapshot taken now, behind a flush of its
+		 * own, as a mark's commit does (wib_commit_locked()).  Not
+		 * while a readd is owed: the union is what it waits to fit.
+		 * Nor after a failed barrier with raid56_wf_no_readd_name=1:
+		 * that readd took back only what fitted, and a flush now does
+		 * not bring back what the failed one may have lost.
+		 */
+		if (ret == -ENOSPC && !wib->readd_owed && !READ_ONCE(commit_keeps_previous) &&
+		    !(barrier_failed && READ_ONCE(readd_legacy)))
+			ret = wib_flush_and_drop_locked(wib, seq, false);
+	}
 	/*
 	 * Still owed: the records a failed flush kept are not in the block yet,
 	 * the names they need not on disk, and the writes they stand for would
