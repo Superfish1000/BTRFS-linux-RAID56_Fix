@@ -38,6 +38,8 @@
 #            copy-data-off-read-only then recreate', after the remount too
 #   health   raid56_wf_recovery_full_legacy=1: nothing unacknowledged, and
 #            the action 'mount-rw' -- the operation that was just refused
+#            (with raid56_wf_latch_needs_log=1: the failed mount's latch work
+#            writes the alert too, since a disabled log keeps acknowledgments)
 #
 # replay: as full, and a small file fsync'd before the overwrites, which leaves
 # a tree log to replay.  The degraded read-write mount is refused

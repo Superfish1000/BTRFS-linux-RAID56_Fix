@@ -3065,8 +3065,9 @@ commit_full)
 	#   CONTROL=0: recovery_log_full stands unacknowledged on the read-only
 	#   mount (the failed recovery wrote it to the log), and the action is to
 	#   bring the missing device back, else to copy the data off.  CONTROL=3
-	#   (raid56_wf_recovery_full_legacy=1): nothing unacknowledged, and the
-	#   action a read-write mount, the refused one.
+	#   (raid56_wf_recovery_full_legacy=1, and raid56_wf_latch_needs_log=1:
+	#   the latch work of the failed mount would write it too): nothing
+	#   unacknowledged, and the action a read-write mount, the refused one.
 	# PLAN=replay: prep as above, with a small file written and fsync'd before
 	# the overwrites, which leaves a tree log to replay; degraded as above,
 	# then the read-only mount recovery_log_full recommends, as its message
@@ -3089,10 +3090,15 @@ commit_full)
 				log "CONTROL_KNOB_FAIL"
 			log "control: raid56_wf_admit_narrow=1";;
 		esac
+		# The latch work of a mount whose log is not enabled yet writes
+		# the alert too (wib_stamp_latch_locked()), since the log disabled
+		# keeps acknowledgments: without it as well, as before both.
 		[ "${CONTROL:-0}" = 3 ] && {
-			echo 1 > /sys/module/btrfs/parameters/raid56_wf_recovery_full_legacy \
-				2>/dev/null || log "CONTROL_KNOB_FAIL"
-			log "control: raid56_wf_recovery_full_legacy=1"
+			for k in raid56_wf_recovery_full_legacy raid56_wf_latch_needs_log; do
+				echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null ||
+					log "CONTROL_KNOB_FAIL"
+			done
+			log "control: raid56_wf_recovery_full_legacy=1 raid56_wf_latch_needs_log=1"
 		}
 		[ "${CONTROL:-0}" = 4 ] && {
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_advice_legacy \
