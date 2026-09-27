@@ -7,7 +7,8 @@
 #
 # See detach_flush in init-final3.sh.  RAID5 over three null_blk devices,
 # memory-backed with a volatile write cache (the kernel needs
-# CONFIG_BLK_DEV_NULL_BLK and CONFIG_CONFIGFS_FS), RAID1 metadata, nodatasum.
+# CONFIG_BLK_DEV_NULL_BLK and CONFIG_CONFIGFS_FS: build it apart from the one
+# the other scenarios run on, see README.md), RAID1 metadata, nodatasum.
 # With no flush, one block per full stripe of a preallocated nodatacow file is
 # written in place (the log records it) and a new file is written with
 # O_DIRECT in full stripes (it does not); then device 1 is powered off --

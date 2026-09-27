@@ -22,8 +22,13 @@ and the self-test boot needs `CONFIG_BTRFS_FS_RUN_SANITY_TESTS`:
     make ARCH=um O=$BTRFS_TEST_DIR/uml-fast defconfig
     # enable: BTRFS_FS=y BTRFS_DEBUG=y BTRFS_FS_RUN_SANITY_TESTS=y
     #         BLK_DEV_UBD=y BLK_DEV_DM=y DM_FLAKEY=y HOSTFS=y PROVE_LOCKING=y
-    #         BLK_DEV_NULL_BLK=y CONFIGFS_FS=y (detach_flush.sh only)
     make ARCH=um O=$BTRFS_TEST_DIR/uml-fast -j$(nproc) linux
+
+`detach_flush.sh` needs `BLK_DEV_NULL_BLK=y CONFIGFS_FS=y` as well, in a
+kernel of its own: built in, null_blk gives every guest a `/dev/nullb0` whose
+reads return whatever the page held, and the guests' `btrfs device scan` can
+take it for a device of the filesystem under test -- which then reads as a
+device missing, or a chunk root that cannot be read, in every other scenario.
 
 A second kernel with `KASAN=y` (as `$BTRFS_TEST_DIR/uml`) is worth having for
 the device-failure scenarios; it is roughly three times slower.
