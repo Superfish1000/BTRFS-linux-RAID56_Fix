@@ -2924,6 +2924,11 @@ commit_full)
 		# commit that drops the finished record succeed, and only its log
 		# block does not reach enough devices.  CONTROL=2: it goes on, as
 		# the lazy commit it was taken for.
+		# DISABLE=1: the log is being disabled.  The disable takes two
+		# commits: the first, before the write, writes the superblock
+		# without the flag, and the one that meets the failing slots is
+		# the one that writes the log's last block.  CONTROL=2: "could not
+		# write the final log block", and it goes on.
 		dm_setup
 		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 		dm_scan
@@ -2932,6 +2937,16 @@ commit_full)
 		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
 		sync
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		if [ "${DISABLE:-0}" = 1 ]; then
+			echo 0 > /sys/fs/btrfs/*-*-*/features/raid56_write_intent || log "DISABLE_FAIL"
+			touch $MNT/marker0
+			sync
+			# Still enabled: only the superblock without the flag is written.
+			[ "$(awk '$1 == "enabled" {print $2}' $W)" = 1 ] || log "CF_DISABLED_EARLY"
+			log "disable requested, log enabled until the next commit:" \
+			    "$(awk '$1 == "enabled" {print $2}' $W)"
+		fi
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.cf
 		dd if=/tmp/cblock.cf of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
 		   conv=notrunc status=none 2>/dev/null && w=ok || w=eio
@@ -2942,11 +2957,15 @@ commit_full)
 		btrfs filesystem sync $MNT >/dev/null 2>&1 || c=fail
 		ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
-		kmsg "failing the transaction commit|commit FAILED|lazy commit failed" 4
-		log "CF logio: write $w commit $c ro=$ro" \
+		kmsg "failing the transaction commit|commit FAILED|lazy commit failed|final log block" 4
+		kmsg "log disabled" 1
+		# That commit wrote the disable's last block: the log is off.
+		dis=-
+		[ "${DISABLE:-0}" = 1 ] && dis=$(awk '$1 == "enabled" {print ($2 == 0)}' $W)
+		log "CF logio: write $w commit $c ro=$ro disabled=$dis" \
 		    "log_write_failed=$(sed -n 's/^log_write_failed //p' $H)" \
 		    "log_commit_failed=$(sed -n 's/^log_commit_failed //p' $H)"
-		echo "$w $c $ro $(sed -n 's/^log_commit_failed //p' $H)" > $T/umltest/cf-logio.$TAG
+		echo "$w $c $ro $(sed -n 's/^log_commit_failed //p' $H) $dis" > $T/umltest/cf-logio.$TAG
 		for i in 0 1 2; do dm_heal $i; done
 		umount $MNT || log "UMOUNT_FAIL"
 		dmsetup remove_all 2>/dev/null
@@ -3261,8 +3280,13 @@ replace_target_fail)
 	# and write its superblock), then 'btrfs replace start -B'.  The copy of
 	# every sector goes to the target and is lost; a replace that finishes
 	# anyway swaps in a device with holes where the source had data.
-	# CONTROL=1 sets scrub_replace_ignores_write_errors=1, the old
-	# behaviour: then a read-only scrub afterwards finds them.
+	# CONTROL=1 sets scrub_replace_ignores_write_errors=1 and
+	# raid56_wf_replace_trusts_target=1, the old behaviour: then a read-only
+	# scrub afterwards finds them.  CONTROL=2 sets only the first: the
+	# target fails the flushes too (error_writes fails them), and a replace
+	# whose new device failed a flush fails all the same
+	# (replace_target_unflushed).  CONTROL=3 sets only the second: the
+	# write errors alone fail it.
 	watchdog ${WATCH:-900}
 	dm_setup
 	set -- $DMDEVS
@@ -3270,11 +3294,17 @@ replace_target_fail)
 	TGT=$5
 	btrfs device scan --forget >/dev/null 2>&1; btrfs device scan $1 $2 $3 $4 >/dev/null 2>&1
 	do_mount $OPTS $1
-	[ "${CONTROL:-0}" = 1 ] && {
+	case "${CONTROL:-0}" in 1|2)
 		echo 1 > /sys/module/btrfs/parameters/scrub_replace_ignores_write_errors 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: target write errors ignored"
-	}
+	esac
+	case "${CONTROL:-0}" in 1|3)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_replace_trusts_target 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a target that failed a flush is trusted"
+	esac
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 	head -c 96M /dev/urandom > $MNT/data
 	sync
 	want=$(md5sum < $MNT/data | awk '{print $1}')
@@ -3300,8 +3330,11 @@ replace_target_fail)
 	got=$(md5sum < $MNT/data 2>/dev/null | awk '{print $1}')
 	log "scrub: $(tr '\n' ' ' < /tmp/scrub.out | grep -o 'Error summary:.*' | cut -c1-120)"
 	kmsg "replace|scrub: device replace could not write" 6
-	log "RTF rrc=$rrc inuse=$inuse md5ok=$([ "$got" = "$want" ] && echo 1 || echo 0) csum=${csum:-0}"
-	echo "$rrc $inuse $([ "$got" = "$want" ] && echo 1 || echo 0) ${csum:-0}" > $T/umltest/rtf.$TAG
+	unfl=$(awk '$1 == "replace_target_unflushed" {print $2}' $H 2>/dev/null)
+	log "RTF rrc=$rrc inuse=$inuse md5ok=$([ "$got" = "$want" ] && echo 1 || echo 0) csum=${csum:-0}" \
+	    "replace_target_unflushed=${unfl:-?}"
+	echo "$rrc $inuse $([ "$got" = "$want" ] && echo 1 || echo 0) ${csum:-0} ${unfl:-0}" \
+		> $T/umltest/rtf.$TAG
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
 	finish
@@ -4432,6 +4465,202 @@ scrub_uncommitted)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+refusal_marks)
+	# Does a refused repair clear the record's marks?  RAID6 over four
+	# devices, a nodatacow block 'B' overwritten in place while the devices
+	# of its column AND of Q fail writes: two faults, within the tolerance,
+	# acknowledged; the record names B's column stale and Q bad.  Q is
+	# healed, B's device keeps failing writes.  The repair queued on the
+	# fault (DELAY ms later) reads the stripe, rebuilds B from P, and its
+	# write-back of B (phase A, rmw_repair_first()) fails: the repair is
+	# refused.  Then B is read cold: it must be rebuilt from P, Q's bad mark
+	# standing.  DELAY=600000 keeps the repair out: the setup check, which
+	# must read 'B'.
+	#
+	# Where the repair's write-back comes before it is recorded in flight
+	# (the default), a refused one never reaches the record at all.  With
+	# raid56_rmw_mark_before_repair=1 it is recorded first, and its refusal
+	# takes rmw_rbio()'s path through the record's update -- which, with
+	# raid56_refusal_clears_marks=1, clears Q's mark although Q was never
+	# rewritten: the read of B then fails the cross-check against the stale
+	# Q (read_parities_disagree, EIO) or, with raid56_read_trusts_ambiguous=1
+	# as well, returns the old 'A', silently.
+	dm_setup
+	mkfs.btrfs -K -q -f -d raid6 -m raid1c3 $DMDEVS || { log "MKFS_FAIL"; finish; }
+	dm_scan
+	do_mount $OPTS /dev/mapper/d0
+	allow_nodatacow
+	echo ${DELAY:-1000} > /sys/module/btrfs/parameters/raid56_repair_delay_ms
+	touch $MNT/nocow; chattr +C $MNT/nocow
+	dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+	sync
+	L=$(python3 $T/umltest/raid56_layout.py $MNT/nocow /dev/mapper/d0 2>&1)
+	log "layout: $L"
+	eval "$L"
+	{ [ -n "${FO_B:-}" ] && [ -n "${IDX_Q:-}" ]; } || { log "LAYOUT_FAIL"; finish; }
+	watchdog 300
+	dm_error_writes $IDX_B
+	dm_error_writes $IDX_Q
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' |
+		dd of=$MNT/nocow bs=4096 seek=$((FO_B / 4096)) count=1 conv=notrunc,fsync \
+		status=none 2>/dev/null && log "B acknowledged" || log "B refused"
+	dm_heal $IDX_Q
+	sleep ${WAIT:-6}
+	W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	failed=$(awk '$1 == "repair_failed" {print $2}' $W 2>/dev/null)
+	kmsg "could not write back|refusing|raid56:" 6
+	echo 3 > /proc/sys/vm/drop_caches
+	dd if=$MNT/nocow bs=4096 skip=$((FO_B / 4096)) count=1 status=none of=/tmp/rm.b 2>/dev/null
+	rc=$?
+	nb=$(tr -cd 'B' < /tmp/rm.b | wc -c)
+	na=$(tr -cd 'A' < /tmp/rm.b | wc -c)
+	pd=$(awk '$1 == "read_parities_disagree" {print $2}' $H 2>/dev/null)
+	log "RFM read_B=$nb read_A=$na rc=$rc repairs_failed=${failed:-?}" \
+	    "read_parities_disagree=${pd:-?} state=$(awk '$1 == "state" {print $2}' $H)"
+	echo "$nb $na $rc ${failed:-0}" > $T/umltest/rfm.$TAG
+	dm_heal $IDX_B
+	umount $MNT || log "UMOUNT_FAIL"
+	dmsetup remove_all 2>/dev/null
+	finish
+	;;
+detach_flush)
+	# A device detached while the filesystem is mounted -- a surprise
+	# removal, an enclosure that drops off the bus -- takes its volatile
+	# cache with it.  btrfs marks it missing (btrfs_remove_bdev()) and goes
+	# on degraded, and neither a barrier nor the log's own flushes go to a
+	# missing device: none fails on it to say what it lost.
+	#
+	# RAID5 over NDEV null_blk devices (memory-backed, with a write cache of
+	# DF_CACHE MiB that a flush empties and a power-off throws away -- for
+	# sectors never written before: null_blk writes into a page its media
+	# already holds in place), RAID1 metadata, nodatasum, commit=600 so that
+	# nothing commits on its own.  A nodatacow file is preallocated and
+	# committed; then, with no flush, one 4 KiB block per full stripe of it
+	# is written in place with 'B' (O_DIRECT, a read-modify-write, which the
+	# log records) and a new file of 'C' is written with O_DIRECT in full
+	# stripes (copy-on-write, which it does not).  Device DF_DEV is powered
+	# off: detached, its cache lost.  A sync commits.  Unmounted, the device
+	# powered on again with what reached its media, the filesystem mounted
+	# with every device (the log's recovery runs), and both files are read
+	# back cold:
+	#   fixed      the commit counts the detached device as one that did not
+	#              confirm its flush, and the log names what was written to
+	#              it: every block reads back as written
+	#   CONTROL=1  raid56_wf_detach_unnamed=1: nothing is named, and the
+	#              blocks of the detached device's column read back as they
+	#              were before the write (zeros), with no error
+	#   CONTROL=2  the fixed kernel with raid56_wf_load_stale_inflight=1 at
+	#              the last mount: the device's own last log block, older
+	#              than the others', still lists the overwrites in flight,
+	#              and taken at its word the recovery takes those stripes for
+	#              possibly torn and refuses the named column (EIO)
+	watchdog ${WATCH:-600}
+	mkdir -p /sys/kernel/config
+	mount -t configfs none /sys/kernel/config 2>/dev/null
+	NB=/sys/kernel/config/nullb
+	[ -d $NB ] || { log "NULLB_UNAVAILABLE"; finish; }
+	NDEV=${NDEV:-3}; DF_DEV=${DF_DEV:-1}; NBDEVS=""
+	for i in $(seq 0 $((NDEV - 1))); do
+		d=$NB/nulldf$i
+		mkdir $d || { log "NULLB_FAIL"; finish; }
+		echo 1 > $d/memory_backed; echo 4096 > $d/blocksize
+		echo ${DF_MB:-512} > $d/size; echo ${DF_CACHE:-128} > $d/cache_size
+		echo 1 > $d/power || { log "NULLB_FAIL power"; finish; }
+		NBDEVS="$NBDEVS /dev/nulldf$i"
+	done
+	sleep 1
+	for i in $(seq 0 $((NDEV - 1))); do
+		[ -b /dev/nulldf$i ] || { log "NULLB_FAIL no /dev/nulldf$i"; finish; }
+	done
+	mkfs.btrfs -K -q -f -d raid5 -m raid1 $NBDEVS || { log "MKFS_FAIL"; finish; }
+	btrfs device scan $NBDEVS >/dev/null 2>&1
+	do_mount rw,commit=600,nodatasum /dev/nulldf0
+	allow_nodatacow
+	if [ "${CONTROL:-0}" = 1 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_detach_unnamed 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a detached device is left out of the flushes, nothing named"
+	fi
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+	hv() { awk -v k=$1 '$1 == k {print $2}' $H 2>/dev/null; }
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	fallocate -l ${DF_MB_FILE:-8}M $MNT/nocow || { log "FALLOCATE_FAIL"; finish; }
+	sync
+	commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.df
+	# One block per full stripe of two data columns (128 KiB).
+	nblk=$(( ${DF_MB_FILE:-8} * 8 ))
+	acked=0
+	for i in $(seq 0 $((nblk - 1))); do
+		dd if=/tmp/bblock.df of=$MNT/nocow bs=4096 seek=$((i * 32)) count=1 \
+		   oflag=direct conv=notrunc status=none 2>/dev/null && acked=$((acked + 1))
+	done
+	dd if=/dev/zero bs=1M count=${DF_MB_FILE:-8} status=none | tr '\000' 'C' |
+		dd of=$MNT/cow bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
+	cwrc=$?
+	commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+	log "overwrites: $acked of $nblk acknowledged, new file rc $cwrc," \
+	    "commits $commits0 -> $commits1"
+	echo 0 > $NB/nulldf$DF_DEV/power || log "NULLB_FAIL power off"
+	sleep 1
+	dmesg | grep -q "has gone missing" || log "DF_NOT_MISSING"
+	kmsg "gone missing|was detached" 3
+	sync
+	btrfs filesystem sync $MNT >/dev/null 2>&1 && sync_ok=1 || sync_ok=0
+	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+	stale=$(hv stale_marks)
+	kmsg "did not confirm|write-intent log|raid56:" 6
+	log "DF after the commit: sync_ok=$sync_ok ro=$ro stale_marks=$stale" \
+	    "state=$(hv state) unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
+	umount $MNT || log "UMOUNT_FAIL"
+	echo 1 > $NB/nulldf$DF_DEV/power || log "NULLB_FAIL power on"
+	sleep 1
+	[ -b /dev/nulldf$DF_DEV ] || log "NULLB_FAIL no /dev/nulldf$DF_DEV after power on"
+	if [ "${CONTROL:-0}" = 2 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_load_stale_inflight 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: an older log block's writes in flight are taken at their word"
+	fi
+	btrfs device scan --forget >/dev/null 2>&1
+	btrfs device scan $NBDEVS >/dev/null 2>&1
+	mount -o rw /dev/nulldf0 $MNT || { log "DF_MOUNT_FAIL"; kmsg "BTRFS" 6; finish; }
+	kmsg "write-intent|raid56:" 8
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	echo 3 > /proc/sys/vm/drop_caches
+	# Every overwritten block and every 64 KiB of the new file: new, old
+	# (zeros: nothing had been written there before), eio, other.
+	res=$(python3 - $MNT/nocow $MNT/cow $nblk <<'PY'
+import os, sys
+def score(path, offs, size, new):
+    n = [0, 0, 0, 0]
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return "absent absent absent absent"
+    for off in offs:
+        try:
+            b = os.pread(fd, size, off)
+        except OSError:
+            n[2] += 1
+            continue
+        n[0 if b == new * size else 1 if b == bytes(size) else 3] += 1
+    return " ".join(map(str, n))
+nblk = int(sys.argv[3])
+print(score(sys.argv[1], [i * 32 * 4096 for i in range(nblk)], 4096, b"B"),
+      score(sys.argv[2], range(0, nblk * 128 * 1024 // 2, 65536), 65536, b"C"))
+PY
+)
+	read -r bn bo be bx cn co ce cx <<< "$res"
+	out="acked=$acked commits_while_cached=$((commits1 - commits0)) sync_ok=$sync_ok ro=$ro"
+	out="$out stale_marks=$stale b_new=$bn b_old=$bo b_eio=$be b_other=$bx"
+	out="$out c_new=$cn c_old=$co c_eio=$ce c_other=$cx"
+	log "DF $out health=$(tr '\n' ' ' < $H 2>/dev/null | cut -c1-200)"
+	echo "$out" > $T/umltest/df.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
 fullstripe_flush_prep)
 	# Does a device that failed a flush after full stripes were written
 	# copy-on-write -- writes the write-intent log does not record -- get
@@ -5137,10 +5366,15 @@ flush_wedge)
 	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
-	#              nothing acknowledges the overwrites
+	#              nothing acknowledges the overwrites -- and the names the
+	#              readd could not write stay in memory for the reads until
+	#              the unmount (@refused_names): every overwrite reads back
 	#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 	#              overwrites FAIL dropped read back as the block was before,
 	#              with no error
+	#     CONTROL=2 raid56_wf_refusal_leaves_unnamed=1: the commit fails as in
+	#              fixed, but nothing keeps the names: until the unmount, the
+	#              overwrites FAIL dropped read back as the block was before
 	watchdog ${WATCH:-900}
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -5159,6 +5393,13 @@ flush_wedge)
 		echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null || log "CONTROL_KNOB_FAIL"
 		log "control: $k=1"
 	done
+	# PLAN=unnamed, CONTROL=2: the refused readd leaves what it could not
+	# name out of the in-memory record too, as before @refused_names.
+	[ "${CONTROL:-0}" = 2 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_refusal_leaves_unnamed \
+			2>/dev/null || log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_refusal_leaves_unnamed=1"
+	}
 	# torn and busy check what a log full of records that only say a write
 	# may have been torn does: both arms let the readd that cannot name the
 	# device leave them, which unnamed shows the default refuses.  And busy

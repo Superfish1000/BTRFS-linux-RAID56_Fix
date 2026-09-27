@@ -54,6 +54,7 @@ enum btrfs_raid56_event {
 	BTRFS_RAID56_EV_COMMIT_FAILED,	/* a commit could not write the log: read-only */
 	BTRFS_RAID56_EV_SCRUB_UNCOMMITTED, /* a scrub left a stripe newer than its tree */
 	BTRFS_RAID56_EV_FLUSH_UNLOGGED,	/* a failed flush left full stripe writes unnamed */
+	BTRFS_RAID56_EV_REPLACE_UNFLUSHED, /* a replace's new device failed a flush: it fails */
 	BTRFS_RAID56_NR_EVENTS
 };
 
@@ -552,6 +553,21 @@ struct btrfs_wib_unlogged_names {
 	struct btrfs_wib_names names;
 };
 
+/*
+ * In memory only.  A name a refused readd or naming of full stripe writes
+ * could not put on the record (@refused_names in struct btrfs_wib): the
+ * members of region @bytenr, addressed as the record addresses them, that a
+ * write went to on a device that did not confirm a flush.
+ */
+struct btrfs_wib_refused_name {
+	u64 bytenr;
+	u64 stale;
+	u64 stale_par;
+};
+
+/* Every region of the last block, and every region of unlogged records. */
+#define BTRFS_WIB_REFUSED_SLOTS	(BTRFS_WIB_NR_ENTRIES + BTRFS_WIB_UNLOGGED_SLOTS)
+
 /* A region's in-flight bits in a snapshot block, see wib_load_snapbits(). */
 struct btrfs_wib_bits {
 	u64 bytenr;
@@ -611,6 +627,14 @@ struct btrfs_wib {
 	 * not finish (btrfs_wib_replace_marks_lost()); cleared when it ends.
 	 */
 	bool replace_marks_lost;
+	/*
+	 * The running device replace's new device did not confirm a flush
+	 * (wib_replace_target_unflushed()): what was copied to it may be gone
+	 * from its cache, and no record says so -- it is no member yet, and
+	 * the old device, which does hold it all, was flushed.  The replace
+	 * must not finish, as for @replace_marks_lost; cleared when it ends.
+	 */
+	bool replace_tgt_unflushed;
 
 	/* Sequence number of the last successful commit. */
 	u64 seq;
@@ -728,8 +752,25 @@ struct btrfs_wib {
 	u32 nr_readd_last;
 	u64 *readd_last;
 	unsigned long readd_until;
+	/*
+	 * Writes btrfs_wib_mark() has put in the set whose record is not
+	 * written yet: each waits for @commit_mutex to write it
+	 * (wib_commit_wait()), and holds its room until then.  A transaction
+	 * commit that finds a readd owed waits for them only while there are
+	 * any: nothing else makes that room (wib_commit_readd_settle()).
+	 */
+	atomic_t nr_marking;
 	/* Under @commit_mutex: who failed the flush just issued. */
 	struct btrfs_wib_flush_failed flush_failed;
+	/*
+	 * Under @lock: devices detached while the log was enabled
+	 * (btrfs_wib_device_lost()), since the flush that takes them
+	 * (wib_take_lost()).  Neither a barrier nor the log's own flushes go
+	 * to a missing device, so none can fail on it -- yet it went with
+	 * whatever its cache held.  The next flush counts it as one that did
+	 * not confirm, and the readd names what was written to it.
+	 */
+	struct btrfs_wib_flush_failed lost;
 	/*
 	 * Under @commit_mutex: wib_name_devices() for each entry of @last,
 	 * worked out before wib_readd_dropped() takes @lock -- the chunk map
@@ -795,6 +836,20 @@ struct btrfs_wib {
 	 * @commit_mutex.
 	 */
 	bool unlogged_refused;
+	/*
+	 * Under @lock.  The names a readd (@readd_refused) or the naming of
+	 * full stripe writes (@unlogged_refused) refused over could not put on
+	 * the record: no block could describe them, and none is written again.
+	 * A read of such a member would get what the device holds, which it
+	 * may have lost from its cache, with no error.  While a refusal stands
+	 * the staleness queries answer from these too
+	 * (wib_refused_stale_locked()), and the read rebuilds the member from
+	 * the parity the other devices flushed; @refused_names_overflow if
+	 * there were more than BTRFS_WIB_REFUSED_SLOTS regions.
+	 */
+	struct btrfs_wib_refused_name *refused_names;
+	u32 nr_refused_names;
+	bool refused_names_overflow;
 	/*
 	 * Under @commit_mutex: the in-flight bits of the snapshot a flush was
 	 * issued after, sorted by region (wib_load_snapbits()), and how many.
@@ -986,6 +1041,11 @@ bool btrfs_wib_readd_disowns_all(void);
 bool btrfs_wib_readd_admits_busy(void);
 bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_commit_keeps_previous(void);
+bool btrfs_wib_untimed_takes_back(void);
+bool btrfs_wib_commit_refuses_owed(void);
+bool btrfs_wib_refusal_leaves_unnamed(void);
+unsigned int btrfs_wib_set_log_full_repair_wait_ms(unsigned int ms);
+bool btrfs_wib_replace_trusts_target(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
@@ -1029,6 +1089,7 @@ void btrfs_wib_parity_unwritten(struct btrfs_fs_info *fs_info, u64 start, u64 le
 				unsigned int parities);
 #endif
 void btrfs_wib_unmount(struct btrfs_fs_info *fs_info);
+void btrfs_wib_device_lost(struct btrfs_fs_info *fs_info, u64 devid);
 void btrfs_wib_remount_ro(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);

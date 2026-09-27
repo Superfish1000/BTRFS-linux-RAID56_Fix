@@ -2511,6 +2511,13 @@ static int btrfs_remove_bdev(struct super_block *sb, struct block_device *bdev)
 		return 0;
 	}
 	/*
+	 * Its cache went with it: the RAID5/6 write-intent log counts it among
+	 * the devices that did not confirm the next flush, before a flush can
+	 * leave it out as missing.
+	 */
+	if (!test_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state))
+		btrfs_wib_device_lost(fs_info, device->devid);
+	/*
 	 * The to-be-removed device is already missing?
 	 *
 	 * That's weird but no special handling needed and can exit right now.

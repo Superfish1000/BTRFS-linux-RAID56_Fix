@@ -5,8 +5,15 @@
 #
 # See replace_target_fail in init-final3.sh.
 #   fixed    the replace fails (EIO); the source stays in the filesystem
-#   control  scrub_replace_ignores_write_errors=1: the replace "finishes",
-#            the target joins with holes, and a scrub finds them
+#   writes   raid56_wf_replace_trusts_target=1: its write errors alone fail
+#            it, counted in its status
+#   flush    scrub_replace_ignores_write_errors=1: the target's write errors
+#            are not counted, but it fails the flushes too, and a replace
+#            whose new device failed a flush fails all the same, with the
+#            replace_target_unflushed alert (wib_replace_target_unflushed())
+#   control  scrub_replace_ignores_write_errors=1 and
+#            raid56_wf_replace_trusts_target=1: the replace "finishes", the
+#            target joins with holes, and a scrub finds them
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: replace_target_fail.sh <kernel>}
@@ -28,14 +35,20 @@ arm() {	# name control
 	rm -f $D/disk*.img
 }
 arm fixed 0
+arm writes 3
+arm flush 2
 arm control 1
-for a in fixed control; do
+for a in fixed writes flush control; do
 	grep -ah "target \|replace rc\|replace status\|in use\|scrub:\|RTF \|control:\|could not write\|KERNEL_SPLAT\|MOUNT_FAIL\|MKFS_FAIL\|DM_RELOAD" $T/umltest/rtf-$a/log | sed "s/^/  [$a] /"
 done
-read -r f_rc f_in f_md5 f_csum < $T/umltest/rtf.rtf-fixed 2>/dev/null || f_rc=?
-read -r c_rc c_in c_md5 c_csum < $T/umltest/rtf.rtf-control 2>/dev/null || c_rc=?
-case "$f_rc$c_rc" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+read -r f_rc f_in f_md5 f_csum f_unfl < $T/umltest/rtf.rtf-fixed 2>/dev/null || f_rc=?
+read -r w_rc w_in w_md5 w_csum w_unfl < $T/umltest/rtf.rtf-writes 2>/dev/null || w_rc=?
+read -r l_rc l_in l_md5 l_csum l_unfl < $T/umltest/rtf.rtf-flush 2>/dev/null || l_rc=?
+read -r c_rc c_in c_md5 c_csum c_unfl < $T/umltest/rtf.rtf-control 2>/dev/null || c_rc=?
+case "$f_rc$w_rc$l_rc$c_rc" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 grep -lq KERNEL_SPLAT $T/umltest/rtf-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+grep -lq CONTROL_KNOB_FAIL $T/umltest/rtf-*/log &&
+	{ echo "RESULT: INCONCLUSIVE -- a knob is not there (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2; }
 if [ "$c_rc" != 0 ] || [ "$c_in" != 1 ]; then
 	echo "RESULT: INCONCLUSIVE -- the control's replace did not finish, so the setup failed it some other way"; exit 2
 fi
@@ -44,5 +57,24 @@ if [ "$f_rc" = 0 ] || [ "$f_in" != 0 ]; then
 	echo "RESULT: FAIL -- the replace finished onto a target that did not take its writes"; exit 1
 fi
 [ "$f_md5" = 1 ] || { echo "RESULT: FAIL -- the data does not read back after the refused replace"; exit 1; }
-echo "RESULT: PASS -- the replace failed and the source stayed; ignoring the errors it finished"
-echo "        onto a target with holes (scrub csum errors $c_csum)"
+if [ "$w_rc" = 0 ] || [ "$w_in" != 0 ] || [ "${w_unfl:-0}" != 0 ] ||
+   ! grep -aq "device replace could not write" $T/umltest/rtf-writes/log; then
+	echo "RESULT: FAIL -- with the new device's failed flush trusted, its write errors did not"
+	echo "        fail the replace (rc $w_rc, in use $w_in, replace_target_unflushed $w_unfl)"
+	exit 1
+fi
+[ "$w_md5" = 1 ] || { echo "RESULT: FAIL -- the data does not read back after the refused replace (writes)"; exit 1; }
+if [ "$l_rc" = 0 ] || [ "$l_in" != 0 ]; then
+	echo "RESULT: FAIL -- with its write errors ignored, the replace finished onto a new device"
+	echo "        that failed a flush"
+	exit 1
+fi
+if [ "${l_unfl:-0}" = 0 ]; then
+	echo "RESULT: FAIL -- the replace whose new device failed a flush raised no replace_target_unflushed"
+	exit 1
+fi
+[ "$l_md5" = 1 ] || { echo "RESULT: FAIL -- the data does not read back after the refused replace (flush)"; exit 1; }
+echo "RESULT: PASS -- the replace failed and the source stayed, on the target's write errors alone"
+echo "        too; with its write errors ignored it"
+echo "        failed all the same on the new device's failed flush (replace_target_unflushed $l_unfl);"
+echo "        ignoring both it finished onto a target with holes (scrub csum errors $c_csum)"

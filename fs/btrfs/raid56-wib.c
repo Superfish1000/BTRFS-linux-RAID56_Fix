@@ -1914,6 +1914,76 @@ static void wib_flush_failed_describe(const struct btrfs_wib_flush_failed *faile
 }
 
 /*
+ * Testing only.  raid56_wf_replace_trusts_target=1: a running device replace
+ * whose new device failed a flush finishes all the same, as before
+ * wib_replace_target_unflushed(): the new device serves what it may have lost
+ * from its cache, in place of the old one that holds it.  The negative
+ * control for test_replace_target_unflushed() in the self tests.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool replace_trusts_target;
+module_param_named(raid56_wf_replace_trusts_target, replace_trusts_target, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_replace_trusts_target,
+		 "Let a device replace finish although its new device failed a cache flush while it ran (testing only: restores a known defect)");
+#else
+static const bool replace_trusts_target;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_replace_trusts_target(void)
+{
+	return READ_ONCE(replace_trusts_target);
+}
+#endif
+
+/*
+ * @dev, the new device of a running replace, did not confirm a flush: a
+ * transaction commit's barrier or one of the log's own.  The copy writes and
+ * the writes duplicated to it (RMW phase B, the log's own blocks) may be gone
+ * from its cache.  Nothing records that -- the device is in no chunk map, so
+ * no name falls on it (wib_name_region()), and barrier_all_devices() does not
+ * count it -- and once the replace finishes it serves them in place of the
+ * old device, which holds them, flushed: data without a checksum reads back
+ * wrong, with no error.  So the replace must not finish: it stops copying
+ * (btrfs_wib_replace_marks_lost(), which also has the item resume from the
+ * start, as the latched alert does after a crash), and fails at its end
+ * (btrfs_wib_replace_end()), the old device staying as it was.  Nothing is
+ * lost, and the replace can be started again.  RCU read side.
+ */
+static void wib_replace_target_unflushed(struct btrfs_fs_info *fs_info,
+					 const struct btrfs_device *dev)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	struct btrfs_wib_flush_failed failed = { 0 };
+	unsigned long flags;
+	bool was;
+
+	if (!wib || READ_ONCE(replace_trusts_target) ||
+	    !test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &dev->dev_state))
+		return;
+	spin_lock_irqsave(&wib->lock, flags);
+	was = wib->replace_tgt_unflushed;
+	wib->replace_tgt_unflushed = true;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (was)
+		return;
+	wib_flush_failed_add(&failed, dev->devid);
+	raid56_alert_failed(fs_info, BTRFS_RAID56_EV_REPLACE_UNFLUSHED, 0, &failed);
+}
+
+/* A transaction commit's barrier: see wib_replace_target_unflushed(). */
+static void wib_replace_target_barrier(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_device *device;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(device, &fs_info->fs_devices->devices, dev_list)
+		if (test_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &device->dev_state))
+			wib_replace_target_unflushed(fs_info, device);
+	rcu_read_unlock();
+}
+
+/*
  * The devices whose barrier failed in this transaction commit, which is
  * running write_all_supers() under device_list_mutex: barrier_all_devices()
  * has just set BTRFS_DEV_STATE_FLUSH_FAILED on exactly those.
@@ -1929,6 +1999,73 @@ static void wib_barrier_failed(struct btrfs_fs_info *fs_info,
 		if (test_bit(BTRFS_DEV_STATE_FLUSH_FAILED, &device->dev_state))
 			wib_flush_failed_add(failed, device->devid);
 	rcu_read_unlock();
+}
+
+/*
+ * Testing only.  raid56_wf_detach_unnamed=1: a device detached while mounted
+ * drops out of every later flush without counting as one that did not
+ * confirm it, as before btrfs_wib_device_lost(): the next commit drops what
+ * its cache may have lost, and the device, reconnected, is read as it is.
+ * The negative control for uml/detach_flush.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool detach_unnamed;
+module_param_named(raid56_wf_detach_unnamed, detach_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_detach_unnamed,
+		 "Let a device detached while mounted drop out of the flushes without the write-intent log naming what its cache may have lost (testing only: restores a known defect)");
+#else
+static const bool detach_unnamed;
+#endif
+
+/*
+ * Device @devid has been detached while the filesystem is mounted
+ * (btrfs_remove_bdev()), about to be marked missing: whatever its cache held
+ * is gone, and no flush will fail on it to say so -- a barrier, and the log's
+ * own flushes, leave a missing device out.  The writes it acknowledged since
+ * it last confirmed a flush are the ones a failed flush loses, and read back
+ * as the old content, with no error, once it is back: count it among the
+ * devices that did not confirm the next flush (wib_take_lost()), whose readd
+ * names them.  Before the device is marked missing: a flush that already
+ * leaves it out finds it here.  Only while the log is enabled: nothing names
+ * anything otherwise.  Under device_list_mutex; takes wib->lock.
+ */
+void btrfs_wib_device_lost(struct btrfs_fs_info *fs_info, u64 devid)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	unsigned long flags;
+	bool enabled;
+
+	if (!wib || READ_ONCE(detach_unnamed))
+		return;
+	spin_lock_irqsave(&wib->lock, flags);
+	enabled = wib->enabled;
+	if (enabled)
+		wib_flush_failed_add(&wib->lost, devid);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (enabled)
+		btrfs_warn(fs_info,
+	"raid56 write-intent log: devid %llu was detached; what its cache held is gone, and the log names what was written to it since its last flush, so that its copy of that is rebuilt from the parity if it comes back",
+			   devid);
+}
+
+/*
+ * Merge the devices detached since the last flush that took them into
+ * @failed, for the flush just issued: true if there were any.  That flush
+ * then counts as failed on them.
+ */
+static bool wib_take_lost(struct btrfs_wib *wib, struct btrfs_wib_flush_failed *failed)
+{
+	unsigned long flags;
+	bool any;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	any = wib_flush_failed_any(&wib->lost);
+	if (any) {
+		wib_flush_failed_merge(failed, &wib->lost);
+		memset(&wib->lost, 0, sizeof(wib->lost));
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return any;
 }
 
 /*
@@ -1952,6 +2089,8 @@ static void wib_update_targets(struct btrfs_fs_info *fs_info, struct file **file
 			if (!with_data) {
 				if (!ok[i] && failed)
 					wib_flush_failed_add(failed, device->devid);
+				if (!ok[i])
+					wib_replace_target_unflushed(fs_info, device);
 			} else if (ok[i]) {
 				WRITE_ONCE(device->wib_next_slot,
 					   (slots[i] + 1) % BTRFS_WIB_NR_SLOTS);
@@ -2052,6 +2191,7 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 				 struct btrfs_wib_flush_failed *failed)
 {
 	int nr;
+	int ret;
 
 	memset(failed, 0, sizeof(*failed));
 	if (btrfs_test_opt(wib->fs_info, NOBARRIER))
@@ -2061,8 +2201,12 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 	 * A flush that could not even be submitted (-ENOMEM) names nobody: no
 	 * device reported losing anything, the stripes only stay recorded.
 	 */
-	return wib_submit_all_devices(wib, REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC, false,
-				      &nr, failed);
+	ret = wib_submit_all_devices(wib, REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC, false,
+				     &nr, failed);
+	/* A device detached meanwhile did not confirm it either. */
+	if (wib_take_lost(wib, failed) && ret == 0)
+		ret = 1;
+	return ret;
 }
 
 /*
@@ -2233,8 +2377,32 @@ static const bool name_unwritten;
  * the log -- the set is more than a block describes, or too few devices took
  * the block -- keeps the previous block on the devices and goes on, as before
  * wib_commit_failed(): the records only the set holds are acknowledged with
- * nothing on disk.  The negative control for the r2 arm of
- * uml/commit_full.sh.
+ * nothing on disk.  So does the commit that writes the last block of a log
+ * being disabled.  The negative control for the r2 arm of uml/commit_full.sh,
+ * and for its logio and disable plans.
+ *
+ * raid56_wf_untimed_takes_back=1: a transaction commit with no snapshot from
+ * before its barrier -- a block written during the barrier invalidated it
+ * (wib_fold_prepared_locked()) -- takes back what the last block lists as a
+ * failed flush's readd does, although every device confirmed the barrier, as
+ * before btrfs_wib_commit() flushed again instead: records that name nobody,
+ * and in a full log a readd owed for them, which fails that commit and every
+ * later one with log_flush_unnamed.  The negative control for
+ * test_untimed_commit() in the self tests.
+ *
+ * raid56_wf_commit_refuses_owed=1: a transaction commit that finds a failed
+ * flush's readd owed refuses at once, as before wib_commit_readd_settle():
+ * the writes in flight that hold the readd's room wait for the commit's
+ * mutex, and would have gone within milliseconds, and the filesystem goes
+ * read-only for a readd that would have landed.  The negative control for
+ * readd_names_settle() in the self tests.
+ *
+ * raid56_wf_refusal_leaves_unnamed=1: a readd or a naming of full stripe
+ * writes that refuses the commits leaves out of the record what it could not
+ * name, as before @refused_names: until the unmount, a read of such a member
+ * returns what the device holds, which it may have lost from its cache, with
+ * no error.  The negative control for the unnamedctl arm of
+ * uml/flush_wedge.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2281,6 +2449,18 @@ static bool commit_keeps_previous;
 module_param_named(raid56_wf_commit_keeps_previous, commit_keeps_previous, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_commit_keeps_previous,
 		 "Let a transaction commit that cannot write the write-intent log keep the previous log block and go on (testing only: restores a known defect)");
+static bool untimed_takes_back;
+module_param_named(raid56_wf_untimed_takes_back, untimed_takes_back, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_untimed_takes_back,
+		 "Let a transaction commit with no snapshot from before its barrier take back what the write-intent log's last block lists as a failed flush would, although every device confirmed the barrier (testing only: restores a known defect)");
+static bool commit_refuses_owed;
+module_param_named(raid56_wf_commit_refuses_owed, commit_refuses_owed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_commit_refuses_owed,
+		 "Let a transaction commit that finds a failed flush's readd owed refuse at once, without waiting for the writes in flight that hold its room in the write-intent log (testing only: restores a known defect)");
+static bool refusal_leaves_unnamed;
+module_param_named(raid56_wf_refusal_leaves_unnamed, refusal_leaves_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_refusal_leaves_unnamed,
+		 "Let a failed flush's readd that refuses the commits leave what it could not name out of the write-intent log's in-memory record too, so reads of it until the unmount return what the device holds (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2293,6 +2473,9 @@ static const bool readd_says_each;
 static const bool remount_ro_keeps_inflight;
 static const bool readd_acks_unnamed;
 static const bool commit_keeps_previous;
+static const bool untimed_takes_back;
+static const bool commit_refuses_owed;
+static const bool refusal_leaves_unnamed;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2355,6 +2538,27 @@ bool btrfs_wib_readd_acks_unnamed(void)
 bool btrfs_wib_commit_keeps_previous(void)
 {
 	return READ_ONCE(commit_keeps_previous);
+}
+
+bool btrfs_wib_untimed_takes_back(void)
+{
+	return READ_ONCE(untimed_takes_back);
+}
+
+bool btrfs_wib_commit_refuses_owed(void)
+{
+	return READ_ONCE(commit_refuses_owed);
+}
+
+bool btrfs_wib_refusal_leaves_unnamed(void)
+{
+	return READ_ONCE(refusal_leaves_unnamed);
+}
+
+/* No repair runs in the self tests: waiting for one is time for nothing. */
+unsigned int btrfs_wib_set_log_full_repair_wait_ms(unsigned int ms)
+{
+	return xchg(&log_full_repair_wait_ms, ms);
 }
 #endif
 
@@ -3117,6 +3321,91 @@ static void wib_readd_names(struct btrfs_wib *wib, u32 i, u64 bytenr, bool preci
 }
 
 /*
+ * Keep the name of members @stale and @stale_par of region @bytenr that a
+ * refusal could not put on the record (@refused_names in struct btrfs_wib).
+ * Caller holds wib->lock.
+ */
+static void wib_refused_name_locked(struct btrfs_wib *wib, u64 bytenr, u64 stale,
+				    u64 stale_par)
+{
+	lockdep_assert_held(&wib->lock);
+
+	if (!(stale | stale_par) || READ_ONCE(refusal_leaves_unnamed))
+		return;
+	for (u32 i = 0; i < wib->nr_refused_names; i++) {
+		struct btrfs_wib_refused_name *r = &wib->refused_names[i];
+
+		if (r->bytenr == bytenr) {
+			r->stale |= stale;
+			r->stale_par |= stale_par;
+			return;
+		}
+	}
+	if (wib->nr_refused_names == BTRFS_WIB_REFUSED_SLOTS) {
+		wib->refused_names_overflow = true;
+		return;
+	}
+	wib->refused_names[wib->nr_refused_names++] = (struct btrfs_wib_refused_name) {
+		.bytenr = bytenr, .stale = stale, .stale_par = stale_par,
+	};
+}
+
+/*
+ * Does a refusal stand with names it kept only here?  Lock-free: a stale
+ * answer is the one given before the refusal, as for wib->nr_stale.
+ */
+static bool wib_refused_any(const struct btrfs_wib *wib)
+{
+	return READ_ONCE(wib->nr_refused_names) &&
+	       (READ_ONCE(wib->readd_refused) || READ_ONCE(wib->unlogged_refused));
+}
+
+/* The names a refusal kept of region @bytenr, or NULL.  Caller holds wib->lock. */
+static const struct btrfs_wib_refused_name *
+wib_refused_stale_locked(const struct btrfs_wib *wib, u64 bytenr)
+{
+	lockdep_assert_held(&wib->lock);
+
+	if (!wib_refused_any(wib))
+		return NULL;
+	for (u32 i = 0; i < wib->nr_refused_names; i++)
+		if (wib->refused_names[i].bytenr == bytenr)
+			return &wib->refused_names[i];
+	return NULL;
+}
+
+/*
+ * A transaction commit refused a readd that is still owed: nothing of the
+ * last block was taken back, nor named.  Keep the names the readd planned
+ * (wib->readd_names[], worked out against @last by the plan the commit met),
+ * where a write went to the member.  commit_mutex held.
+ */
+static void wib_readd_refused_names(struct btrfs_wib *wib)
+{
+	const struct btrfs_wib_disk_header *oh = wib->last;
+	const bool precise = !READ_ONCE(name_unwritten);
+	unsigned long flags;
+	u32 onr;
+
+	lockdep_assert_held(&wib->commit_mutex);
+
+	if (le64_to_cpu(oh->magic) != BTRFS_WIB_MAGIC)
+		return;
+	onr = min(le32_to_cpu(oh->nr_entries), wib_block_max_entries(wib->last));
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u32 i = 0; i < onr; i++) {
+		struct btrfs_wib_entry old;
+		u64 stale, stale_par;
+
+		btrfs_wib_read_entry(wib->last, i, &old);
+		wib_readd_names(wib, i, old.bytenr, precise, &stale, &stale_par);
+		wib_refused_name_locked(wib, old.bytenr, stale & wib_entry_bits(&old),
+					stale_par & wib_entry_bits(&old));
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
  * Ask for a repair of the full stripe of each block @bits of region @bytenr,
  * once for a run of blocks of the same stripe (@prev), and say in @first the
  * first one asked for.  Outside wib->lock, under memalloc_nofs_save(); @mapp
@@ -3492,6 +3781,17 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 				e = wib_find_or_alloc_entry(wib, old.bytenr, false);
 			if (!e) {
 				nr_lost += hweight64(back);
+				/*
+				 * Lost, which refuses every commit from here:
+				 * keep at least the names, for the reads until
+				 * the unmount.
+				 */
+				if (!READ_ONCE(readd_acks_unnamed)) {
+					wib_readd_names(wib, i, old.bytenr, precise, &nstale,
+							&npar);
+					wib_refused_name_locked(wib, old.bytenr, nstale & back,
+								npar & back);
+				}
 				continue;
 			}
 			live++;
@@ -3551,8 +3851,18 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 			 * Say at least that, so that a mount after a crash
 			 * treats it as the write in flight it was, not as a
 			 * failed write whose damage the record names.
+			 *
+			 * Unless that refuses every commit from here (a name
+			 * left off is one, @readd_refused): then no block is
+			 * written again, and the mark would only refuse this
+			 * mount's rebuilds of the member.  Keep the name
+			 * instead, for its reads until the unmount
+			 * (@refused_names).
 			 */
-			if (!READ_ONCE(all_records_torn))
+			if ((nstale | npar) && !READ_ONCE(readd_acks_unnamed) &&
+			    !READ_ONCE(refusal_leaves_unnamed))
+				wib_refused_name_locked(wib, old.bytenr, nstale, npar);
+			else if (!READ_ONCE(all_records_torn))
 				e->torn |= ((nstale & ~e->stale) | (npar & ~e->stale_par)) &
 					   e->sticky;
 		}
@@ -3817,8 +4127,18 @@ static void wib_unlogged_name(struct btrfs_wib *wib,
 		names->repair = (nstale | npar) & ~names->absent;
 		nr_named += hweight64(nstale) + hweight64(npar);
 	}
-	if (refuse)
+	if (refuse) {
 		WRITE_ONCE(wib->unlogged_refused, true);
+		/* Keep the names for the reads until the unmount: @refused_names. */
+		for (u32 i = 0; i < nr; i++) {
+			const struct btrfs_wib_unlogged *u = wib_unlogged_find(wib, un[i].bytenr);
+
+			if (u)
+				wib_refused_name_locked(wib, un[i].bytenr,
+							u->cols & un[i].names.stale,
+							u->par & un[i].names.stale_par);
+		}
+	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (nr_named) {
@@ -4246,6 +4566,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 			 */
 			want = wib->snap_seq + 1;
 			enabled = wib->enabled;
+			/* Holding room until its record is written: @nr_marking. */
+			if (enabled)
+				atomic_inc(&wib->nr_marking);
 			spin_unlock_irqrestore(&wib->lock, flags);
 			break;
 		}
@@ -4322,6 +4645,9 @@ int btrfs_wib_mark(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 */
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_WRITE, logical, NULL, 0);
 	}
+	/* Listed, or gone: a commit waiting on it can plan again. */
+	atomic_dec(&wib->nr_marking);
+	wake_up_all(&wib->wait);
 	return ret;
 }
 
@@ -4540,7 +4866,8 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 /* Is anything at all recorded stale?  Lock-free; see wib->nr_stale. */
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info)
 {
-	return fs_info->wib && atomic_read(&fs_info->wib->nr_stale) != 0;
+	return fs_info->wib && (atomic_read(&fs_info->wib->nr_stale) != 0 ||
+				wib_refused_any(fs_info->wib));
 }
 
 /*
@@ -4746,7 +5073,15 @@ int btrfs_wib_replace_end(struct btrfs_fs_info *fs_info, bool finished)
 "raid56: device replace FAILED: the write-intent log, full with a device missing, had to drop its record of zeros the replace put on the new device where it could neither copy nor rebuild the old one, so the new device is not used; see the replace_record_dropped alert");
 		return -EIO;
 	}
+	if (finished && READ_ONCE(wib->replace_tgt_unflushed)) {
+		spin_unlock_irqrestore(&wib->lock, flags);
+		if (!btrfs_is_testing(fs_info))
+			btrfs_err(fs_info,
+"device replace FAILED: the new device did not confirm a cache flush, so it may not hold what was copied to it, and it is not used; the old device stays; see the replace_target_unflushed alert");
+		return -EIO;
+	}
 	WRITE_ONCE(wib->replace_marks_lost, false);
+	WRITE_ONCE(wib->replace_tgt_unflushed, false);
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
 		struct btrfs_wib_entry *e = &wib->entries[i];
 		const u64 stale = e->stale & e->replace_stale;
@@ -4792,7 +5127,8 @@ int btrfs_wib_replace_end(struct btrfs_fs_info *fs_info, bool finished)
  */
 bool btrfs_wib_replace_marks_lost(struct btrfs_fs_info *fs_info)
 {
-	return fs_info->wib && READ_ONCE(fs_info->wib->replace_marks_lost);
+	return fs_info->wib && (READ_ONCE(fs_info->wib->replace_marks_lost) ||
+				READ_ONCE(fs_info->wib->replace_tgt_unflushed));
 }
 
 /*
@@ -4812,7 +5148,23 @@ bool btrfs_wib_replace_marks_lost(struct btrfs_fs_info *fs_info)
  */
 bool btrfs_wib_replace_resume_rewinds(struct btrfs_fs_info *fs_info, u64 nr_uncopyable)
 {
-	return nr_uncopyable && fs_info->wib && !READ_ONCE(replace_keeps_added_only);
+	struct btrfs_wib *wib = fs_info->wib;
+	unsigned long flags;
+	bool unflushed;
+
+	if (!wib)
+		return false;
+	if (nr_uncopyable && !READ_ONCE(replace_keeps_added_only))
+		return true;
+	/*
+	 * Its new device failed a flush before the crash or the unmount, and
+	 * the item may hold a cursor past what it lost: copy again from the
+	 * start (wib_replace_target_unflushed()).
+	 */
+	spin_lock_irqsave(&wib->alert_lock, flags);
+	unflushed = wib->alert_latched & BIT(BTRFS_RAID56_EV_REPLACE_UNFLUSHED);
+	spin_unlock_irqrestore(&wib->alert_lock, flags);
+	return unflushed && !READ_ONCE(replace_trusts_target);
 }
 
 /*
@@ -5332,7 +5684,7 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 	 */
 	if (nr_data > 64 || nr_parity > 2)
 		return false;
-	if (likely(!atomic_read(&wib->nr_stale))) {
+	if (likely(!atomic_read(&wib->nr_stale)) && likely(!wib_refused_any(wib))) {
 		atomic64_inc(&wib->stat_stale_fast);
 		return false;
 	}
@@ -5346,8 +5698,13 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 		const u64 mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
 		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		const struct btrfs_wib_entry *pe = wib_find_pending(wib, cur, mask);
+		const struct btrfs_wib_refused_name *rn = wib_refused_stale_locked(wib, cur);
 		u64 stale = 0, stale_par = 0, any = 0, gen = 0;
 
+		if (rn) {
+			stale |= rn->stale;
+			stale_par |= rn->stale_par;
+		}
 		if (e) {
 			/*
 			 * Not what a running replace marked for its target
@@ -5419,6 +5776,7 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 cur = wib_entry_bytenr(logical);
+	const struct btrfs_wib_refused_name *rn;
 	struct btrfs_wib_entry *e;
 	const struct btrfs_wib_entry *pe;
 	bool stale = false;
@@ -5432,7 +5790,7 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	 * being added can only return the answer this function gave before
 	 * the record existed at all, which is the behaviour without it.
 	 */
-	if (likely(!atomic_read(&wib->nr_stale))) {
+	if (likely(!atomic_read(&wib->nr_stale)) && likely(!wib_refused_any(wib))) {
 		atomic64_inc(&wib->stat_stale_fast);
 		return false;
 	}
@@ -5453,6 +5811,9 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	pe = wib_find_pending(wib, cur, mask);
 	if (pe)
 		stale |= pe->stale & mask;
+	rn = wib_refused_stale_locked(wib, cur);
+	if (rn)
+		stale |= rn->stale & mask;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return stale;
 }
@@ -6420,8 +6781,14 @@ static int wib_write_final_locked(struct btrfs_wib *wib, bool flushed)
 		wib_written_reset_locked(wib);
 		spin_unlock_irqrestore(&wib->lock, flags);
 	} else {
-		if (!flushed) {
+		if (!flushed)
 			wib_barrier_failed(wib->fs_info, &wib->flush_failed);
+		else
+			memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
+		/* A device detached since the last flush: see wib_take_lost(). */
+		if (wib_take_lost(wib, &wib->flush_failed))
+			flushed = false;
+		if (!flushed) {
 			wib_readd_dropped(wib, &wib->flush_failed,
 					  wib->prepared_valid ? wib->prepared : NULL);
 			wib_unlogged_name(wib, &wib->flush_failed,
@@ -6494,6 +6861,59 @@ static int wib_unlogged_refused(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * A transaction commit found the readd a failed flush left owed
+ * (WIB_READD_WAIT): the block it has to write does not fit until writes in
+ * flight whose record is not written yet are gone -- and those wait for
+ * @commit_mutex, which the commit holds, to write it or fail
+ * (wib_commit_wait()).  Refused on the spot, the filesystem went read-only for
+ * a readd that would have landed milliseconds later.  So let them have the
+ * mutex, and plan again once they are gone, until @readd_until -- as long as
+ * any of them is still there (@nr_marking): nothing else makes the room.  If
+ * the readd lands, write the block it planned.  Returns @ret, the result of
+ * the commit's own write, or that of the write after the readd.  Called with
+ * @commit_mutex held, which it drops and takes again.
+ */
+static int wib_commit_readd_settle(struct btrfs_wib *wib, int ret)
+{
+	unsigned long flags;
+	unsigned long until;
+	bool planned = false;
+	u64 seq;
+
+	lockdep_assert_held(&wib->commit_mutex);
+
+	spin_lock_irqsave(&wib->lock, flags);
+	until = wib->readd_until;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	while (wib->readd_owed && time_before(jiffies, until)) {
+		const int marking = atomic_read(&wib->nr_marking);
+
+		if (!marking)
+			break;
+		/* Until one of them is done, written or failed. */
+		mutex_unlock(&wib->commit_mutex);
+		wait_event_timeout(wib->wait, atomic_read(&wib->nr_marking) < marking,
+				   max_t(long, (long)(until - jiffies), 1));
+		mutex_lock(&wib->commit_mutex);
+		/*
+		 * Planned here, right after its names were worked out against
+		 * @last, or by a writer meanwhile, which wrote its own block
+		 * after it: then @readd_names no longer matches @last.
+		 */
+		planned = wib->readd_owed;
+		if (planned)
+			wib_readd_dropped(wib, NULL, NULL);
+	}
+	if (wib->readd_owed || READ_ONCE(wib->readd_refused) || ret != -ENOSPC)
+		return ret;
+	spin_lock_irqsave(&wib->lock, flags);
+	seq = ++wib->snap_seq;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return wib_write_block_locked(wib, seq, planned ? wib_readd_base(wib) : wib->last,
+				      false);
+}
+
+/*
  * Called at transaction commit (and log commit) time, after the device
  * barriers and before the superblocks are written.  Persists the current
  * in-flight set, dropping stripes that finished before the snapshot taken
@@ -6517,6 +6937,9 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 
 	if (!wib)
 		return 0;
+	/* Log or no log: a replace whose new device failed the barrier fails. */
+	if (!flushed)
+		wib_replace_target_barrier(fs_info);
 	if (READ_ONCE(wib->unlogged_refused))
 		return wib_unlogged_refused(fs_info);
 
@@ -6585,15 +7008,25 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 			mutex_lock(&wib->commit_mutex);
 			ret = wib_write_final_locked(wib, flushed);
 			mutex_unlock(&wib->commit_mutex);
+			if (READ_ONCE(wib->readd_refused))
+				return wib_commit_refused(fs_info);
+			if (READ_ONCE(wib->unlogged_refused))
+				return wib_unlogged_refused(fs_info);
+			/*
+			 * The devices keep the previous block, which lists what
+			 * may be in flight but not the records the set gained
+			 * since -- the names failed writes put on members above
+			 * all -- and the next mount reads it whatever the
+			 * feature flag says: fail the commit as any other that
+			 * cannot write the log (wib_commit_failed()).
+			 */
+			if (ret < 0 && !READ_ONCE(commit_keeps_previous))
+				return wib_commit_failed(fs_info, ret);
 			if (ret < 0)
 				btrfs_warn(fs_info,
 	"raid56 write-intent log: could not write the final log block, the next mount will scrub the stripes the previous one listed");
 			if (!btrfs_is_testing(fs_info))
 				btrfs_info(fs_info, "raid56 write-intent log disabled");
-			if (READ_ONCE(wib->readd_refused))
-				return wib_commit_refused(fs_info);
-			if (READ_ONCE(wib->unlogged_refused))
-				return wib_unlogged_refused(fs_info);
 			return 0;
 		}
 		wib->disable_armed = !flag_written;
@@ -6609,37 +7042,74 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		wib_barrier_failed(fs_info, &wib->flush_failed);
 	else
 		memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
-	timed = wib->prepared_valid;
-	if (!timed) {
-		/*
-		 * No snapshot before the flush: don't trust it, drop nothing.
-		 * A set no block describes fails below.
-		 */
-		btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
-		flushed = false;
-	}
-	wib->prepared_valid = false;
-	ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed, false,
-			      timed, wib->prepared_epoch);
 	/*
-	 * Not even the union with the snapshot fits.  The set alone may: drop
-	 * against a snapshot taken now, behind a flush of its own, as a mark's
-	 * commit does (wib_commit_locked()).  Not while a readd is owed: the
-	 * union is what it waits to fit.  Nor after a failed barrier with
-	 * raid56_wf_no_readd_name=1: that readd took back only what fitted, and
-	 * a flush now does not bring back what the failed one may have lost.
+	 * And who was detached since the last flush: the barrier left it out,
+	 * and its cache is gone all the same (wib_take_lost()).
 	 */
-	if (ret == -ENOSPC && !wib->readd_owed && !READ_ONCE(commit_keeps_previous) &&
-	    !(barrier_failed && READ_ONCE(readd_legacy)))
-		ret = wib_flush_and_drop_locked(wib, seq, false);
+	if (wib_take_lost(wib, &wib->flush_failed)) {
+		flushed = false;
+		barrier_failed = true;
+	}
+	timed = wib->prepared_valid;
+	wib->prepared_valid = false;
+	if (!timed && flushed && !wib->readd_owed && !READ_ONCE(untimed_takes_back)) {
+		/*
+		 * No snapshot before the barrier -- a block written during it
+		 * found the set and the snapshot together more than a block
+		 * describes (wib_fold_prepared_locked()), or the snapshot
+		 * itself was -- so the barrier cannot say what it made
+		 * durable.  But every device confirmed it: nothing was lost.
+		 * Flush once more behind a snapshot taken now and drop against
+		 * that, as a mark's commit does (wib_commit_locked()), rather
+		 * than take back what the last block lists as a failed flush
+		 * does: records that name nobody, which a full log has no room
+		 * for, and a readd owed for them would fail this commit and
+		 * every later one with log_flush_unnamed although no device
+		 * failed anything.  A set no block describes fails the commit
+		 * (wib_commit_failed()).
+		 */
+		if (btrfs_wib_build_block(wib, wib->prepared, 0, NULL) == 0)
+			ret = wib_flush_and_drop_locked(wib, seq, false);
+		else
+			ret = -ENOSPC;
+	} else {
+		if (!timed) {
+			/*
+			 * No snapshot before a flush a device failed, or a
+			 * readd is owed: drop nothing.  A set no block
+			 * describes fails below.
+			 */
+			btrfs_wib_build_block(wib, wib->prepared, 0, NULL);
+			flushed = false;
+		}
+		ret = wib_drop_locked(wib, seq, wib->prepared, flushed, &wib->flush_failed,
+				      false, timed, wib->prepared_epoch);
+		/*
+		 * Not even the union with the snapshot fits.  The set alone
+		 * may: drop against a snapshot taken now, behind a flush of its
+		 * own, as a mark's commit does (wib_commit_locked()).  Not
+		 * while a readd is owed: the union is what it waits to fit.
+		 * Nor after a failed barrier with raid56_wf_no_readd_name=1:
+		 * that readd took back only what fitted, and a flush now does
+		 * not bring back what the failed one may have lost.
+		 */
+		if (ret == -ENOSPC && !wib->readd_owed && !READ_ONCE(commit_keeps_previous) &&
+		    !(barrier_failed && READ_ONCE(readd_legacy)))
+			ret = wib_flush_and_drop_locked(wib, seq, false);
+	}
+	/* Owed: the writes in flight holding its room may be about to go. */
+	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed) &&
+	    !READ_ONCE(commit_refuses_owed))
+		ret = wib_commit_readd_settle(wib, ret);
 	/*
 	 * Still owed: the records a failed flush kept are not in the block yet,
 	 * the names they need not on disk, and the writes they stand for would
-	 * be acknowledged all the same.  The readd waits for writes in flight
-	 * and this commit cannot: refuse it (@readd_refused).
+	 * be acknowledged all the same.  The writes that hold the readd's room
+	 * are stuck: refuse the commit (@readd_refused).
 	 */
 	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed)) {
 		WRITE_ONCE(wib->readd_refused, true);
+		wib_readd_refused_names(wib);
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
 	}
 	owed = wib->readd_owed;
@@ -6873,6 +7343,7 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 	[BTRFS_RAID56_EV_COMMIT_FAILED] = "log_commit_failed",
 	[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED] = "scrub_uncommitted",
 	[BTRFS_RAID56_EV_FLUSH_UNLOGGED] = "full_stripe_flush_unnamed",
+	[BTRFS_RAID56_EV_REPLACE_UNFLUSHED] = "replace_target_unflushed",
 };
 
 /*
@@ -6897,7 +7368,8 @@ static const char * const raid56_event_names[BTRFS_RAID56_NR_EVENTS] = {
 					 BIT(BTRFS_RAID56_EV_REPLACE_ABORTED) |	\
 					 BIT(BTRFS_RAID56_EV_RECOVERY_FULL) |	\
 					 BIT(BTRFS_RAID56_EV_COMMIT_FAILED) |	\
-					 BIT(BTRFS_RAID56_EV_FLUSH_UNLOGGED))
+					 BIT(BTRFS_RAID56_EV_FLUSH_UNLOGGED) |	\
+					 BIT(BTRFS_RAID56_EV_REPLACE_UNFLUSHED))
 
 static const char * const raid56_health_names[] = {
 	[BTRFS_RAID56_HEALTH_OK]	= "ok",
@@ -7152,12 +7624,12 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 			break;
 		}
 		btrfs_err(fs_info,
-"raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log cannot keep a record naming that device in every stripe the flush covered -- more of them than a log block holds, or writes in flight still holding the room. Rather than acknowledge those writes with nothing on disk saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only; the log on the devices still lists every one of those stripes, and data written since the last commit may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs) and fix it, unmount and mount again (-o degraded if you pulled it): the mount's recovery checks every stripe the log lists. Replace the device if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+"raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log cannot keep a record naming that device in every stripe the flush covered -- more of them than a log block holds, or writes in flight still holding the room. Rather than acknowledge those writes with nothing on disk saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only; the log on the devices still lists every one of those stripes, and data written since the last commit may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs; or the one that went missing, whose cache went with it) and fix it, unmount and mount again (-o degraded if you pulled it): the mount's recovery checks every stripe the log lists. Replace the device if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_FLUSH_UNLOGGED:
 		btrfs_err(fs_info,
-"raid56: a device did not confirm a cache flush after full stripes were written copy-on-write, so data it acknowledged may never have reached its disk, and the write-intent log, which does not record such writes, cannot name that device in them: it lost track of some of them, or has no room for the names. Rather than commit a transaction that references data the device may have lost with nothing saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only: what was written since the last commit is not kept, and until the unmount data without checksums written since then may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs), unmount, fix it or pull it and mount again (-o degraded if you pulled it); replace it if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+"raid56: a device did not confirm a cache flush after full stripes were written copy-on-write, so data it acknowledged may never have reached its disk, and the write-intent log, which does not record such writes, cannot name that device in them: it lost track of some of them, or has no room for the names. Rather than commit a transaction that references data the device may have lost with nothing saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only: what was written since the last commit is not kept, and until the unmount data without checksums written since then may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs; or the one that went missing, whose cache went with it), unmount, fix it or pull it and mount again (-o degraded if you pulled it); replace it if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_UNRECOVERED:
@@ -7213,6 +7685,11 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 		btrfs_err(fs_info,
 "raid56: a transaction commit FAILED and the filesystem is now read-only, because the write-intent log could not be written: it records more regions than a log block describes, or too few devices took the block (the message before this one says which). Going on would have acknowledged writes whose records -- which copy of a stripe a failed write left stale -- exist only in memory, and after a crash the old data would have read back with no error. What was written since the last commit is not acknowledged (fsync returned an error), and the log on the devices still lists every stripe the next mount's recovery has to check. Unmount and mount again (-o degraded if a device is missing); if a device keeps failing writes, replace it ('btrfs replace start <devid> <new device> <mountpoint>') and run 'btrfs scrub start <mountpoint>'. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
+		break;
+	case BTRFS_RAID56_EV_REPLACE_UNFLUSHED:
+		btrfs_err(fs_info,
+"raid56: a device replace FAILED: its new device (%s) did not confirm a cache flush, so what the replace copied to it may never have reached its disk. Finishing would have it serve those sectors in place of the old device, which still holds them, and data without a checksum would read back wrong with no error. So the replace stops, and the old device stays as it was: nothing is lost. Check the new device (cabling, power, its kernel messages), then start the replace again ('btrfs replace start <devid> <new device> <mountpoint>'). If the machine goes down before the replace has stopped and it resumes at the next mount, it copies again from the start where the write-intent log is enabled; otherwise cancel it ('btrfs replace cancel <mountpoint>') and start it again. Then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+			  name && name[0] ? name : "?", fsid);
 		break;
 	case BTRFS_RAID56_EV_REPLACE_ABORTED:
 		btrfs_err(fs_info,
@@ -7483,7 +7960,7 @@ static void raid56_alert_work(struct work_struct *work)
 
 	if (any)
 		btrfs_warn(fs_info,
-"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep, %llu commits that could not write the log, %llu full stripes a scrub left to the next one, %llu failed flushes the log could not name full stripe writes in; %u stale marks and %u blocks still recorded; health %s",
+"raid56: since the last report: %llu device write failures, %llu writes refused, %llu refused as not durable, %llu undecidable, %llu failed, %llu repairs given up, %llu log-full failures, %llu records dropped, %llu unverifiable reads, %llu log write failures, %llu repairs not queued, %llu reads with disagreeing parities, %llu failed flushes the log could not name, %llu full stripes a replace could not copy, %llu replace records dropped, %llu replaces aborted, %llu reads of possibly torn stripes refused, %llu possibly torn stripes the recovery could not decide, %llu records the recovery could not keep, %llu commits that could not write the log, %llu full stripes a scrub left to the next one, %llu failed flushes the log could not name full stripe writes in, %llu replaces whose new device failed a flush; %u stale marks and %u blocks still recorded; health %s",
 			   pending[BTRFS_RAID56_EV_STALE],
 			   pending[BTRFS_RAID56_EV_REFUSED],
 			   pending[BTRFS_RAID56_EV_NOT_DURABLE],
@@ -7506,6 +7983,7 @@ static void raid56_alert_work(struct work_struct *work)
 			   pending[BTRFS_RAID56_EV_COMMIT_FAILED],
 			   pending[BTRFS_RAID56_EV_SCRUB_UNCOMMITTED],
 			   pending[BTRFS_RAID56_EV_FLUSH_UNLOGGED],
+			   pending[BTRFS_RAID56_EV_REPLACE_UNFLUSHED],
 			   nr_stale, nr_sticky, raid56_health_names[health]);
 
 	if (health != old) {
@@ -7742,9 +8220,11 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	wib->unlogged = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged), GFP_KERNEL);
 	wib->unlogged_names = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged_names),
 				      GFP_KERNEL);
+	wib->refused_names = kcalloc(BTRFS_WIB_REFUSED_SLOTS, sizeof(*wib->refused_names),
+				     GFP_KERNEL);
 	if (!wib->block || !wib->last || !wib->prepared || !wib->flushsnap ||
 	    !wib->readd_base || !wib->written || !wib->snapbits || !wib->readd_last ||
-	    !wib->unlogged || !wib->unlogged_names) {
+	    !wib->unlogged || !wib->unlogged_names || !wib->refused_names) {
 		free_page((unsigned long)wib->block);
 		free_page((unsigned long)wib->last);
 		free_page((unsigned long)wib->prepared);
@@ -7755,6 +8235,7 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 		kfree(wib->readd_last);
 		kfree(wib->unlogged);
 		kfree(wib->unlogged_names);
+		kfree(wib->refused_names);
 		kfree(wib);
 		return -ENOMEM;
 	}
@@ -7805,6 +8286,7 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 	kfree(wib->readd_last);
 	kfree(wib->unlogged);
 	kfree(wib->unlogged_names);
+	kfree(wib->refused_names);
 	kvfree(wib->pending);
 	kvfree(wib->pending_taken);
 	kfree(wib);
@@ -7904,6 +8386,22 @@ MODULE_PARM_DESC(raid56_load_unions_stale,
 #endif
 
 /*
+ * Testing only: take a device's older block's writes in flight at their word
+ * where the newest block records them finished, with their damage named, as
+ * before wib_load_block()'s @superseding: the recovery takes the stripe for
+ * possibly torn.  The negative control for the inflight arm of
+ * uml/detach_flush.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool load_stale_inflight;
+module_param_named(raid56_wf_load_stale_inflight, load_stale_inflight, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_load_stale_inflight,
+		 "At mount, take the writes an older log block lists in flight at their word where the newest block records them finished with their damage named, so their stripes read as possibly torn (testing only: restores a known defect)");
+#else
+static const bool load_stale_inflight;
+#endif
+
+/*
  * Add the entries of @block, the newest valid block of one device, to the
  * pending set.  @newest: it is the newest block of all, whose stale marks
  * count (see btrfs_wib_load()).
@@ -7918,8 +8416,38 @@ MODULE_PARM_DESC(raid56_load_unions_stale,
  * (wib_keep_torn()), so the blocks this kernel writes from then on say so.
  * @nr_torn receives how many blocks were loaded that way.
  */
-int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
-			 unsigned int *nr_torn)
+/*
+ * The blocks of region @bytenr that @newest lists as the record of a failed
+ * write and not in flight.
+ */
+static u64 wib_superseded(const void *newest, u64 bytenr)
+{
+	const struct btrfs_wib_disk_header *hdr = newest;
+	const u32 nr = min(le32_to_cpu(hdr->nr_entries), wib_block_max_entries(newest));
+
+	for (u32 i = 0; i < nr; i++) {
+		struct btrfs_wib_entry ne;
+
+		btrfs_wib_read_entry(newest, i, &ne);
+		if (ne.bytenr == bytenr)
+			return ne.sticky & ~ne.bitmap;
+	}
+	return 0;
+}
+
+/*
+ * @superseding: the newest block of the log, another device's, when @block is
+ * older (!@newest).  Its device missed the blocks written after it -- it was
+ * missing or detached, or failed their writes -- and a write @block lists in
+ * flight that @superseding lists as a record, no longer in flight, had
+ * finished when that was written: with the damage the record says, which is
+ * how a failed flush's readd writes what it took back (wib_readd_base()).
+ * Taken at @block's word, the stripe reads to the recovery as possibly torn,
+ * and a column the record names that only its parity rebuilds is refused for
+ * good.  So that listing is left out.
+ */
+static int wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
+			  const void *superseding, unsigned int *nr_torn)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
 	const bool marks = btrfs_wib_block_marks_torn(block) ||
@@ -7935,6 +8463,8 @@ int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
 		if (!newest) {
 			e.stale = 0;
 			e.stale_par = 0;
+			if (superseding && !READ_ONCE(load_stale_inflight))
+				e.bitmap &= ~wib_superseded(superseding, e.bytenr);
 		}
 		if (!marks) {
 			e.torn = e.sticky;
@@ -7945,6 +8475,12 @@ int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
 			return ret;
 	}
 	return 0;
+}
+
+int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
+			 unsigned int *nr_torn)
+{
+	return wib_load_block(wib, block, newest, NULL, nr_torn);
 }
 
 /*
@@ -7982,6 +8518,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	unsigned int nr_unmarked = 0;
 	unsigned int nofs_flag;
 	u32 latched = 0;
+	void *newest_buf;
 	void *buf;
 	int ret = 0;
 
@@ -7992,8 +8529,12 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		return 0;
 
 	buf = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!buf)
+	newest_buf = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!buf || !newest_buf) {
+		free_page((unsigned long)buf);
+		free_page((unsigned long)newest_buf);
 		return -ENOMEM;
+	}
 
 	/* Allocations under device_list_mutex must not enter reclaim. */
 	nofs_flag = memalloc_nofs_save();
@@ -8010,6 +8551,9 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			if (wib_read_slot(device, slot, buf) < 0 ||
 			    !btrfs_wib_block_valid(fs_info, buf))
 				continue;
+			/* The newest block of all, see wib_load_block(). */
+			if (le64_to_cpu(hdr->seq) > max_seq)
+				memcpy(newest_buf, buf, BTRFS_WIB_SLOT_SIZE);
 			max_seq = max(max_seq, le64_to_cpu(hdr->seq));
 		}
 	}
@@ -8063,7 +8607,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			ret = 0;
 			continue;
 		}
-		ret = btrfs_wib_load_block(wib, buf, newest, &nr);
+		ret = wib_load_block(wib, buf, newest, max_seq ? newest_buf : NULL, &nr);
 		if (ret < 0)
 			goto out;
 		nr_unmarked += nr;
@@ -8075,6 +8619,7 @@ out:
 	mutex_unlock(&fs_devices->device_list_mutex);
 	memalloc_nofs_restore(nofs_flag);
 	free_page((unsigned long)buf);
+	free_page((unsigned long)newest_buf);
 	if (ret < 0)
 		return ret;
 
