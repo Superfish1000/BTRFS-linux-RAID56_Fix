@@ -718,6 +718,17 @@ module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0
 MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
 		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
 /*
+ * raid56_wf_spend_straddling_half=1: a full log spends the half of a stripe
+ * straddling two regions that names nothing while the other half names a
+ * member, as a record that names nothing, as before (wib_entry_half_named()):
+ * a false record_dropped, and a stripe a scrub then declines as partly
+ * recorded.  The negative control for uml/degraded_log_full.sh (straddle).
+ */
+static bool spend_straddling_half;
+module_param_named(raid56_wf_spend_straddling_half, spend_straddling_half, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_spend_straddling_half,
+		 "Let a full write-intent log spend the half of a stripe straddling two regions that names nothing while the other half names a member (testing only: restores a known defect)");
+/*
  * raid56_wf_repair_leaves_unpinned=1: a write that cleared what the record
  * names after writing it back (rmw_repair_first()) leaves the record
  * sticky-only and spendable until its own mark, as before (btrfs_wib_pin()).
@@ -761,6 +772,7 @@ static const bool failed_leaves_flight;
 static const bool admit_recorded_free;
 static const bool flush_drop_asserts;
 static const bool repair_leaves_unpinned;
+static const bool spend_straddling_half;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -818,6 +830,11 @@ bool btrfs_wib_admits_recorded_free(void)
 bool btrfs_wib_flush_drop_asserts(void)
 {
 	return READ_ONCE(flush_drop_asserts);
+}
+
+bool btrfs_wib_spends_straddling_half(void)
+{
+	return READ_ONCE(spend_straddling_half);
 }
 
 bool btrfs_wib_failed_leaves_flight(void)
@@ -930,15 +947,63 @@ static bool wib_entry_kept_torn(const struct btrfs_wib_entry *e)
 }
 
 /*
+ * Is @e, naming nothing, perhaps the half of a full stripe straddling two
+ * regions whose other half names a member?  A name goes on the entry of the
+ * block it names (wib_name_region(), rmw_update_stale_data()), so the record
+ * of a straddling stripe is two entries, and only one of them may name
+ * anything.  Spent as a record that names nothing, the other half raised a
+ * record_dropped nothing warranted, and made the stripe one only partly
+ * recorded (BTRFS_WIB_STRIPE_PARTIAL_ERROR), which a scrub declines where a
+ * column holds data without a checksum -- the scrub the log_full alert asks
+ * for.
+ *
+ * Told without the chunk map, which is not walked under the lock: a stripe
+ * straddles from the last block of a region into the first of the next, so
+ * the runs of recorded blocks at either side of the boundary are what may be
+ * one stripe; any name in the neighbour's run counts.  More than the stripe,
+ * never less.  Caller holds wib->lock.
+ */
+static bool wib_entry_half_named(struct btrfs_wib *wib, const struct btrfs_wib_entry *e)
+{
+	const struct btrfs_wib_entry *n;
+
+	if (READ_ONCE(spend_straddling_half) || wib_entry_names_member(e))
+		return false;
+	if (e->sticky & BIT_ULL(63)) {
+		n = wib_find_entry(wib, e->bytenr + BTRFS_WIB_ENTRY_SIZE);
+		if (n && (n->sticky & 1)) {
+			const u64 run = n->sticky == U64_MAX ? U64_MAX :
+					(n->sticky ^ (n->sticky + 1)) >> 1;
+
+			if ((n->stale | n->stale_par | n->torn) & run)
+				return true;
+		}
+	}
+	if ((e->sticky & 1) && e->bytenr >= BTRFS_WIB_ENTRY_SIZE) {
+		n = wib_find_entry(wib, e->bytenr - BTRFS_WIB_ENTRY_SIZE);
+		if (n && (n->sticky & BIT_ULL(63))) {
+			const u64 ones = 64 - fls64(~n->sticky);
+			const u64 run = ones >= 64 ? U64_MAX : GENMASK_ULL(63, 64 - ones);
+
+			if ((n->stale | n->stale_par | n->torn) & run)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * May a full log evict @e?  See wib_may_evict_naming().  With every device
  * there, a record that only says a write may have been torn only if
- * @spend_torn: see wib_entry_torn_only().
+ * @spend_torn: see wib_entry_torn_only().  Nor the half of a stripe whose
+ * other half names a member (wib_entry_half_named()).
  */
-static bool wib_evictable(const struct btrfs_wib *wib, const struct btrfs_wib_entry *e,
+static bool wib_evictable(struct btrfs_wib *wib, const struct btrfs_wib_entry *e,
 			  bool spend_torn)
 {
 	return !e->bitmap && !e->pin &&
-	       (wib->may_evict_naming || !wib_entry_names_member(e) ||
+	       (wib->may_evict_naming ||
+		(!wib_entry_names_member(e) && !wib_entry_half_named(wib, e)) ||
 		(spend_torn && wib_entry_torn_only(e)));
 }
 
@@ -996,7 +1061,8 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 
 			if (e->bitmap || e->pin || !e->sticky)
 				continue;
-			if (pass == 0 && wib_entry_names_member(e))
+			if (pass == 0 &&
+			    (wib_entry_names_member(e) || wib_entry_half_named(wib, e)))
 				continue;
 			if (pass >= 1 && !wib->may_evict_naming &&
 			    (!wib_entry_torn_only(e) || (pass == 1 && wib_entry_kept_torn(e))))
@@ -1301,14 +1367,15 @@ static const bool room_any_write;
  * a record naming a member, or saying a write may have been torn, leaves it,
  * and frees nothing.  Caller holds wib->lock, after wib_policy_locked().
  */
-static bool wib_write_frees_room(const struct btrfs_wib *wib,
+static bool wib_write_frees_room(struct btrfs_wib *wib,
 				 const struct btrfs_wib_entry *e, bool spend_torn)
 {
 	if (!e->bitmap)
 		return false;
 	if (READ_ONCE(room_any_write))
 		return spend_torn || !e->sticky;
-	return wib->may_evict_naming || !wib_entry_names_member(e) ||
+	return wib->may_evict_naming ||
+	       (!wib_entry_names_member(e) && !wib_entry_half_named(wib, e)) ||
 	       (spend_torn && wib_entry_torn_only(e));
 }
 

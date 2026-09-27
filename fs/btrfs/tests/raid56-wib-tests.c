@@ -1887,12 +1887,15 @@ out:
  * wide, which spends records to fit -- and the half whose name has yet to go
  * on names nothing so far: spent, its name found no entry, and the mount went
  * on without it.  Pinned while the names go on, both stay.  Under
- * raid56_wf_recover_names_unpinned=1 the second half is spent.
+ * raid56_wf_recover_names_unpinned=1 the second half is spent -- if
+ * raid56_wf_spend_straddling_half=1 as well: the half of a stripe whose other
+ * half names a member is not spent either way (wib_entry_half_named()).
  */
 static int test_recover_names_pinned(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_wib *wib = fs_info->wib;
-	const bool unpinned = btrfs_wib_recover_names_unpinned();
+	const bool unpinned = btrfs_wib_recover_names_unpinned() &&
+			      btrfs_wib_spends_straddling_half();
 	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
 	const u64 base = 6700;
 	/* Three data columns: the last two blocks of R1, the first of R2. */
@@ -1935,10 +1938,10 @@ static int test_recover_names_pinned(struct btrfs_fs_info *fs_info)
 	e2 = find_live_entry(wib, r2);
 	if (unpinned) {
 		if (e2 && (e2->stale & 0x1)) {
-			test_err("raid56_wf_recover_names_unpinned is set, yet the second half kept its name");
+			test_err("raid56_wf_recover_names_unpinned and raid56_wf_spend_straddling_half are set, yet the second half kept its name");
 			goto out;
 		}
-		test_msg("raid56_wf_recover_names_unpinned is set: the second half was spent and its name lost, as expected");
+		test_msg("raid56_wf_recover_names_unpinned and raid56_wf_spend_straddling_half are set: the second half was spent and its name lost, as expected");
 	} else if (!e1 || !(e1->stale & BIT_ULL(62)) || !e2 || e2->stale != 0x1 ||
 		   e1->pin || e2->pin) {
 		test_err("the stripe's names: R1 %d stale 0x%llx, R2 %d stale 0x%llx; expected both",
@@ -1958,6 +1961,91 @@ out:
 	wib->max_pending = 0;
 	if (!ret && btrfs_wib_any_stale(fs_info)) {
 		test_err("stale marks left after the recovery naming test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
+ * A full stripe straddling two regions is recorded in two entries, and a
+ * name goes on the entry of the block it names: the other half names nothing.
+ * A full log spent it as a record that names nothing -- a record_dropped
+ * nothing warranted, and a stripe a scrub then declines as only partly
+ * recorded.  It is kept now, both ways across a boundary
+ * (wib_entry_half_named()); under raid56_wf_spend_straddling_half=1 it is
+ * spent.
+ */
+static int test_straddling_half_kept(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool spends = btrfs_wib_spends_straddling_half();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 7000;
+	/* Forward: R1 unnamed at its last blocks, R2 named at its first. */
+	const u64 r1 = base * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r2 = r1 + BTRFS_WIB_ENTRY_SIZE;
+	/* Backward: R3 named at its last block, R4 unnamed at its first. */
+	const u64 r3 = r2 + 2 * BTRFS_WIB_ENTRY_SIZE;
+	const u64 r4 = r3 + BTRFS_WIB_ENTRY_SIZE;
+	const u64 fresh = (base + 200) * BTRFS_WIB_ENTRY_SIZE;
+	struct btrfs_wib_entry *e;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r[2];
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the straddling-half test");
+		return 0;
+	}
+	if (!put_entry(wib, r1, 0, BIT_ULL(62) | BIT_ULL(63)) || !put_entry(wib, r4, 0, 0x3)) {
+		test_err("no room for the unnamed halves");
+		goto out;
+	}
+	e = put_entry(wib, r2, 0, 0x1);
+	if (!e)
+		goto out;
+	spin_lock_irqsave(&wib->lock, flags);
+	e->stale = 0x1;
+	atomic_inc(&wib->nr_stale);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (!put_entry(wib, r3, 0, BIT_ULL(63)))
+		goto out;
+	/* Parity 0 of the stripe starting at R3's last block. */
+	btrfs_wib_update_stale_parity(fs_info, r3 + 63 * blk, 0, true);
+	/* A wide log, full with writes in flight. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 4; i++) {
+		if (!put_entry(wib, (base + 10 + i) * BTRFS_WIB_ENTRY_SIZE, 0x1, 0)) {
+			test_err("no room for write %u", i);
+			goto out;
+		}
+	}
+	spin_lock_irqsave(&wib->lock, flags);
+	r[0] = btrfs_wib_try_mark(wib, fresh, blk);
+	r[1] = btrfs_wib_try_mark(wib, fresh + BTRFS_WIB_ENTRY_SIZE, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (spends) {
+		if (r[0] || r[1] || find_live_entry(wib, r1) || find_live_entry(wib, r4)) {
+			test_err("raid56_wf_spend_straddling_half is set, yet the halves were kept: %d %d",
+				 r[0], r[1]);
+			goto out;
+		}
+		test_msg("raid56_wf_spend_straddling_half is set: both unnamed halves were spent, as expected");
+	} else if (r[0] != -ENOSPC || r[1] != -ENOSPC || !find_live_entry(wib, r1) ||
+		   !find_live_entry(wib, r4) || btrfs_wib_can_mark(wib, fresh, blk)) {
+		test_err("an unnamed half of a named stripe was spent: marks %d %d, R1 %d R4 %d",
+			 r[0], r[1], !!find_live_entry(wib, r1), !!find_live_entry(wib, r4));
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 4; i++)
+		btrfs_wib_done(fs_info, (base + 10 + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+	btrfs_wib_done(fs_info, fresh, 2 * BTRFS_WIB_ENTRY_SIZE, false);
+	for (u64 i = 0; i < 210; i++)
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+				       BTRFS_WIB_ENTRY_SIZE);
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the straddling-half test");
 		ret = -EINVAL;
 	}
 	return ret;
@@ -6095,6 +6183,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_recover_names_pinned(fs_info);
+	if (ret)
+		goto out;
+	ret = test_straddling_half_kept(fs_info);
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);

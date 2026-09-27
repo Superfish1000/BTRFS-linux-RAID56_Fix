@@ -15,6 +15,13 @@
 #            acknowledged block reads back as written, and no record is dropped
 #   control  raid56_wf_evict_stage0=1: the log spends them (record_dropped),
 #            every write succeeds and metadata commits, as stage 0 did
+#   And the fixed arm spends no record at all (record_dropped 0): on four
+#   devices a full stripe can run from one region into the next, and the
+#   first write goes into one such stripe past the others, whose record is
+#   two entries, one naming the missing member and one nothing; the half
+#   that names nothing is not spent while the other names the member --
+#   the straddle arm (raid56_wf_spend_straddling_half=1, column only)
+#   spends it with a record_dropped nothing warranted.
 # unrelated (CUR-6): RAID5 data and RAID1 metadata on three devices, a fourth
 # added that holds none of it, then removed: degraded, though nothing of the
 # RAID5 chunk is missing.  Device 1 fails the writes of 82 regions (one block
@@ -53,21 +60,31 @@ arm() {	# name control
 	echo "boot rc=$?" >> $D/log
 	rm -f $D/disk*.img
 }
+ARMS="fixed control"
 arm fixed 0
 arm control 1
-for a in fixed control; do
+[ $PLAN = column ] && { ARMS="$ARMS straddle"; arm straddle 2; }
+for a in $ARMS; do
 	grep -ah "mounted degraded\|writes ok\|writes into new\|DLF \|control:\|healed\|fails writes\|scrub rc\|log is full of records\|KERNEL_SPLAT\|WATCHDOG\|MOUNT_FAIL\|MKFS_FAIL\|LAYOUT_FAIL\|KNOB_FAIL\|DEVICE_ADD_FAIL" \
 		$T/umltest/dlf-$PLAN-$a/log | grep -v DLF_READ_BAD | cut -c1-400 | sed "s/^/  [$a] /"
 	echo "  [$a] DLF_READ_BAD lines: $(grep -ac DLF_READ_BAD $T/umltest/dlf-$PLAN-$a/log)"
 done
 res() { cat $T/umltest/dlf.dlf-$PLAN-$1 2>/dev/null || echo "?"; }
-read -r f_ok f_eio f_meta f_ro f_drop f_full f_acked f_rok f_reio f_rbad f_fresh f_sev <<<"$(res fixed)"
-read -r c_ok c_eio c_meta c_ro c_drop c_full c_acked c_rok c_reio c_rbad c_fresh c_sev <<<"$(res control)"
-case "$f_ok$c_ok" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+read -r f_ok f_eio f_meta f_ro f_drop f_full f_acked f_rok f_reio f_rbad f_fresh f_sev f_stev \
+	<<<"$(res fixed)"
+read -r c_ok c_eio c_meta c_ro c_drop c_full c_acked c_rok c_reio c_rbad c_fresh c_sev c_stev \
+	<<<"$(res control)"
+s_ok=- s_drop=- s_stev=- s_sev=- s_rbad=-
+[ $PLAN = column ] &&
+	read -r s_ok s_eio s_meta s_ro s_drop s_full s_acked s_rok s_reio s_rbad s_fresh s_sev s_stev \
+		<<<"$(res straddle)"
+case "$f_ok$c_ok$s_ok" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 grep -lq KERNEL_SPLAT $T/umltest/dlf-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 grep -lq WATCHDOG $T/umltest/dlf-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
-grep -lq CONTROL_KNOB_FAIL $T/umltest/dlf-$PLAN-control/log &&
-	{ echo "RESULT: INCONCLUSIVE -- the control knob is not there (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2; }
+for a in $ARMS; do
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/dlf-$PLAN-$a/log &&
+		{ echo "RESULT: INCONCLUSIVE -- the $a knob is not there (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2; }
+done
 echo "  new writes ok/eio: fixed $f_ok/$f_eio, control $c_ok/$c_eio; metadata committed fixed $f_meta control $c_meta," \
      "read-only fixed $f_ro control $c_ro"
 echo "  log_full fixed $f_full control $c_full, record_dropped fixed $f_drop control $c_drop," \
@@ -81,11 +98,21 @@ if [ $PLAN = column ]; then
 		exit 2
 	fi
 	[ "${f_acked:-0}" -gt 0 ] || { echo "RESULT: INCONCLUSIVE -- no write was acknowledged"; exit 2; }
-	# A record that names nothing yet (pass 0 of wib_evict_sticky()) may
-	# go: RAID5 metadata writes fail on the missing device concurrently,
-	# and a record is vague until rmw_update_stale_data() names it.
 	if [ "${f_sev:-0}" != 0 ]; then
 		echo "RESULT: FAIL -- $f_sev record(s) naming a member were spent (record_dropped $f_drop)"; exit 1
+	fi
+	# Nor the half of a stripe straddling two regions that names nothing,
+	# its other half naming the missing column: a record_dropped nothing
+	# warranted.  The straddle arm spends it (or finds none to spend).
+	echo "  straddle (raid56_wf_spend_straddling_half=1): records spent $s_stev, record_dropped $s_drop," \
+	     "naming a member $s_sev, read back wrong $s_rbad; fixed: records spent $f_stev"
+	if [ "${s_stev:-0}" = 0 ] || [ "${s_sev:-0}" != 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the straddle arm spent no unnamed half ($s_stev record(s), $s_sev naming),"
+		echo "        so a fixed arm that spends none proves nothing about it"
+		exit 2
+	fi
+	if [ "${f_drop:-0}" != 0 ] || [ "${f_stev:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- the fixed arm spent $f_stev record(s) (record_dropped $f_drop)"; exit 1
 	fi
 	if [ "$f_eio" = 0 ] || [ "${f_full:-0}" -lt 1 ]; then
 		echo "RESULT: FAIL -- the full log did not refuse (eio=$f_eio log_full=$f_full)"; exit 1
@@ -99,7 +126,8 @@ if [ $PLAN = column ]; then
 	echo "RESULT: PASS -- degraded, the full log refused $f_eio write(s) with the log_full alert and spent"
 	echo "        no record naming a member, no acknowledged block reads back wrong ($f_rok ok, $f_reio EIO"
 	echo "        of $f_acked);"
-	echo "        control (stage 0) spent records: record_dropped $c_drop, every write succeeded"
+	echo "        control (stage 0) spent records: record_dropped $c_drop, every write succeeded;"
+	echo "        spending the unnamed half of a named stripe (straddle) raised record_dropped $s_drop"
 	exit 0
 fi
 # unrelated

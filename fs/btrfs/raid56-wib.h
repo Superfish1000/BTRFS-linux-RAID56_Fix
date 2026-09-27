@@ -1010,6 +1010,7 @@ u32 btrfs_wib_block_latched(const void *block);
 bool btrfs_wib_failed_leaves_flight(void);
 bool btrfs_wib_admits_recorded_free(void);
 bool btrfs_wib_flush_drop_asserts(void);
+bool btrfs_wib_spends_straddling_half(void);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG
 bool btrfs_wib_unrecovered_as_ambiguous(void);

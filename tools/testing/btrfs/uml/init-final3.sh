@@ -3097,6 +3097,11 @@ degraded_log_full)
 			log "CONTROL_KNOB_FAIL"
 		log "control: raid56_wf_evict_stage0=1, a full log spends records as stage 0 did"
 	}
+	[ "${CONTROL:-0}" = 2 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_spend_straddling_half 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_spend_straddling_half=1, a full log spends the unnamed half of a named stripe"
+	}
 	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.dlf
 	: > $T/umltest/dlf.acked.$TAG
@@ -3198,6 +3203,18 @@ degraded_log_full)
 	else
 		dd if=/dev/zero bs=1M count=$(( ${NREG:-120} * 4 + 16 )) status=none | tr '\000' 'A' > $MNT/nocow
 		sync
+		# A full stripe past the regions written below that runs from one
+		# 4 MiB region into the next: written first, its record is two
+		# entries, one of them naming the missing device's member and the
+		# other nothing -- which a full log must not spend as a record
+		# that names nothing (the straddle arm spends it).
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 16 \
+			$(( (${NREG:-120} * 4 + 16) * 16 )) region > $T/umltest/dlf.rows.$TAG 2>&1
+		straddle=$(awk -v from=$(( (${NREG:-120} + 1) * 1024 )) '$2 >= from && $5 ~ /:1$/ {
+			out = ""
+			for (k = 6; k <= NF; k++) { split($k, m, ":"); if (m[1] >= 0) out = out " " m[1] }
+			print out; exit }' $T/umltest/dlf.rows.$TAG)
+		[ -n "$straddle" ] || { log "LAYOUT_FAIL no straddling stripe: $(head -2 $T/umltest/dlf.rows.$TAG | tr '\n' ' ')"; finish; }
 		umount $MNT || { log "UMOUNT_FAIL"; finish; }
 		# Pull the last device: remove its dm node and let btrfs forget it.
 		last=$(( $(echo $DMDEVS | wc -w) - 1 ))
@@ -3209,6 +3226,10 @@ degraded_log_full)
 		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
 		log "mounted degraded without d$last: $(grep " $MNT " /proc/mounts | awk '{print $4}')"
 		ok=0; eio=0
+		for b in $straddle; do
+			if dlf_write $b; then ok=$((ok+1)); else eio=$((eio+1)); fi
+		done
+		log "straddling stripe written first: blocks$straddle (ok=$ok eio=$eio)"
 		for r in $(seq 0 $(( ${NREG:-120} - 1 ))); do
 			for c in 0 1 2; do
 				if dlf_write $(( r * 1024 + c * 16 )); then
@@ -3218,7 +3239,7 @@ degraded_log_full)
 				fi
 			done
 		done
-		log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 ))"
+		log "writes ok=$ok eio=$eio of $(( ${NREG:-120} * 3 + $(echo $straddle | wc -w) ))"
 		# Before the metadata: once a transaction aborts, the tree blocks
 		# it did not write read back as EIO.
 		dlf_read
@@ -3247,7 +3268,7 @@ degraded_log_full)
 		log "DLF after the scrub: a write into a new region $fresh, stale_marks=$(hv stale_marks)"
 	fi
 	echo "$ok $eio $meta $ro $(hv record_dropped) $(hv log_full) $acked $rok $reio $rbad $fresh" \
-	     "$(wv stale_evicted)" > $T/umltest/dlf.$TAG
+	     "$(wv stale_evicted) $(wv sticky_evicted)" > $T/umltest/dlf.$TAG
 	kmsg "raid56|forced readonly|Transaction aborted" 8
 	umount $MNT || log "UMOUNT_FAIL"
 	dmsetup remove_all 2>/dev/null
