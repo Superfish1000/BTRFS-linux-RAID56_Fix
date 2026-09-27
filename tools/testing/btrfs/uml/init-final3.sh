@@ -3067,6 +3067,15 @@ commit_full)
 	#   bring the missing device back, else to copy the data off.  CONTROL=3
 	#   (raid56_wf_recovery_full_legacy=1): nothing unacknowledged, and the
 	#   action a read-write mount, the refused one.
+	# PLAN=replay: prep as above, with a small file written and fsync'd before
+	# the overwrites, which leaves a tree log to replay; degraded as above,
+	# then the read-only mount recovery_log_full recommends, as its message
+	# gives the options.
+	#   CONTROL=0: 'ro,degraded,rescue=nologreplay', which mounts, and the
+	#   message says that without the device no mount makes the filesystem
+	#   writable again, and to copy the data off.  CONTROL=4
+	#   (raid56_wf_advice_legacy=1): '-o ro, with -o degraded', which replays
+	#   the tree log, runs the recovery again and fails the same way.
 	# PHASE=final: every device, rw.  The recovery rebuilds what the log on
 	# disk lists in flight from the data as it is on disk: the target block
 	# must read what was acknowledged ('C' where it was, else 'A' or 'C').
@@ -3084,6 +3093,11 @@ commit_full)
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_recovery_full_legacy \
 				2>/dev/null || log "CONTROL_KNOB_FAIL"
 			log "control: raid56_wf_recovery_full_legacy=1"
+		}
+		[ "${CONTROL:-0}" = 4 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_advice_legacy \
+				2>/dev/null || log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_advice_legacy=1"
 		}
 		[ "${CONTROL:-0}" = 2 ] && {
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_commit_keeps_previous \
@@ -3167,6 +3181,17 @@ commit_full)
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.cf
 		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
 		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		lroot=0
+		if [ "${PLAN:-full}" = replay ]; then
+			# Before the overwrites: the tree log's sync issues a
+			# barrier, which would drop their records.  A few bytes,
+			# inline: no data space, so no chunk allocated, which would
+			# make the fsync a full transaction commit.
+			printf 'fsynced\n' | dd of=$MNT/fsynced conv=fsync status=none ||
+				log "FSYNC_FAIL"
+			lroot=$(btrfs inspect-internal dump-super /dev/mapper/d0 2>/dev/null |
+				awk '$1 == "log_root" {print $2}')
+		fi
 		acked=0
 		for i in $(seq 0 $((CF_REGIONS - 1))); do
 			dd if=/tmp/bblock.cf of=$MNT/nocow bs=4096 seek=$((i * CF_STRIDE)) count=1 \
@@ -3175,8 +3200,8 @@ commit_full)
 		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
 		stats "after the overwrites"
 		log "CF_PREP overwrites=$acked of $CF_REGIONS target=$tgt" \
-		    "commits $commits0 -> $commits1"
-		echo "$acked $([ "$commits0" = "$commits1" ] && echo 0 || echo 1)" \
+		    "commits $commits0 -> $commits1 log_root ${lroot:-?}"
+		echo "$acked $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) ${lroot:-0}" \
 			> $T/umltest/cf-prep.$TAG
 		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)" &&
 			log "KERNEL_SPLAT"
@@ -3191,6 +3216,30 @@ commit_full)
 		tgt=$(cat $T/umltest/cf.target.$TAG)
 		refused=0; acked=-; ro=0
 		ro_un=-; ro_act=-; rm_act=-
+		if [ "${PLAN:-full}" = replay ]; then
+			mount -o $OPTS,degraded $MNTDEV $MNT && refused=0 || refused=1
+			grep " $MNT " /proc/mounts >/dev/null && umount $MNT
+			kmsg "could not keep the record" 1
+			# The read-only mount the alert gives.
+			opts=$(dmesg | sed -n "s/.*'mount -o \([^ ']*\) <device> <mountpoint>'.*/\1/p" |
+			       tail -1)
+			[ -z "$opts" ] && dmesg | grep -q "Mount it read-only (-o ro, with -o degraded" &&
+				opts=ro,degraded
+			deadend=$(dmesg | grep -c "If it cannot come back, no mount can make this filesystem writable again")
+			if [ -n "$opts" ] && mount -o $opts $MNTDEV $MNT; then
+				advised=1
+				allow_nodatacow
+				got=$(cf_blk $tgt)
+				umount $MNT || log "UMOUNT_FAIL"
+			else
+				advised=0; got=-
+				kmsg "could not keep the record|failed to replay|open_ctree" 3
+			fi
+			log "CF replay: rw refused=$refused, advised read-only mount -o ${opts:-?}:" \
+			    "mounted=$advised target=$got dead_end_said=$deadend"
+			echo "$refused ${opts:-none} $advised $got $deadend" > $T/umltest/cf-deg.$TAG
+			finish
+		fi
 		if ! mount -o $OPTS,degraded $MNTDEV $MNT; then
 			refused=1
 			log "CF_RW_REFUSED: the read-write mount failed"

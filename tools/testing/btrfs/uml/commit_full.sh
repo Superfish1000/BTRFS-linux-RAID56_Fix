@@ -4,7 +4,7 @@
 # describes, and does a transaction commit then acknowledge names that exist
 # only in memory?
 #
-#   commit_full.sh <kernel> [full|logio]
+#   commit_full.sh <kernel> [full|logio|replay]
 #
 # See commit_full in init-final3.sh.  RAID5 data, RAID1C3 metadata, four
 # devices.  A crash leaves the log listing 100 regions in flight; mounted with
@@ -39,6 +39,17 @@
 #   health   raid56_wf_recovery_full_legacy=1: nothing unacknowledged, and
 #            the action 'mount-rw' -- the operation that was just refused
 #
+# replay: as full, and a small file fsync'd before the overwrites, which leaves
+# a tree log to replay.  The degraded read-write mount is refused
+# (recovery_log_full); then the read-only mount its message gives:
+#   fixed    'mount -o ro,degraded,rescue=nologreplay': it mounts and the data
+#            reads; the message says that if the device cannot come back no
+#            mount can make the filesystem writable again, and to copy the
+#            data off and recreate it
+#   advice   raid56_wf_advice_legacy=1: '-o ro, with -o degraded': that mount
+#            replays the tree log, runs the recovery again and fails the same
+#            way, and nothing says the filesystem cannot be made writable
+#
 # logio: the log block does not reach enough devices -- a write goes
 # through, then the log slots of three of the four fail every IO, nothing
 # else does (the barriers succeed); the transaction commit that drops the
@@ -48,9 +59,9 @@
 #            commit, it goes on
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: commit_full.sh <kernel> [full|logio]}
+KERNEL=${1:?usage: commit_full.sh <kernel> [full|logio|replay]}
 PLAN=${2:-full}
-case $PLAN in full|logio) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in full|logio|replay) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OMIT=2
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -79,7 +90,7 @@ arm() {	# name control [final]
 		timeout 1800 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw log_buf_len=4M \
 			init=$T/umltest/init-cf.sh $ubds quiet con=null con0=fd:0,fd:1 \
 			BTRFS_TEST_DIR=$T MODE=commit_full OPTS=$3 PROFILE=raid5:raid1c3 TAG=$tag \
-			NDEV=$NDEV CONTROL=$control MNTDEV=$mnt OMITTED=$OMIT PHASE=$1 \
+			NDEV=$NDEV CONTROL=$control MNTDEV=$mnt OMITTED=$OMIT PHASE=$1 PLAN=$PLAN \
 			< /dev/null > $D/log.$1 2>&1
 		echo "boot $1 rc=$?" >> $D/log.boots
 	}
@@ -136,6 +147,56 @@ if [ $PLAN = logio ]; then
 	echo "        with log_commit_failed; control: it went on"
 	exit 0
 fi
+if [ $PLAN = replay ]; then
+	arm fixed 0 no
+	arm advice 4 no
+	for a in fixed advice; do
+		grep -ahE "control:|CF |KERNEL_SPLAT|WATCHDOG|_FAIL|could not keep the record" \
+			$T/umltest/cf-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
+	done
+	res() { cat $T/umltest/cf-$2.cf-$1 2>/dev/null || echo "? ? ? ? ?"; }
+	read -r f_ov f_commit f_lroot <<<"$(res fixed prep)"
+	read -r a_ov a_commit a_lroot <<<"$(res advice prep)"
+	read -r f_ref f_opts f_ok f_got f_dead <<<"$(res fixed deg)"
+	read -r a_ref a_opts a_ok a_got a_dead <<<"$(res advice deg)"
+	echo "  tree log to replay: fixed $f_lroot, advice $a_lroot; read-write mount refused:" \
+	     "fixed $f_ref, advice $a_ref"
+	echo "  the read-only mount recovery_log_full gives: fixed '-o $f_opts' mounted $f_ok" \
+	     "(target $f_got), advice '-o $a_opts' mounted $a_ok"
+	echo "  says no mount can make it writable without the device: fixed $f_dead, advice $a_dead"
+	case "$f_ov$a_ov$f_ref$a_ref" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/cf-{fixed,advice}/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/cf-{fixed,advice}/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-advice/log.* &&
+		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
+	if [ "${f_lroot:-0}" = 0 ] || [ "${a_lroot:-0}" = 0 ] || [ "$f_commit$a_commit" != 00 ]; then
+		echo "RESULT: INCONCLUSIVE -- no tree log was left to replay, or a commit ran"
+		exit 2
+	fi
+	if [ "$f_ref$a_ref" != 11 ]; then
+		echo "RESULT: INCONCLUSIVE -- the degraded read-write mount was not refused"; exit 2
+	fi
+	if [ "$a_opts" != ro,degraded ] || [ "$a_ok" != 0 ] || [ "${a_dead:-0}" != 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control's advice did not fail the same way"
+		echo "        ('-o $a_opts' mounted $a_ok, dead end said $a_dead)"
+		exit 2
+	fi
+	if [ "$f_opts" != ro,degraded,rescue=nologreplay ] || [ "$f_ok" != 1 ]; then
+		echo "RESULT: FAIL -- the read-only mount recovery_log_full gives ('-o $f_opts')" \
+		     "mounted $f_ok"
+		exit 1
+	fi
+	case $f_got in A|eio) ;; *) echo "RESULT: FAIL -- the target block reads $f_got"; exit 1;; esac
+	if [ "${f_dead:-0}" = 0 ]; then
+		echo "RESULT: FAIL -- recovery_log_full does not say that without the device no mount"
+		echo "        makes the filesystem writable again"
+		exit 1
+	fi
+	echo "RESULT: PASS -- with a tree log to replay, the read-only mount recovery_log_full"
+	echo "        gives (-o $f_opts) mounted, and it says the filesystem cannot be made"
+	echo "        writable without the device; control: '-o ro,degraded' failed the same way"
+	exit 0
+fi
 arm fixed 0
 arm health 3 no
 arm r2 1
@@ -146,9 +207,9 @@ for a in fixed health r2 control; do
 	grep -ahE "$SHOW" $T/umltest/cf-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
 done
 res() { cat $T/umltest/cf-$2.cf-$1 2>/dev/null || echo "? ? ? ? ? ?"; }
-read -r f_ov f_commit <<<"$(res fixed prep)"
-read -r r_ov r_commit <<<"$(res r2 prep)"
-read -r c_ov c_commit <<<"$(res control prep)"
+read -r f_ov f_commit _ <<<"$(res fixed prep)"
+read -r r_ov r_commit _ <<<"$(res r2 prep)"
+read -r c_ov c_commit _ <<<"$(res control prep)"
 read -r f_regs f_ref f_ack f_ro f_lcf f_rlf f_roun f_roact f_rmact <<<"$(res fixed deg)"
 read -r h_regs h_ref h_ack h_ro h_lcf h_rlf h_roun h_roact h_rmact <<<"$(res health deg)"
 read -r r_regs r_ref r_ack r_ro r_lcf r_rlf <<<"$(res r2 deg)"
