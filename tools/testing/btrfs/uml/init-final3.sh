@@ -2944,6 +2944,14 @@ commit_full)
 	#     log_commit_failed, and the fsync reports it.  2: the commit keeps
 	#     the previous block and goes on: 'C' is acknowledged, its name only
 	#     in memory.
+	#   Where the read-write mount is refused, the filesystem is mounted
+	#   read-only, degraded, as the alert says, and raid56_health read; then a
+	#   remount read-write, refused again, and raid56_health read again.
+	#   CONTROL=0: recovery_log_full stands unacknowledged on the read-only
+	#   mount (the failed recovery wrote it to the log), and the action is to
+	#   bring the missing device back, else to copy the data off.  CONTROL=3
+	#   (raid56_wf_recovery_full_legacy=1): nothing unacknowledged, and the
+	#   action a read-write mount, the refused one.
 	# PHASE=final: every device, rw.  The recovery rebuilds what the log on
 	# disk lists in flight from the data as it is on disk: the target block
 	# must read what was acknowledged ('C' where it was, else 'A' or 'C').
@@ -2952,10 +2960,15 @@ commit_full)
 	CF_REGIONS=${CF_REGIONS:-100}
 	CF_STRIDE=$(( 23 * NOCOW_FS_BLOCKS ))
 	cf_knobs() {
-		[ "${CONTROL:-0}" -ge 1 ] && {
+		case "${CONTROL:-0}" in 1|2)
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_admit_narrow 2>/dev/null ||
 				log "CONTROL_KNOB_FAIL"
-			log "control: raid56_wf_admit_narrow=1"
+			log "control: raid56_wf_admit_narrow=1";;
+		esac
+		[ "${CONTROL:-0}" = 3 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_recovery_full_legacy \
+				2>/dev/null || log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_recovery_full_legacy=1"
 		}
 		[ "${CONTROL:-0}" = 2 ] && {
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_commit_keeps_previous \
@@ -3062,11 +3075,21 @@ commit_full)
 	degraded)
 		tgt=$(cat $T/umltest/cf.target.$TAG)
 		refused=0; acked=-; ro=0
+		ro_un=-; ro_act=-; rm_act=-
 		if ! mount -o $OPTS,degraded $MNTDEV $MNT; then
 			refused=1
 			log "CF_RW_REFUSED: the read-write mount failed"
 			kmsg "could not keep the record|recovery stopped" 2
 			do_mount ro,degraded $MNTDEV
+			H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+			ro_un=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+			ro_act=$(sed -n 's/^action //p' $H | tr ' ' _)
+			mount -o remount,rw $MNT 2>/dev/null && rm_ok=1 || rm_ok=0
+			rm_act=$(sed -n 's/^action //p' $H | tr ' ' _)
+			log "CF health on the read-only mount: unacknowledged $ro_un, action $ro_act;" \
+			    "remount,rw ok=$rm_ok, then action $rm_act"
+			grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" ||
+				mount -o remount,ro $MNT
 		fi
 		regs=$(dmesg | sed -n 's/.*valid blocks found, \([0-9]*\) regions.*/\1/p' | tail -1)
 		allow_nodatacow
@@ -3087,7 +3110,8 @@ commit_full)
 		    "recovery_log_full=$(sed -n 's/^recovery_log_full //p' $H)" \
 		    "unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
 		echo "${regs:-?} $refused $acked $ro $(sed -n 's/^log_commit_failed //p' $H)" \
-		     "$(sed -n 's/^recovery_log_full //p' $H)" > $T/umltest/cf-deg.$TAG
+		     "$(sed -n 's/^recovery_log_full //p' $H) ${ro_un:-none} $ro_act $rm_act" \
+			> $T/umltest/cf-deg.$TAG
 		umount $MNT || log "UMOUNT_FAIL"
 		finish
 		;;

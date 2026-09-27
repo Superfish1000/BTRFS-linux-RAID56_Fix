@@ -1024,6 +1024,7 @@ u32 btrfs_wib_narrow_max(void);
 u32 btrfs_wib_block_latched(const void *block);
 void btrfs_wib_block_latched_devs(const void *block, u64 *devs);
 bool btrfs_wib_latch_no_devs(void);
+bool btrfs_wib_recovery_full_legacy(void);
 bool btrfs_wib_failed_leaves_flight(void);
 #endif
 #ifdef CONFIG_BTRFS_DEBUG

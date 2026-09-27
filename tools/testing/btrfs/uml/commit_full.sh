@@ -29,6 +29,16 @@
 # INCONCLUSIVE unless the log listed more than 82 regions at the degraded
 # mount and the control acknowledged the write and read it back old.
 #
+# Where the read-write mount is refused, the filesystem is mounted read-only,
+# degraded, as recovery_log_full says, then remounted read-write, which is
+# refused again; raid56_health is read after each:
+#   fixed    recovery_log_full stands unacknowledged on the read-only mount
+#            (the failed recovery wrote it to the log), and the action is
+#            'bring-back-missing-devices then mount-rw then ack, else
+#            copy-data-off-read-only then recreate', after the remount too
+#   health   raid56_wf_recovery_full_legacy=1: nothing unacknowledged, and
+#            the action 'mount-rw' -- the operation that was just refused
+#
 # logio: the log block does not reach enough devices -- a write goes
 # through, then the log slots of three of the four fail every IO, nothing
 # else does (the barriers succeed); the transaction commit that drops the
@@ -50,8 +60,8 @@ cp $HERE/init-final3.sh $T/umltest/init-cf.sh.$$ && mv -f $T/umltest/init-cf.sh.
 cp $HERE/raid56_rows.py $T/umltest/raid56_rows.py.$$ &&
 	mv -f $T/umltest/raid56_rows.py.$$ $T/umltest/raid56_rows.py
 ulimit -c 0
-arm() {	# name control
-	local tag=cf-$1 control=$2
+arm() {	# name control [final]
+	local tag=cf-$1 control=$2 final=${3:-final}
 	local D=$T/umltest/$tag
 	rm -rf $D; mkdir -p $D
 	rm -f $T/umltest/cf-prep.$tag $T/umltest/cf-deg.$tag $T/umltest/cf-final.$tag \
@@ -77,7 +87,7 @@ arm() {	# name control
 	# before the crash (the guest checks and says so).
 	boot prep none rw,commit=600
 	boot degraded $OMIT rw
-	boot final none rw
+	[ $final = final ] && boot final none rw
 	rm -f $D/disk*.img
 }
 if [ $PLAN = logio ]; then
@@ -127,18 +137,20 @@ if [ $PLAN = logio ]; then
 	exit 0
 fi
 arm fixed 0
+arm health 3 no
 arm r2 1
 arm control 2
 SHOW="control:|CF_|CF |KERNEL_SPLAT|WATCHDOG|MOUNT_FAIL|MKFS_FAIL|LAYOUT_FAIL|KNOB_FAIL"
 SHOW="$SHOW|block full|failing the transaction commit|could not keep the record"
-for a in fixed r2 control; do
+for a in fixed health r2 control; do
 	grep -ahE "$SHOW" $T/umltest/cf-$a/log.* | cut -c1-300 | sed "s/^/  [$a] /"
 done
 res() { cat $T/umltest/cf-$2.cf-$1 2>/dev/null || echo "? ? ? ? ? ?"; }
 read -r f_ov f_commit <<<"$(res fixed prep)"
 read -r r_ov r_commit <<<"$(res r2 prep)"
 read -r c_ov c_commit <<<"$(res control prep)"
-read -r f_regs f_ref f_ack f_ro f_lcf f_rlf <<<"$(res fixed deg)"
+read -r f_regs f_ref f_ack f_ro f_lcf f_rlf f_roun f_roact f_rmact <<<"$(res fixed deg)"
+read -r h_regs h_ref h_ack h_ro h_lcf h_rlf h_roun h_roact h_rmact <<<"$(res health deg)"
 read -r r_regs r_ref r_ack r_ro r_lcf r_rlf <<<"$(res r2 deg)"
 read -r c_regs c_ref c_ack c_ro c_lcf c_rlf <<<"$(res control deg)"
 read -r f_got f_bad _ <<<"$(res fixed final)"
@@ -150,7 +162,10 @@ echo "  target write acknowledged: r2 $r_ack, control $c_ack; read-only after it
      "control $c_ro; log_commit_failed r2 $r_lcf, control $c_lcf"
 echo "  target block once every device is back: fixed $f_got, r2 $r_got, control $c_got;" \
      "overwritten blocks read neither A nor B: $f_bad/$r_bad/$c_bad"
-case "$f_ov$r_ov$c_ov$f_regs$r_regs$c_regs$f_got$r_got$c_got" in
+echo "  health on the read-only mount after the refused one: fixed $f_roun, $f_roact;" \
+     "after a refused remount $f_rmact"
+echo "  control (raid56_wf_recovery_full_legacy): $h_roun, $h_roact; after the remount $h_rmact"
+case "$f_ov$r_ov$c_ov$f_regs$r_regs$c_regs$f_got$r_got$c_got$h_regs" in
 *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
 esac
 grep -lq KERNEL_SPLAT $T/umltest/cf-*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
@@ -186,6 +201,21 @@ if [ "$f_ref" != 1 ] ||
 	exit 1
 fi
 case $f_got in A) ;; *) echo "RESULT: FAIL -- fixed: the target block reads $f_got, not A"; exit 1;; esac
+if [ "$h_ref" != 1 ] || [ "$h_roun" != none ] || [ "$h_roact" != mount-rw ] ||
+   [ "$h_rmact" != mount-rw ]; then
+	echo "RESULT: INCONCLUSIVE -- the health control did not show the old raid56_health"
+	echo "        (refused $h_ref, unacknowledged $h_roun, action $h_roact / $h_rmact)"
+	exit 2
+fi
+case ",$f_roun," in *,recovery_log_full,*) ;; *)
+	echo "RESULT: FAIL -- the read-only mount after the refused one shows $f_roun unacknowledged"
+	exit 1;;
+esac
+for a in "$f_roact" "$f_rmact"; do
+	case "$a" in bring-back-missing-devices_then_mount-rw_then_ack,_else_copy-data-off*) ;; *)
+		echo "RESULT: FAIL -- the action after recovery_log_full is $a"; exit 1;;
+	esac
+done
 if [ "$r_ref" != 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- r2: the degraded read-write mount was refused under"
 	echo "        raid56_wf_admit_narrow=1, so no commit met the full log"
@@ -206,7 +236,8 @@ case ",$r_unack," in *,log_commit_failed,*) ;; *)
 	exit 1;;
 esac
 echo "RESULT: PASS -- with $f_regs regions listed, the degraded read-write mount was refused"
-echo "        (recovery_log_full) and nothing read wrong; admitted as before, the commit that"
+echo "        (recovery_log_full), the read-only mount showed it and said to bring the device"
+echo "        back or copy the data off, and nothing read wrong; admitted as before, the commit that"
 echo "        could not write the name failed, read-only, log_commit_failed, fsync EIO, and"
 echo "        the alert stood after the reboot;"
 echo "        control: acknowledged with the name only in memory, read back $c_got (K3)"

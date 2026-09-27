@@ -6391,6 +6391,136 @@ static void wib_write_latch_locked(struct btrfs_wib *wib)
 	wib->last_ok = nr_errors == 0;
 }
 
+/* Read or write (@opf) log slot @slot of @bdev from or to @buf, a page. */
+static int wib_slot_io(struct block_device *bdev, unsigned int slot, void *buf,
+		       blk_opf_t opf)
+{
+	struct bio *bio;
+	int ret;
+
+	bio = bio_alloc(bdev, 1, opf | REQ_META | REQ_PRIO, GFP_NOFS);
+	bio->bi_iter.bi_sector = (BTRFS_WIB_OFFSET + slot * BTRFS_WIB_SLOT_SIZE) >>
+				 SECTOR_SHIFT;
+	__bio_add_page(bio, virt_to_page(buf), BTRFS_WIB_SLOT_SIZE, offset_in_page(buf));
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	return ret;
+}
+
+/*
+ * Put the latched alerts in the log although this mount has written no block
+ * of its own to carry them (@last): its recovery stopped before it wrote one.
+ * The devices that hold the newest block of all get it again, the alerts
+ * updated and one sequence number on, in their other slot.  Every block lists
+ * what it did, the next mount still takes the stale marks from the newest one,
+ * and a device holding an older block keeps it for the union that mount takes
+ * (btrfs_wib_load()).  Nothing to do where no device holds a valid block, or
+ * the newest carries the alerts already.  commit_mutex held -- and not
+ * device_list_mutex, which a transaction commit takes first: the devices are
+ * found as wib_collect_targets() finds them.
+ */
+static void wib_stamp_latch_locked(struct btrfs_wib *wib)
+{
+	struct btrfs_fs_info *fs_info = wib->fs_info;
+	struct btrfs_wib_disk_header *hdr = wib->block;
+	const blk_opf_t opf = REQ_OP_WRITE | REQ_SYNC |
+			      (btrfs_test_opt(fs_info, NOBARRIER) ? 0 : REQ_FUA);
+	u64 devs[BTRFS_WIB_LATCH_DEVS];
+	struct file **files = NULL;
+	unsigned int *slots = NULL;
+	unsigned int nofs_flag;
+	unsigned long flags;
+	u64 *seqs = NULL;
+	bool *ok = NULL;
+	u64 max_seq = 0;
+	int nr_ok = 0;
+	int src = -1;
+	void *buf;
+	int nr = 0;
+	u64 seq;
+
+	lockdep_assert_held(&wib->commit_mutex);
+	nofs_flag = memalloc_nofs_save();
+	buf = (void *)__get_free_page(GFP_NOFS);
+	if (!buf || wib_collect_targets(fs_info, &files, &slots, &nr) < 0)
+		goto out;
+	seqs = kcalloc(nr, sizeof(*seqs), GFP_NOFS);
+	ok = kcalloc(nr, sizeof(*ok), GFP_NOFS);
+	if (!seqs || !ok)
+		goto out;
+	/* The newest valid block of each device, its sequence number + 1. */
+	for (int i = 0; i < nr; i++) {
+		for (unsigned int slot = 0; slot < BTRFS_WIB_NR_SLOTS; slot++) {
+			const struct btrfs_wib_disk_header *bh = buf;
+
+			if (wib_slot_io(file_bdev(files[i]), slot, buf, REQ_OP_READ) ||
+			    !btrfs_wib_block_valid(fs_info, buf) ||
+			    le64_to_cpu(bh->seq) + 1 <= seqs[i])
+				continue;
+			seqs[i] = le64_to_cpu(bh->seq) + 1;
+			slots[i] = slot;
+		}
+		if (seqs[i] > max_seq) {
+			max_seq = seqs[i];
+			src = i;
+		}
+	}
+	if (src < 0 || wib_slot_io(file_bdev(files[src]), slots[src], wib->block, REQ_OP_READ) ||
+	    !btrfs_wib_block_valid(fs_info, wib->block))
+		goto out;
+	memcpy(buf, wib->block, BTRFS_WIB_SLOT_SIZE);
+	raid56_latched_devs(wib, devs);
+	wib_block_set_latched(wib->block, raid56_latched_now(wib), devs);
+	if (!memcmp(wib->block + BTRFS_WIB_LATCH_DEVS_OFFSET, buf + BTRFS_WIB_LATCH_DEVS_OFFSET,
+		    BTRFS_WIB_TRAILER_OFFSET - BTRFS_WIB_LATCH_DEVS_OFFSET))
+		goto out;
+	spin_lock_irqsave(&wib->lock, flags);
+	seq = max(max_seq - 1, wib->snap_seq) + 1;
+	wib->snap_seq = seq;
+	spin_unlock_irqrestore(&wib->lock, flags);
+	hdr->seq = cpu_to_le64(seq);
+	btrfs_csum(fs_info->csum_type, wib->block + BTRFS_CSUM_SIZE,
+		   BTRFS_WIB_SLOT_SIZE - BTRFS_CSUM_SIZE, hdr->csum);
+	for (int i = 0; i < nr; i++) {
+		if (seqs[i] != max_seq)
+			continue;
+		slots[i] = (slots[i] + 1) % BTRFS_WIB_NR_SLOTS;
+		ok[i] = !wib_slot_io(file_bdev(files[i]), slots[i], wib->block, opf);
+		nr_ok += ok[i];
+	}
+	/* The slots written are the newest now; any other is written next. */
+	for (int i = 0; i < nr; i++)
+		if (seqs[i] == max_seq && ok[i])
+			wib_update_targets(fs_info, &files[i], &slots[i], &ok[i], 1, true, NULL);
+	if (!nr_ok)
+		btrfs_warn(fs_info,
+	"raid56 write-intent log: could not write the alerts nobody acknowledged to the log, the next mount will not show them");
+out:
+	kfree(ok);
+	kfree(seqs);
+	for (int i = 0; i < nr; i++)
+		fput(files[i]);
+	kfree(files);
+	kfree(slots);
+	free_page((unsigned long)buf);
+	memalloc_nofs_restore(nofs_flag);
+}
+
+/*
+ * Put the latched alerts in the log (wib_write_latch_locked()) -- or, where
+ * this mount has written no block to carry them and @stamp,
+ * wib_stamp_latch_locked().
+ */
+static void wib_write_latch(struct btrfs_wib *wib, bool stamp)
+{
+	mutex_lock(&wib->commit_mutex);
+	if (le64_to_cpu(((struct btrfs_wib_disk_header *)wib->last)->magic) == BTRFS_WIB_MAGIC)
+		wib_write_latch_locked(wib);
+	else if (stamp)
+		wib_stamp_latch_locked(wib);
+	mutex_unlock(&wib->commit_mutex);
+}
+
 /*
  * The latched alerts changed (a new one, or an acknowledgment): put them in the
  * log now, not with whatever block comes next -- on an idle filesystem that may
@@ -7060,6 +7190,30 @@ static const bool latch_no_devs;
 bool btrfs_wib_latch_no_devs(void)
 {
 	return READ_ONCE(latch_no_devs);
+}
+#endif
+
+/*
+ * Testing only: a recovery that stops, recovery_log_full above all, leaves
+ * the alerts it raised in memory, the log saying nothing of them -- the
+ * read-only mount its alert recommends shows none -- and raid56_health's
+ * action while the log is not recovered is a read-write mount, the one thing
+ * that has just failed, as before.  The negative control for the health arm
+ * of uml/commit_full.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool recovery_full_legacy;
+module_param_named(raid56_wf_recovery_full_legacy, recovery_full_legacy, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_recovery_full_legacy,
+		 "Keep the alerts of a write-intent log recovery that stopped in memory only, and have raid56_health advise a read-write mount after recovery_log_full (testing only: restores the old behaviour)");
+#else
+static const bool recovery_full_legacy;
+#endif
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+bool btrfs_wib_recovery_full_legacy(void)
+{
+	return READ_ONCE(recovery_full_legacy);
 }
 #endif
 
@@ -7795,7 +7949,9 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 	bool undecidable;
 	bool unrecovered;
 	bool aborted;
+	bool missing;
 	bool failing;
+	bool stuck;
 	int len = 0;
 
 	if (!wib)
@@ -7877,8 +8033,25 @@ ssize_t btrfs_raid56_health_show(struct btrfs_fs_info *fs_info, char *buf)
 	 * least of all.
 	 */
 	aborted = BTRFS_FS_ERROR(fs_info) && !READ_ONCE(refusal_health_legacy);
+	/*
+	 * The log is not recovered because a recovery with a device missing,
+	 * this mount's or the one before it, had more to keep than a log
+	 * block describes (recovery_log_full): a read-write mount fails the
+	 * same way until the device is back, and never makes the filesystem
+	 * writable if it cannot come back.  One at this mount with every
+	 * device there: the same unless a device is fixed.
+	 */
+	missing = READ_ONCE(fs_info->fs_devices->missing_devices);
+	stuck = unrecovered && !READ_ONCE(recovery_full_legacy) &&
+		(READ_ONCE(wib->recovery_full) ||
+		 (missing && (latched & BIT(BTRFS_RAID56_EV_RECOVERY_FULL))));
 	len += sysfs_emit_at(buf, len, "action %s", aborted ? "unmount then mount-rw" : "");
-	if (unrecovered) {
+	if (stuck) {
+		len += sysfs_emit_at(buf, len, "%s%s then mount-rw then ack, else %s\n",
+				     aborted ? " then " : "",
+				     missing ? "bring-back-missing-devices" : "fix-devices",
+				     "copy-data-off-read-only then recreate");
+	} else if (unrecovered) {
 		len += sysfs_emit_at(buf, len, "%s\n", aborted ? "" : "mount-rw");
 	} else if (health == BTRFS_RAID56_HEALTH_FAILING) {
 		bool named = false;
@@ -8932,6 +9105,13 @@ out:
 	if (ret < 0 && wib->pending)
 		wib_recovery_stopped(wib, ret);
 	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
+	/*
+	 * And what it raised goes to the log: no block of this mount carries
+	 * it, the mount stays read-only or fails, and the read-only mount
+	 * recovery_log_full recommends would show nothing unacknowledged.
+	 */
+	if (ret < 0 && !READ_ONCE(recovery_full_legacy))
+		wib_write_latch(wib, true);
 	return ret;
 }
 
@@ -9043,6 +9223,9 @@ int btrfs_wib_recover_after_replay(struct btrfs_fs_info *fs_info)
 out_end:
 	WRITE_ONCE(wib->recovery_running, false);
 	btrfs_scrub_raid56_recovery_end(fs_info, sctx);
+	/* The mount fails: as btrfs_wib_recover() does. */
+	if (ret < 0 && !READ_ONCE(recovery_full_legacy))
+		wib_write_latch(wib, true);
 out:
 	kvfree(snap);
 	return ret;

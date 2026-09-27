@@ -830,9 +830,40 @@ static int test_unrecovered_health(struct btrfs_fs_info *fs_info)
 		test_err("raid56_health does not ask for a read-write mount while unrecovered records are refused");
 		goto out;
 	}
+	/*
+	 * Unless that is what just failed, a recovery with more to keep than a
+	 * log block describes (recovery_log_full): with a device missing, it
+	 * is to come back first, or the data to be copied off.  Under
+	 * raid56_wf_recovery_full_legacy=1 the read-write mount, as before.
+	 */
+	if (!old) {
+		const bool legacy = btrfs_wib_recovery_full_legacy();
+		const char *missing = legacy ? "\naction mount-rw\n" :
+			"\naction bring-back-missing-devices then mount-rw then ack, else copy-data-off-read-only then recreate\n";
+		const char *present = legacy ? "\naction mount-rw\n" :
+			"\naction fix-devices then mount-rw then ack, else copy-data-off-read-only then recreate\n";
+
+		wib->recovery_full = true;
+		fs_info->fs_devices->missing_devices = 1;
+		btrfs_raid56_health_show(fs_info, buf);
+		if (!strstr(buf, missing)) {
+			test_err("raid56_health after recovery_log_full with a device missing: %s",
+				 strstr(buf, "action") ?: "no action");
+			goto out;
+		}
+		fs_info->fs_devices->missing_devices = 0;
+		btrfs_raid56_health_show(fs_info, buf);
+		if (!strstr(buf, present)) {
+			test_err("raid56_health after recovery_log_full with every device there: %s",
+				 strstr(buf, "action") ?: "no action");
+			goto out;
+		}
+	}
 	ret = 0;
 out:
 	wib->pending_unrecovered = false;
+	wib->recovery_full = false;
+	fs_info->fs_devices->missing_devices = 0;
 	free_page((unsigned long)before);
 	free_page((unsigned long)buf);
 	return ret;
