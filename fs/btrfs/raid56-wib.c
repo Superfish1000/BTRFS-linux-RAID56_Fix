@@ -6524,6 +6524,23 @@ static const bool latch_needs_log;
 #endif
 
 /*
+ * Testing only: an unmount discards the latch work queued a moment before --
+ * an acknowledgment, or a new alert -- and writes nothing of what an error
+ * that made the filesystem read-only latched, that of the unmount's own
+ * commit above all (raised once the alerts stopped); and an acknowledgment
+ * on a read-only mount says nothing of lasting only that long.  As before.
+ * The negative control for the unmount plan of uml/alert_latch.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool latch_unmount_drops;
+module_param_named(raid56_wf_latch_unmount_drops, latch_unmount_drops, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_latch_unmount_drops,
+		 "Let an unmount discard the raid56 alerts and acknowledgments not yet in the write-intent log, and one after an error write none, and say nothing when an acknowledgment on a read-only mount lasts only that mount (testing only: restores the old behaviour)");
+#else
+static const bool latch_unmount_drops;
+#endif
+
+/*
  * Put the latched alerts in the log (wib_write_latch_locked()) -- or, where
  * this mount has written no block to carry them and @stamp,
  * wib_stamp_latch_locked().
@@ -6623,6 +6640,22 @@ void btrfs_wib_unmount(struct btrfs_fs_info *fs_info)
 	/* An acknowledgment the log does not have yet: see wib_latch_work(). */
 	wib_write_latch_locked(wib);
 	mutex_unlock(&wib->commit_mutex);
+}
+
+/*
+ * The filesystem is being unmounted after an error made it read-only: a
+ * transaction commit failed, the unmount's own among them, and its alerts
+ * were raised after they stopped (btrfs_raid56_alert_stop()), so no latch
+ * work wrote them; nor does anything else write the log any more.  Put what
+ * is latched in it, as wib_latch_work() does on such a filesystem.
+ */
+void btrfs_wib_close_latch(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+
+	if (!wib || READ_ONCE(latch_unmount_drops))
+		return;
+	wib_write_latch(wib, !READ_ONCE(latch_needs_log));
 }
 
 /*
@@ -7931,8 +7964,13 @@ static void raid56_alert_work(struct work_struct *work)
 		raid56_alert_kick(wib, BTRFS_RAID56_ALERT_PERIOD);
 }
 
-/* No more alerts: unmount, or a mount that failed. */
-static void raid56_alert_stop(struct btrfs_wib *wib)
+/*
+ * No more alerts: unmount (@flush), or a mount that failed.  An unmount writes
+ * what the latch work was queued for, an acknowledgment or an alert raised a
+ * moment ago: the devices are still open, and on a filesystem an error made
+ * read-only nothing else would ever write it.
+ */
+static void raid56_alert_stop(struct btrfs_wib *wib, bool flush)
 {
 	unsigned long flags;
 
@@ -7940,13 +7978,16 @@ static void raid56_alert_stop(struct btrfs_wib *wib)
 	wib->alert_stopped = true;
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
 	cancel_delayed_work_sync(&wib->alert_work);
-	cancel_work_sync(&wib->latch_work);
+	if (flush && !READ_ONCE(latch_unmount_drops))
+		flush_work(&wib->latch_work);
+	else
+		cancel_work_sync(&wib->latch_work);
 }
 
 void btrfs_raid56_alert_stop(struct btrfs_fs_info *fs_info)
 {
 	if (fs_info->wib)
-		raid56_alert_stop(fs_info->wib);
+		raid56_alert_stop(fs_info->wib, true);
 }
 
 /*
@@ -8135,7 +8176,15 @@ int btrfs_raid56_health_ack(struct btrfs_fs_info *fs_info, bool check_seq, u64 s
 	if (was && !wib->alert_stopped)
 		queue_work(system_wq, &wib->latch_work);
 	spin_unlock_irqrestore(&wib->alert_lock, flags);
-	if (was)
+	/*
+	 * A read-only mount writes nothing, and its unmount does not either:
+	 * the log keeps the alerts, and the next mount shows them again.
+	 */
+	if (was && !btrfs_is_testing(fs_info) && sb_rdonly(fs_info->sb) &&
+	    !BTRFS_FS_ERROR(fs_info) && !READ_ONCE(latch_unmount_drops))
+		btrfs_warn(fs_info,
+"raid56: alerts acknowledged for this mount only: it is read-only, so the write-intent log keeps them and the next mount shows them again. Acknowledge them again once the filesystem is mounted read-write, or remount this one read-write, which writes the acknowledgment");
+	else if (was)
 		btrfs_info(fs_info, "raid56: alerts acknowledged");
 	raid56_alert_kick(wib, 0);
 	return 0;
@@ -8212,7 +8261,7 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 		return;
 	/* Normally done already by close_ctree(); a failed mount may not have. */
 	btrfs_raid56_stop_repairs(fs_info);
-	raid56_alert_stop(wib);
+	raid56_alert_stop(wib, false);
 	fs_info->wib = NULL;
 	free_page((unsigned long)wib->block);
 	free_page((unsigned long)wib->last);

@@ -44,11 +44,27 @@
 #            again with it (wib_stamp_latch_locked())
 #   control  raid56_wf_latch_needs_log=1: nothing wrote the ack, and the alert
 #            is back -- at every mount, for good
+#
+#   alert_latch.sh <kernel> unmount
+#
+# One boot.  A write goes through; then the log slots of three devices of four
+# fail every IO, and the filesystem is unmounted: the unmount's transaction
+# commit cannot write the log and fails (log_commit_failed, read-only), and the
+# alert reaches the fourth device.  Healed and mounted read-only, the alert is
+# acknowledged; then unmounted, mounted read-write, acknowledged there, and
+# mounted again.  In both arms log_commit_failed stands on the read-only
+# mount, again on the read-write mount (an ack on a read-only mount cannot
+# reach the log), and is gone after the ack there.
+#   fixed    the read-only ack says it lasts that mount only
+#   control  raid56_wf_latch_unmount_drops=1: it says nothing
+# The same knob restores an unmount that discards the latch work queued a
+# moment before and writes nothing an error latched once the alerts stopped;
+# no arm reaches either (README.md, Known gaps).
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: alert_latch.sh <kernel> [narrow|disabled]}
+KERNEL=${1:?usage: alert_latch.sh <kernel> [narrow|disabled|unmount]}
 PLAN=${2:-latch}
-case $PLAN in latch|narrow|disabled) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in latch|narrow|disabled|unmount) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p $T/umltest
@@ -78,6 +94,54 @@ arm() {	# name control
 	boot final rw $2
 	rm -f $D/disk*.img
 }
+if [ $PLAN = unmount ]; then
+	for a in fixed:0 control:1; do
+		tag=al-u${a%%:*}
+		D=$T/umltest/$tag
+		rm -rf $D; mkdir -p $D
+		rm -f $T/umltest/al.$tag.* $T/umltest/results.$tag
+		for i in $(seq 0 $((NDEV-1))); do truncate -s 256M $D/disk$i.img; done
+		boot uraise rw,commit=600 ${a##*:}
+		rm -f $D/disk*.img
+		grep -ahE "control:|AL |commit FAILED|failing the transaction|KERNEL_SPLAT|WATCHDOG|_FAIL" \
+			$D/log.* | cut -c1-300 | sed "s/^/  [${a%%:*}] /"
+	done
+	res() { cat $T/umltest/al.al-u$1.uraise 2>/dev/null || echo "? ? ? ? ?"; }
+	read -r f_w f_u1 f_msg f_u2 f_u3 <<<"$(res fixed)"
+	read -r c_w c_u1 c_msg c_u2 c_u3 <<<"$(res control)"
+	echo "  unacknowledged after the failed unmount, read-only / read-write after a read-only"
+	echo "  ack / after an ack there (the read-only ack said it lasts that mount only):"
+	echo "    fixed   $f_u1 / $f_u2 / $f_u3 ($f_msg)"
+	echo "    control $c_u1 / $c_u2 / $c_u3 ($c_msg)"
+	case "$f_w$c_w" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/al-u*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/al-u*/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/al-ucontrol/log.* &&
+		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
+	grep -aq "commit FAILED" $T/umltest/al-ufixed/log.* $T/umltest/al-ucontrol/log.* ||
+		{ echo "RESULT: INCONCLUSIVE -- the unmount's commit did not fail"; exit 2; }
+	has() { case ",$1," in *,log_commit_failed,*) return 0;; esac; return 1; }
+	for v in "$f_w:$f_u1:$f_u2:$f_u3" "$c_w:$c_u1:$c_u2:$c_u3"; do
+		case "$v" in ok:*log_commit_failed*:*log_commit_failed*:none) ;; *)
+			echo "RESULT: INCONCLUSIVE -- the alert did not stand after the unmount and the"
+			echo "        read-only ack, or did after the read-write one ($v)"
+			exit 2;;
+		esac
+	done
+	if [ "$c_msg" != 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- the control's read-only ack said something ($c_msg)"
+		exit 2
+	fi
+	if [ "$f_msg" != 1 ]; then
+		echo "RESULT: FAIL -- the ack on the read-only mount did not say it lasts that mount" \
+		     "only, and the alert came back ($f_u2)"
+		exit 1
+	fi
+	echo "RESULT: PASS -- the ack on the read-only mount said it lasts that mount only (the"
+	echo "        alert stood again on the read-write mount, and went with the ack there);"
+	echo "        control: the read-only ack said nothing and the alert came back all the same"
+	exit 0
+fi
 if [ $PLAN = disabled ]; then
 	darm() {	# name control
 		tag=al-d$1

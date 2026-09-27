@@ -1062,6 +1062,7 @@ void btrfs_wib_parity_unwritten(struct btrfs_fs_info *fs_info, u64 start, u64 le
 				unsigned int parities);
 #endif
 void btrfs_wib_unmount(struct btrfs_fs_info *fs_info);
+void btrfs_wib_close_latch(struct btrfs_fs_info *fs_info);
 void btrfs_wib_remount_ro(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);

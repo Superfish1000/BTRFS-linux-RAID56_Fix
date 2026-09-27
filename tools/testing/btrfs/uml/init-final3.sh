@@ -2440,6 +2440,15 @@ alert_latch)
 	# raid56_wf_latch_full_narrow=1: the newest block lists 165 regions and
 	# no alert, and the mount after the crash reads none.
 	#
+	# PLAN=unmount (PHASE=uraise, one boot): a write goes through, then the
+	# log slots of three devices of four fail every IO and the filesystem is
+	# unmounted: the unmount's commit cannot write the log and fails,
+	# log_commit_failed, read-only; the alert reaches the fourth device.
+	# Healed and mounted read-only, it stands; it is acknowledged, and after
+	# an unmount and a read-write mount it stands again, until acknowledged
+	# there.  Fixed, the read-only ack says it lasts that mount only;
+	# CONTROL=1 (raid56_wf_latch_unmount_drops=1): it says nothing.
+	#
 	# PLAN=disabled (PHASE=draise, then dcheck): the alert raised as above,
 	# then the feature cleared (the log disabled: its last block carries the
 	# alert), an unmount, and a mount with -o noraid56_write_intent: the
@@ -2455,7 +2464,11 @@ alert_latch)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_needs_log 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: raid56_wf_latch_needs_log=1";;
-	narrow:*|disabled:*) ;;
+	unmount:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_unmount_drops 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_unmount_drops=1";;
+	narrow:*|disabled:*|unmount:*) ;;
 	*:1)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_volatile 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
@@ -2471,6 +2484,46 @@ alert_latch)
 		sleep 60
 	}
 	case "$PHASE" in
+	uraise)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_bad_sectors $i $((512 * 1024)) $((516 * 1024)); done
+		touch $MNT/marker
+		umount $MNT && um=ok || um=fail
+		kmsg "commit FAILED|failing the transaction commit|commit super" 3
+		for i in 0 1 2; do dm_heal $i; done
+		do_mount ro /dev/mapper/d0
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		u1=$(unack)
+		m0=$(dmesg | grep -c "acknowledged for this mount only")
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 2
+		msg=$(( $(dmesg | grep -c "acknowledged for this mount only") - m0 ))
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw /dev/mapper/d0
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		u2=$(unack)
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 2
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw /dev/mapper/d0
+		u3=$(unack)
+		log "AL uraise: write $w1, unmount $um; read-only mount: $u1, its ack said this" \
+		    "mount only: $msg; read-write mount after it: $u2; after an ack there: $u3"
+		echo "$w1 ${u1:-none} $msg ${u2:-none} ${u3:-none}" > $T/umltest/al.$TAG.uraise
+		umount $MNT || log "UMOUNT_FAIL"
+		dmsetup remove_all 2>/dev/null
+		finish
+		;;
 	draise)
 		dm_setup
 		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }

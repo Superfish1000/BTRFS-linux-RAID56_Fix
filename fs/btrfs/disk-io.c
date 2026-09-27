@@ -4622,6 +4622,9 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 				btrfs_wib_unmount(fs_info);
 		}
 	}
+	/* After an error the RAID56 alerts go to the log all the same. */
+	if (BTRFS_FS_ERROR(fs_info) && !btrfs_is_shutdown(fs_info))
+		btrfs_wib_close_latch(fs_info);
 
 	kthread_stop(fs_info->transaction_kthread);
 	kthread_stop(fs_info->cleaner_kthread);
