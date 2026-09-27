@@ -35,7 +35,7 @@
 #              record is spent, every write succeeds
 #     control  raid56_wf_evict_stage0=1 and raid56_wf_torn_spent_eagerly=1:
 #              each spends one at once (sticky_evicted, record_dropped)
-#   hot    165 regions, as torn, and instead of FW_FRESH writes one at a
+#   hot    164 regions, as torn, and instead of FW_FRESH writes one at a
 #          time, a write into one of the recorded regions held in flight once
 #          its bios have completed (raid56_write_hold_ms), then one write into
 #          a new region
