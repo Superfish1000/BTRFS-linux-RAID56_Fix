@@ -708,6 +708,16 @@ module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0
 MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
 		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
 /*
+ * raid56_wf_admit_recorded_free=1: a write into a region the log records only
+ * as room to spend is admitted uncharged, as before (wib_count_entries_locked()),
+ * and can leave more regions that may not be spent than a wide block
+ * describes.  The negative control for test_admit_wide().
+ */
+static bool admit_recorded_free;
+module_param_named(raid56_wf_admit_recorded_free, admit_recorded_free, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_admit_recorded_free,
+		 "Admit a write into a region the write-intent log records only as room to spend without charging for it (testing only: restores a known defect)");
+/*
  * raid56_wf_flush_drop_asserts=1: wib_flush_and_drop_locked() asserts, as
  * before, that the set it snapshots fits a block -- a BUG() on a kernel with
  * CONFIG_BTRFS_ASSERT where the set is more than a block describes, which a
@@ -728,6 +738,7 @@ static const bool torn_spent_eagerly;
 static const bool kept_torn_in_order;
 static const bool admit_narrow;
 static const bool failed_leaves_flight;
+static const bool admit_recorded_free;
 static const bool flush_drop_asserts;
 #endif
 
@@ -776,6 +787,11 @@ bool btrfs_wib_kept_torn_in_order(void)
 bool btrfs_wib_admits_narrow(void)
 {
 	return READ_ONCE(admit_narrow);
+}
+
+bool btrfs_wib_admits_recorded_free(void)
+{
+	return READ_ONCE(admit_recorded_free);
 }
 
 bool btrfs_wib_flush_drop_asserts(void)
@@ -1156,6 +1172,15 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
  * sticky-only ones outside the range that can be evicted -- with every
  * device there, those that only say a write may have been torn only if
  * @spend_torn).
+ *
+ * And an entry of the range the log could spend (wib_evictable()) counts as
+ * needed, and as room: once the write is in flight it can no longer be spent,
+ * so it takes a slot of what may not be spent as a new one does.  Not charged,
+ * a write into such a region was admitted whatever was left -- the room came
+ * out at nothing, and nothing more was needed -- and could leave more regions
+ * that may not be spent than a wide block describes: the first name then made
+ * a set no block could describe (wib_admit_max()).  Not so under
+ * raid56_wf_admit_recorded_free=1.
  */
 static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len,
 				     bool spend_torn, unsigned int *needed,
@@ -1167,12 +1192,15 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 	lockdep_assert_held(&wib->lock);
 
 	const u32 max = wib_admit_max(wib);
+	const bool uncharged = READ_ONCE(admit_recorded_free);
 	u32 live = 0, evictable = 0;
 
 	*needed = 0;
 	*avail = 0;
 	for (u64 cur = first; cur <= last; cur += BTRFS_WIB_ENTRY_SIZE) {
-		if (!wib_find_entry(wib, cur))
+		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+
+		if (!e || (!uncharged && wib_evictable(wib, e, spend_torn)))
 			(*needed)++;
 	}
 	for (int i = 0; i < BTRFS_WIB_NR_ENTRIES; i++) {
@@ -1181,7 +1209,8 @@ static void wib_count_entries_locked(struct btrfs_wib *wib, u64 logical, u64 len
 		if (!wib_entry_used(e))
 			continue;
 		live++;
-		if (wib_evictable(wib, e, spend_torn) && (e->bytenr < first || e->bytenr > last))
+		if (wib_evictable(wib, e, spend_torn) &&
+		    (!uncharged || e->bytenr < first || e->bytenr > last))
 			evictable++;
 	}
 	/*

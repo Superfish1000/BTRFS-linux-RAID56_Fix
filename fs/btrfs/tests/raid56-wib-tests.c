@@ -1728,6 +1728,72 @@ out:
 }
 
 /*
+ * A write into a region the log records only as room to spend (a sticky-only
+ * record, wib_evictable()) takes that region out of what may be spent, as a
+ * write into a new region takes a slot: it is charged (wib_count_entries_locked()).
+ * Uncharged, it was admitted however many regions that may not be spent the
+ * set already held -- the room came out at nothing, and nothing more was
+ * needed -- and could leave more of them than a wide block describes.  Under
+ * raid56_wf_admit_recorded_free=1 it is admitted, as before.
+ */
+static int test_admit_recorded(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool free = btrfs_wib_admits_recorded_free();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6200;
+	const u32 nr_vague = 4;
+	const u64 first_vague = (base + BTRFS_WIB_MAX_ENTRIES - 1) * BTRFS_WIB_ENTRY_SIZE;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r1, r2;
+
+	if (btrfs_wib_evicts_naming() || btrfs_wib_admits_narrow()) {
+		test_msg("raid56_evict_naming or raid56_wf_admit_narrow is set, skipping the recorded-region admission test");
+		return 0;
+	}
+	/* One region short of a wide block in flight, and a few vague records. */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1 + nr_vague; i++) {
+		const bool vague = i >= BTRFS_WIB_MAX_ENTRIES - 1;
+
+		if (!put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE, vague ? 0 : 0x1,
+			       vague ? 0x1 : 0)) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+	}
+	/* The first vague region takes the last slot; the second has none. */
+	spin_lock_irqsave(&wib->lock, flags);
+	r1 = btrfs_wib_try_mark(wib, first_vague, blk);
+	r2 = btrfs_wib_try_mark(wib, first_vague + BTRFS_WIB_ENTRY_SIZE, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (r1) {
+		test_err("a write into a recorded region with a slot left was refused: %d", r1);
+		goto out;
+	}
+	if (free) {
+		if (r2) {
+			test_err("raid56_wf_admit_recorded_free is set, yet the write was refused: %d", r2);
+			goto out;
+		}
+		test_msg("raid56_wf_admit_recorded_free is set: %u regions that may not be spent admitted, as expected",
+			 (unsigned int)BTRFS_WIB_MAX_ENTRIES + 1);
+	} else if (r2 != -ENOSPC ||
+		   btrfs_wib_can_mark(wib, first_vague + BTRFS_WIB_ENTRY_SIZE, blk)) {
+		test_err("a write into a recorded region past what a wide block describes was admitted: %d",
+			 r2);
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES - 1 + nr_vague; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	return ret;
+}
+
+/*
  * A transaction commit that cannot write the log fails, so that the
  * transaction aborts (wib_commit_failed()): here more regions name a member
  * than a wide block describes -- no write is admitted into that
@@ -5850,6 +5916,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_admit_wide(fs_info);
+	if (ret)
+		goto out;
+	ret = test_admit_recorded(fs_info);
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);
