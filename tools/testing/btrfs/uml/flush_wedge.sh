@@ -50,11 +50,12 @@
 #   describes, and refuses all eight (commit_full.sh).
 #   unnamed (CUR-4)  164 regions, as torn: too many to name device 1 in
 #     fixed    the commit whose barrier failed fails instead (read-only), with
-#              the log_flush_unnamed alert: the overwrites are never
-#              acknowledged -- and until the unmount the refused readd keeps
-#              in memory the names it could not write (@refused_names), so
-#              every block reads back as written: device 1's dropped column
-#              is rebuilt from the parity the others flushed
+#              the log_flush_unnamed alert: no commit makes the overwrites
+#              durable (their O_DIRECT writes did return) -- and until the
+#              unmount the refused readd keeps in memory the names it could
+#              not write (@refused_names), so every overwrite reads back as
+#              written, none old, none refused: device 1's dropped column is
+#              rebuilt from the parity the others flushed
 #     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 #              overwrites device 1 dropped read back as the block was before
 #              the acknowledged write, with no error
@@ -309,9 +310,11 @@ if [ $PLAN = unnamed ]; then
 		<<<"$(res unnamedctl)"
 	echo "  unnamedctl: went on $u_fsync, read-only $u_ro, log_flush_unnamed $u_unn;" \
 	     "read back ok/eio/bad $u_rdok/$u_rdeio/$u_rdbad of $u_acked (old $u_rold)"
-	if [ "${u_fsync:-1}" != 0 ] || [ "${u_rold:-0}" = 0 ]; then
-		echo "RESULT: INCONCLUSIVE -- with raid56_wf_refusal_leaves_unnamed=1 the commit went on or"
-		echo "        nothing read back old, so the fixed arm's reads show nothing"
+	if [ "${u_fsync:-1}" != 0 ] || [ "${u_ro:-0}" != 1 ] || [ "${u_unn:-0}" = 0 ] ||
+	   [ "${u_rold:-0}" = 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- with raid56_wf_refusal_leaves_unnamed=1 the commit was not refused"
+		echo "        read-only with log_flush_unnamed (went on $u_fsync, read-only $u_ro, alert $u_unn) or"
+		echo "        nothing read back old ($u_rold), so the fixed arm's reads show nothing"
 		exit 2
 	fi
 	if [ "${f_rold:-0}" != 0 ] || [ "${f_rdeio:-0}" != 0 ]; then
@@ -319,10 +322,16 @@ if [ $PLAN = unnamed ]; then
 		echo "        $f_rdeio failed, although the refused readd could have kept their names"
 		exit 1
 	fi
+	# Every overwrite whose O_DIRECT write returned was read, and read 'B'.
+	if [ "${f_acked:-0}" = 0 ] || [ "${f_rdok:-0}" != "$f_acked" ]; then
+		echo "RESULT: FAIL -- $f_rdok of $f_acked overwrites read back as written after the refusal"
+		exit 1
+	fi
 	echo "RESULT: PASS -- the commit that could not name device 1 failed, read-only, with the alert,"
-	echo "        and every overwrite read back as written until the unmount ($f_rdok);"
-	echo "        keeping no names, $u_rold read back as before (unnamedctl); control: the commit went"
-	echo "        on and $c_rold acknowledged block(s) read back old, no error"
+	echo "        so no commit made the overwrites durable (their O_DIRECT writes returned); until the"
+	echo "        unmount all $f_rdok of $f_acked read back as written, none old, none refused;"
+	echo "        keeping no names, $u_rold read back as before, no error (unnamedctl); control: the"
+	echo "        commit went on and $c_rold acknowledged block(s) read back old, no error"
 	exit 0
 fi
 if [ $PLAN = named ]; then

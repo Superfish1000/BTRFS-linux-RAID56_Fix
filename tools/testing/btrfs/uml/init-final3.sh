@@ -5925,9 +5925,10 @@ flush_wedge)
 	#   PLAN=unnamed (FW_REGIONS 164, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
-	#              nothing acknowledges the overwrites -- and the names the
-	#              readd could not write stay in memory for the reads until
-	#              the unmount (@refused_names): every overwrite reads back
+	#              no commit makes the overwrites durable (their O_DIRECT
+	#              writes did return) -- and the names the readd could not
+	#              write stay in memory for the reads until the unmount
+	#              (@refused_names): every overwrite reads back as written
 	#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 	#              overwrites FAIL dropped read back as the block was before,
 	#              with no error
