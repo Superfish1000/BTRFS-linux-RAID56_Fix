@@ -4246,6 +4246,18 @@ static unsigned int repair_hold_ms;
 module_param_named(raid56_repair_hold_ms, repair_hold_ms, uint, 0644);
 MODULE_PARM_DESC(raid56_repair_hold_ms,
 		 "Hold each repair this many ms before it writes (testing only)");
+
+/*
+ * Testing only: hold every write that is not a repair this many ms once its
+ * bios have completed, before the write-intent log hears of it -- its record,
+ * or a full stripe's unlogged one, stays in flight meanwhile -- for as long as
+ * this is set.  See uml/fullstripe_flush.sh (inflight), uml/flush_wedge.sh
+ * (hot).
+ */
+static unsigned int write_hold_ms;
+module_param_named(raid56_write_hold_ms, write_hold_ms, uint, 0644);
+MODULE_PARM_DESC(raid56_write_hold_ms,
+		 "Hold each write this many ms once its bios have completed, before the write-intent log hears of it (testing only)");
 #else
 /* Constants, not macros: see rmw_no_repair. */
 static const bool no_repair_on_fault;
@@ -5093,6 +5105,17 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	if (unlikely(crash_point == 1 || crash_point == 2))
 		panic("btrfs: raid56 crash injection %d at full stripe %llu",
 		      crash_point, full_stripe_start);
+	if (unlikely(READ_ONCE(write_hold_ms)) &&
+	    !test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
+		const unsigned int hold = READ_ONCE(write_hold_ms);
+
+		if (hold) {
+			btrfs_info(fs_info,
+		"raid56: write of full stripe %llu holding for %u ms with its bios completed",
+				   full_stripe_start, hold);
+			msleep(hold);
+		}
+	}
 #endif
 
 	/*
@@ -5296,12 +5319,14 @@ out:
 	 * (it was allocated whole), so whatever the record says about it is
 	 * over.  Left in place, a stale mark keeps diverting reads of the new
 	 * data to a rebuild the record then calls undecidable: EIO for good.
-	 * Such a write is not logged, so nothing else would clear it.
+	 * Such a write is not logged, so nothing else would clear it.  But not
+	 * what a flush that failed while its bios were in flight named: the
+	 * write may have gone into the cache the device then lost.
 	 */
 	if (!logged && ret >= 0 && rbio_is_full(rbio) &&
 	    bitmap_empty(rbio->error_bitmap, rbio->nr_sectors) &&
 	    unlikely(btrfs_wib_any_stale(fs_info)))
-		btrfs_wib_clear_sticky(fs_info, full_stripe_start, full_stripe_len);
+		btrfs_wib_clear_written(fs_info, full_stripe_start, full_stripe_len);
 
 	if (test_bit(RBIO_REPAIR_BIT, &rbio->flags)) {
 		raid56_repair_finished(rbio, ret, faulted);

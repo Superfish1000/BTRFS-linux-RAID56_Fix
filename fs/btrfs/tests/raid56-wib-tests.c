@@ -4104,6 +4104,63 @@ static u64 readd_full_many(struct readd_rig *rig, u64 first, u64 nr, bool finish
 }
 
 /*
+ * The full stripe of region @k, in flight at a failed flush that named its
+ * member on the failed device, has finished on every device: rmw_rbio() then
+ * clears what the record says of the stripe (btrfs_wib_clear_written()) --
+ * but not that name (@hold), which the flush took out of the write's unlogged
+ * record: part of the write may have gone into the cache the device lost.
+ * Cleared, nothing said so any more, and the column read back as it was, with
+ * no error.  The next write of the stripe starts after that flush: it releases
+ * the name, and its own completion clears it.  raid56_wf_full_stripe_clears_hold=1
+ * clears it at once, as before.
+ */
+static int readd_full_stripe_lands(struct readd_rig *rig, u64 k)
+{
+	struct btrfs_fs_info *fs_info = rig->fs_info;
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool clears = btrfs_wib_full_stripe_clears_hold();
+	const struct btrfs_wib_entry *e;
+	u64 stale, stale_par;
+	u64 noted;
+
+	readd_expect(k, &stale, &stale_par);
+	btrfs_wib_clear_written(fs_info, readd_region(k), READD_STRIPE_LEN);
+	e = find_live_entry(wib, readd_region(k));
+	if (clears) {
+		if (e && (e->stale | e->stale_par)) {
+			test_err("raid56_wf_full_stripe_clears_hold is set, yet region %llu still names 0x%llx 0x%llx",
+				 k, e->stale, e->stale_par);
+			return -EINVAL;
+		}
+		test_msg("raid56_wf_full_stripe_clears_hold is set: the write's completion cleared the name, as expected");
+		return 0;
+	}
+	if (!e || e->sticky != (stale | stale_par) || e->stale != stale ||
+	    e->stale_par != stale_par || (e->hold | e->hold_par) != (stale | stale_par)) {
+		test_err("region %llu after the write in flight landed: sticky 0x%llx stale 0x%llx stale_par 0x%llx hold 0x%llx 0x%llx, expected the name 0x%llx 0x%llx held",
+			 k, e ? e->sticky : 0, e ? e->stale : 0, e ? e->stale_par : 0,
+			 e ? e->hold : 0, e ? e->hold_par : 0, stale, stale_par);
+		return -EINVAL;
+	}
+	noted = readd_issue_full(rig, k);
+	e = find_live_entry(wib, readd_region(k));
+	if (!e || (e->hold | e->hold_par)) {
+		test_err("region %llu: the next write of the stripe did not release the name (hold 0x%llx 0x%llx)",
+			 k, e ? e->hold : 0, e ? e->hold_par : 0);
+		return -EINVAL;
+	}
+	readd_full_done(rig, k, noted);
+	btrfs_wib_clear_written(fs_info, readd_region(k), READD_STRIPE_LEN);
+	e = find_live_entry(wib, readd_region(k));
+	if (e) {
+		test_err("region %llu: the next write of the stripe landed, and its record stayed (sticky 0x%llx stale 0x%llx)",
+			 k, e->sticky, e->stale);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
  * A full stripe written copy-on-write is not recorded, and a failed flush
  * after one named nothing: its member on the device that failed the flush
  * read back old, with no error.  Now the failed flush names it (struct
@@ -4197,6 +4254,11 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 		return -EINVAL;
 	}
 	readd_full_done(rig, k_fly, n_fly);
+	if (!unnamed) {
+		ret = readd_full_stripe_lands(rig, k_fly);
+		if (ret)
+			return ret;
+	}
 	clear_repairs(wib);
 	ret = readd_clear(rig, k_done, ARRAY_SIZE(k_named));
 	if (ret)

@@ -327,15 +327,16 @@ struct btrfs_wib_entry {
 	/*
 	 * In memory only.  The @stale (@hold) and @stale_par (@hold_par) bits
 	 * a failed flush named while the block had a write in flight
-	 * (wib_readd_dropped()).  That write may have landed part of itself
-	 * on the device before the flush failed, into the cache the device
-	 * then lost, and when it completes it clears the marks of every
-	 * column and parity it wrote (rmw_update_stale_data(),
-	 * rmw_update_stale_parity()) -- the very marks that say it may not
-	 * be there.  So those clears leave these bits alone.  A later write
-	 * of the stripe starts after the failed flush and releases them
-	 * (btrfs_wib_try_mark()); so does a write-back with FUA, which no
-	 * lost cache can take away (btrfs_wib_clear_stale(@durable)).
+	 * (wib_readd_dropped(), wib_unlogged_name()).  That write may have
+	 * landed part of itself on the device before the flush failed, into
+	 * the cache the device then lost, and when it completes it clears the
+	 * marks of every column and parity it wrote (rmw_update_stale_data(),
+	 * rmw_update_stale_parity(), btrfs_wib_clear_written()) -- the very
+	 * marks that say it may not be there.  So those clears leave these
+	 * bits alone.  A later write of the stripe starts after the failed
+	 * flush and releases them (btrfs_wib_try_mark(),
+	 * btrfs_wib_note_full_stripe()); so does a write-back with FUA, which
+	 * no lost cache can take away (btrfs_wib_clear_stale(@durable)).
 	 */
 	u64 hold;
 	u64 hold_par;
@@ -963,6 +964,7 @@ bool btrfs_wib_evicts_stage0(void);
 bool btrfs_wib_readd_legacy(void);
 bool btrfs_wib_name_unwritten(void);
 bool btrfs_wib_full_stripe_unnamed(void);
+bool btrfs_wib_full_stripe_clears_hold(void);
 bool btrfs_wib_all_records_torn(void);
 bool btrfs_wib_torn_no_persist(void);
 bool btrfs_wib_log_unmarked(void);
@@ -1181,6 +1183,7 @@ int btrfs_wib_try_add_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len
 int btrfs_wib_try_add_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_clear_written(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 int btrfs_wib_snapshot(struct btrfs_fs_info *fs_info, u64 from,
 		       struct btrfs_wib_entry *out);
 

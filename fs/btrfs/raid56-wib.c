@@ -2488,14 +2488,32 @@ static bool full_stripe_unnamed;
 module_param_named(raid56_wf_full_stripe_unnamed, full_stripe_unnamed, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_full_stripe_unnamed,
 		 "Let a failed flush name nothing of the full stripes written copy-on-write since the device last confirmed one, and let the commit go on (testing only: restores a known defect)");
+/*
+ * Testing only: a full stripe written copy-on-write that landed everywhere
+ * clears every mark of its stripe, as before, the names a failed flush put on
+ * while it was in flight (@hold) too -- the only record of what the device may
+ * have lost from its cache, the flush having taken them out of the write's
+ * unlogged record: the column reads back as it was, with no error.  The
+ * negative control for uml/fullstripe_flush.sh (inflight).
+ */
+static bool full_stripe_clears_hold;
+module_param_named(raid56_wf_full_stripe_clears_hold, full_stripe_clears_hold, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_full_stripe_clears_hold,
+		 "Let a full stripe written copy-on-write clear the names a failed flush put on while it was in flight (testing only: restores a known defect)");
 #else
 static const bool full_stripe_unnamed;
+static const bool full_stripe_clears_hold;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 bool btrfs_wib_full_stripe_unnamed(void)
 {
 	return READ_ONCE(full_stripe_unnamed);
+}
+
+bool btrfs_wib_full_stripe_clears_hold(void)
+{
+	return READ_ONCE(full_stripe_clears_hold);
 }
 #endif
 
@@ -2571,10 +2589,25 @@ u64 btrfs_wib_note_full_stripe(struct btrfs_fs_info *fs_info, u64 full_stripe_st
 	spin_lock_irqsave(&wib->lock, flags);
 	for (u64 cur = wib_entry_bytenr(full_stripe_start); cur < end;
 	     cur += BTRFS_WIB_ENTRY_SIZE, i++) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		struct btrfs_wib_unlogged *u = NULL;
 		u64 c = cols;
 		u32 p = par;
 
+		/*
+		 * Release @hold, as a logged write's mark does
+		 * (wib_try_mark_locked()): this write starts after any flush
+		 * that failed while an earlier one was in flight, and rewrites
+		 * every member, so the marks its completion clears
+		 * (btrfs_wib_clear_written()) are its to clear.
+		 */
+		if (e && !READ_ONCE(full_stripe_clears_hold)) {
+			const u64 mask = btrfs_wib_range_mask(cur, full_stripe_start,
+							      end - full_stripe_start);
+
+			e->hold &= ~mask;
+			e->hold_par &= ~mask;
+		}
 		/* A column past the 64th has no bit to be named by. */
 		if (wib->enabled && nr_data <= 64)
 			u = wib_unlogged_get(wib, cur);
@@ -5521,7 +5554,14 @@ bool btrfs_wib_recorded(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	return ret;
 }
 
-void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+/*
+ * The stripes of [@logical, @logical + @len) are consistent again: forget what
+ * the record says about them -- but, if @keep_hold, not the names a failed
+ * flush put on while the write that rewrote them was in flight (@hold,
+ * @hold_par in struct btrfs_wib_entry).
+ */
+static void wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
+			     bool keep_hold)
 {
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
@@ -5552,15 +5592,17 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	}
 	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
 		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const u64 range = btrfs_wib_range_mask(cur, logical, len);
+		u64 mask, mask_par;
 
 		if (!e)
 			continue;
-		e->sticky &= ~btrfs_wib_range_mask(cur, logical, len);
-		if (e->stale & btrfs_wib_range_mask(cur, logical, len)) {
-			atomic_sub(hweight64(e->stale &
-					     btrfs_wib_range_mask(cur, logical, len)),
-				   &wib->nr_stale);
-			e->stale &= ~btrfs_wib_range_mask(cur, logical, len);
+		mask = range & ~(keep_hold ? e->hold : 0);
+		mask_par = range & ~(keep_hold ? e->hold_par : 0);
+		e->sticky &= ~(mask & mask_par);
+		if (e->stale & mask) {
+			atomic_sub(hweight64(e->stale & mask), &wib->nr_stale);
+			e->stale &= ~mask;
 		}
 		/*
 		 * The stripe is consistent again, so its parity describes the
@@ -5569,16 +5611,14 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 		 * conservative rather than dangerous, but wrong, and it does
 		 * not clear itself.
 		 */
-		wib_set_stale_par(wib, e, e->stale_par &
-				  ~btrfs_wib_range_mask(cur, logical, len));
-		e->hold &= ~btrfs_wib_range_mask(cur, logical, len);
-		e->hold_par &= ~btrfs_wib_range_mask(cur, logical, len);
+		wib_set_stale_par(wib, e, e->stale_par & ~mask_par);
+		e->hold &= ~mask;
+		e->hold_par &= ~mask_par;
 		/* Rewritten or found consistent: nothing in it is torn. */
-		e->torn &= ~btrfs_wib_range_mask(cur, logical, len);
-		e->kept_torn &= ~btrfs_wib_range_mask(cur, logical, len);
-		wib_replace_disown(e, btrfs_wib_range_mask(cur, logical, len),
-				   btrfs_wib_range_mask(cur, logical, len));
-		e->replace_keep &= ~btrfs_wib_range_mask(cur, logical, len);
+		e->torn &= ~range;
+		e->kept_torn &= ~range;
+		wib_replace_disown(e, mask, mask_par);
+		e->replace_keep &= ~mask;
 		if (!wib_entry_used(e))
 			freed = true;
 	}
@@ -5588,6 +5628,27 @@ void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	/* That may have been the last one: say so now, not in a minute. */
 	if (READ_ONCE(wib->health) != BTRFS_RAID56_HEALTH_OK)
 		raid56_alert_kick(wib, 0);
+}
+
+void btrfs_wib_clear_sticky(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_clear_sticky(fs_info, logical, len, false);
+}
+
+/*
+ * A full stripe written copy-on-write at [@logical, @logical + @len) landed
+ * on every device: it rewrote every member, so what the record says about
+ * the stripe is over -- except what a flush that failed while its bios were
+ * in flight named (@hold): part of the write may have gone into the cache
+ * the device then lost, and the name, which that flush took out of the
+ * write's unlogged record (wib_unlogged_name()), is all that says so.
+ * Cleared, the column read back as it was, with no error.  A later write of
+ * the stripe releases it (btrfs_wib_note_full_stripe(), wib_try_mark_locked()),
+ * as does a write-back with FUA (btrfs_wib_clear_stale()).
+ */
+void btrfs_wib_clear_written(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
+{
+	wib_clear_sticky(fs_info, logical, len, !READ_ONCE(full_stripe_clears_hold));
 }
 
 /*

@@ -4459,18 +4459,40 @@ fullstripe_flush_prep)
 	# never committed.  CONTROL=1 sets raid56_wf_full_stripe_unnamed=1:
 	# nothing is named, the commit goes on, and the blocks of FAIL's column
 	# read back as the zeros on its platter, with no error.
+	#
+	# FF_INFLIGHT=1: the file is FF_KB KiB (three full stripes), written in
+	# one go, and every write held FF_HOLD_MS once its bios have completed
+	# (raid56_write_hold_ms) -- in flight, as far as the log knows.  Then
+	# FAIL fails writes and flushes, and an fsync of another file (notreelog:
+	# a transaction commit, which does not wait for the file's ordered
+	# extent) has its barrier fail on FAIL while the writes are held: the
+	# failed flush names FAIL's member in each full stripe, with the write
+	# in flight.  Once the hold ends, each write finishes on every device,
+	# which clears what the record says of its stripe -- but not that name
+	# (@hold).  FAIL is healed, so the commit that references the file has
+	# a barrier every device confirms, and nothing names FAIL again: every
+	# block reads back as 'B', here and after the crash.
+	# CONTROL=2 sets raid56_wf_full_stripe_clears_hold=1: the completion
+	# clears the name, and the blocks of FAIL's column read back as zeros.
 	watchdog ${WATCH:-900}
 	dm_setup
 	set -- $DMDEVS
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
-	do_mount $OPTS,nossd,nodatasum,commit=600 $1
+	mo=$OPTS,nossd,nodatasum,commit=600
+	[ "${FF_INFLIGHT:-0}" = 1 ] && mo=$mo,notreelog,thread_pool=8
+	do_mount $mo $1
 	echo 600000 > /sys/module/btrfs/parameters/raid56_repair_delay_ms 2>/dev/null ||
 		log "DELAY_KNOB_FAIL"
 	if [ "${CONTROL:-0}" = 1 ]; then
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_full_stripe_unnamed 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: a failed flush names nothing of the full stripes written copy-on-write"
+	fi
+	if [ "${CONTROL:-0}" = 2 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_full_stripe_clears_hold 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a full stripe's completion clears the names a failed flush put on while it was in flight"
 	fi
 	touch $MNT/marker0
 	sync
@@ -4482,14 +4504,43 @@ fullstripe_flush_prep)
 	dd if=/dev/zero bs=1M count=1 status=none | tr '\000' 'B' > /tmp/B1M
 	c0=$(commits); f0=$(pv full_stripe_writes); s0=$(pv sub_stripe_writes)
 	dm_drop_writes $FAIL; log "device $FAIL drops every write"
-	for i in $(seq 1 $FF_MB); do cat /tmp/B1M; done |
-		dd of=$MNT/full bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
-	wrc=$?
-	c1=$(commits); f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
-	acked=$(stat -c %s $MNT/full 2>/dev/null)
-	log "file of $FF_MB MiB written: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits $((c1 - c0))"
-	log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
-	dm_error_writes $FAIL; log "device $FAIL fails writes and flushes"
+	held=-; fsrc=-; named_fly=-; named_landed=-
+	if [ "${FF_INFLIGHT:-0}" = 1 ]; then
+		echo ${FF_HOLD_MS:-12000} > /sys/module/btrfs/parameters/raid56_write_hold_ms ||
+			log "HOLD_KNOB_FAIL"
+		head -c $((FF_KB * 1024)) /tmp/B1M |
+			dd of=$MNT/full bs=${FF_KB}K iflag=fullblock oflag=direct status=none \
+			2>/dev/null &
+		wpid=$!
+		sleep 3
+		held=$(dmesg | grep -c "with its bios completed")
+		c1=$(commits)
+		dm_error_writes $FAIL; log "device $FAIL fails writes and flushes, $held write(s) held"
+		# Inline: a data write would be held too, and the fsync with it.
+		dd if=/dev/zero of=$MNT/m bs=512 count=1 conv=fsync status=none 2>/dev/null
+		fsrc=$?
+		named_fly=$(hv stale_marks)
+		echo 0 > /sys/module/btrfs/parameters/raid56_write_hold_ms
+		wait $wpid
+		wrc=$?
+		named_landed=$(hv stale_marks)
+		# Its flushes work again: nothing but the names says what the
+		# cache it lost held, the next barrier going through.
+		dm_heal $FAIL
+		f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
+		acked=$(stat -c %s $MNT/full 2>/dev/null)
+		log "file of $FF_KB KiB written, held in flight across an fsync (rc $fsrc) whose barrier failed: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits before $((c1 - c0)), stale marks with the writes in flight $named_fly, once they landed $named_landed"
+		log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
+	else
+		for i in $(seq 1 $FF_MB); do cat /tmp/B1M; done |
+			dd of=$MNT/full bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
+		wrc=$?
+		c1=$(commits); f1=$(pv full_stripe_writes); s1=$(pv sub_stripe_writes)
+		acked=$(stat -c %s $MNT/full 2>/dev/null)
+		log "file of $FF_MB MiB written: rc $wrc, $acked bytes, full stripe writes $((f1 - f0)), sub-stripe writes $((s1 - s0)), commits $((c1 - c0))"
+		log "layout: $(filefrag -v $MNT/full 2>/dev/null | sed -n 4p | tr -s ' ')"
+		dm_error_writes $FAIL; log "device $FAIL fails writes and flushes"
+	fi
 	sync -f $MNT/full 2>/dev/null
 	src=$?
 	c2=$(commits)
@@ -4503,6 +4554,7 @@ fullstripe_flush_prep)
 	out="$out sync_rc=$src commits_sync=$((c2 - c1)) writable_after=$wr flush_errs=$fl"
 	out="$out stale_marks=$(hv stale_marks) unnamed=$(hv full_stripe_flush_unnamed)"
 	out="$out state=$(hv state) new=$new old=$old eio=$eio other=$other size=$size"
+	out="$out held=$held fsync_rc=$fsrc named_fly=$named_fly named_landed=$named_landed"
 	log "FF_PREP $out"
 	echo "$out" > $T/umltest/ffp.$TAG
 	# No umount: the crash.
