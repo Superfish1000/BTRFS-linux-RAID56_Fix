@@ -89,6 +89,15 @@ static struct btrfs_wib_entry *put_entry(struct btrfs_wib *wib, u64 bytenr, u64 
 	return e;
 }
 
+/*
+ * raid56_wf_flush_drop_asserts=1 on a kernel with CONFIG_BTRFS_ASSERT: a
+ * commit of a set no block describes is a BUG(), as it was.
+ */
+static bool flush_drop_would_bug(void)
+{
+	return IS_ENABLED(CONFIG_BTRFS_ASSERT) && btrfs_wib_flush_drop_asserts();
+}
+
 static int test_range_mask(void)
 {
 	const u64 base = 3 * BTRFS_WIB_ENTRY_SIZE;
@@ -1635,6 +1644,10 @@ static int test_admit_wide(struct btrfs_fs_info *fs_info)
 		test_msg("raid56_evict_naming is set, skipping the admission test");
 		return 0;
 	}
+	if (narrow && flush_drop_would_bug()) {
+		test_msg("raid56_wf_flush_drop_asserts is set on a CONFIG_BTRFS_ASSERT kernel: the commit would BUG(), skipping the admission test");
+		return 0;
+	}
 	/* Writes in flight into as many regions as are admitted. */
 	spin_lock_irqsave(&wib->lock, flags);
 	while (admitted < BTRFS_WIB_MAX_ENTRIES_V1 &&
@@ -1736,6 +1749,10 @@ static int test_commit_fails_full(struct btrfs_fs_info *fs_info)
 
 	if (btrfs_wib_evicts_naming()) {
 		test_msg("raid56_evict_naming is set, skipping the commit-full test");
+		return 0;
+	}
+	if (flush_drop_would_bug()) {
+		test_msg("raid56_wf_flush_drop_asserts is set on a CONFIG_BTRFS_ASSERT kernel: the commit would BUG(), skipping the commit-full test");
 		return 0;
 	}
 	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++) {

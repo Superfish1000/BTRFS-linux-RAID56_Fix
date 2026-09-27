@@ -29,6 +29,8 @@
 # INCONCLUSIVE unless the log listed more than 82 regions at the degraded
 # mount and the control acknowledged the write and read it back old.
 #
+# CF_KNOBS in the environment go on every boot's kernel command line.
+#
 # logio: the log block does not reach enough devices -- a write goes
 # through, then the log slots of three of the four fail every IO, nothing
 # else does (the barriers succeed); the transaction commit that drops the
@@ -70,7 +72,7 @@ arm() {	# name control
 			init=$T/umltest/init-cf.sh $ubds quiet con=null con0=fd:0,fd:1 \
 			BTRFS_TEST_DIR=$T MODE=commit_full OPTS=$3 PROFILE=raid5:raid1c3 TAG=$tag \
 			NDEV=$NDEV CONTROL=$control MNTDEV=$mnt OMITTED=$OMIT PHASE=$1 \
-			< /dev/null > $D/log.$1 2>&1
+			${CF_KNOBS:-} < /dev/null > $D/log.$1 2>&1
 		echo "boot $1 rc=$?" >> $D/log.boots
 	}
 	# commit=600: no transaction commit drops the overwrites' records

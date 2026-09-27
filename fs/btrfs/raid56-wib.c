@@ -541,15 +541,15 @@ static bool wib_entry_verdict(const struct btrfs_wib_entry *e)
  *
  * A set that cannot be described cannot be written.  btrfs_wib_build_block()
  * returns -ENOSPC and leaves the block zeroed with no magic, and its callers
- * are not all in a position to notice: wib_flush_and_drop_locked() asserts
- * that it fits and then hands the block on as the snapshot of what was in
+ * were not all in a position to notice: wib_flush_and_drop_locked() asserted
+ * that it fits and then handed the block on as the snapshot of what was in
  * flight, so on a kernel built without CONFIG_BTRFS_ASSERT an empty snapshot
- * is taken to mean nothing was in flight, and stripes that finished after the
- * flush are dropped from the log without a flush having covered them.  That is
- * the write hole this log exists to close, reopened by a capacity accident.
+ * was taken to mean nothing was in flight, and stripes that finished after the
+ * flush were dropped from the log without a flush having covered them.  That
+ * is the write hole this log exists to close, reopened by a capacity accident.
  *
- * So the live set is capped here instead, and the assertion is allowed to be
- * true.
+ * So the live set is capped here instead -- and where it cannot be, what
+ * cannot be written fails (wib_flush_and_drop_locked(), btrfs_wib_commit()).
  */
 static u32 wib_live_max(const struct btrfs_wib *wib)
 {
@@ -707,6 +707,16 @@ static bool failed_leaves_flight;
 module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
 		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
+/*
+ * raid56_wf_flush_drop_asserts=1: wib_flush_and_drop_locked() asserts, as
+ * before, that the set it snapshots fits a block -- a BUG() on a kernel with
+ * CONFIG_BTRFS_ASSERT where the set is more than a block describes, which a
+ * commit fails instead (R2).
+ */
+static bool flush_drop_asserts;
+module_param_named(raid56_wf_flush_drop_asserts, flush_drop_asserts, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_flush_drop_asserts,
+		 "Assert that the set a flush-and-drop of the write-intent log snapshots fits a block (testing only: restores a crash on CONFIG_BTRFS_ASSERT kernels)");
 #else
 static const bool evict_naming;
 static const bool keep_naming_degraded;
@@ -718,6 +728,7 @@ static const bool torn_spent_eagerly;
 static const bool kept_torn_in_order;
 static const bool admit_narrow;
 static const bool failed_leaves_flight;
+static const bool flush_drop_asserts;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -765,6 +776,11 @@ bool btrfs_wib_kept_torn_in_order(void)
 bool btrfs_wib_admits_narrow(void)
 {
 	return READ_ONCE(admit_narrow);
+}
+
+bool btrfs_wib_flush_drop_asserts(void)
+{
+	return READ_ONCE(flush_drop_asserts);
 }
 
 bool btrfs_wib_failed_leaves_flight(void)
@@ -4101,18 +4117,22 @@ static int wib_flush_and_drop_locked(struct btrfs_wib *wib, u64 seq, bool force)
 		 */
 		ret = btrfs_wib_build_block(wib, wib->flushsnap, seq, NULL);
 		/*
-		 * The in-memory set always fits: wib_live_max() caps it at what
-		 * the current layout can describe, and wib_enforce_capacity_locked()
-		 * re-establishes that whenever a stale bit halves the cap.
+		 * The in-memory set may be more than a block describes: the
+		 * first name makes every block wide, and wib_enforce_capacity_locked()
+		 * gets the set there only by spending what may be spent, which
+		 * with every record naming a member, in flight or saying a write
+		 * may have been torn is nothing (wib_admit_max()).  The caller
+		 * fails then, and a transaction commit with it, read-only
+		 * (btrfs_wib_commit()): not a BUG().
 		 *
-		 * Check it anyway rather than only asserting.  ASSERT() compiles
-		 * away without CONFIG_BTRFS_ASSERT, and the block handed on from
-		 * here is the snapshot of what was in flight: a failed build
-		 * leaves it zeroed with no magic, which reads as "nothing was in
-		 * flight" and drops stripes that no flush covered.  Refusing the
-		 * commit costs a failed write; continuing costs the write hole.
+		 * And the block handed on from here is the snapshot of what was
+		 * in flight: a failed build leaves it zeroed with no magic, which
+		 * reads as "nothing was in flight" and drops stripes that no
+		 * flush covered.  Refusing the commit costs a failed write;
+		 * continuing costs the write hole.
 		 */
-		ASSERT(ret == 0);
+		if (READ_ONCE(flush_drop_asserts))
+			ASSERT(ret == 0);
 		if (ret)
 			return ret;
 		flush = wib_flush_all_devices(wib, &wib->flush_failed);
