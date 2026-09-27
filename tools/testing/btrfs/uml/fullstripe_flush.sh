@@ -22,10 +22,19 @@
 #   refuse         360 MiB (90 regions, more than a log block that names
 #                  anything describes): the commit fails and the filesystem
 #                  goes read-only with the full_stripe_flush_unnamed alert;
-#                  after the crash the file was never committed, and nothing
-#                  reads back wrong
-#   refuse-control the same with the knob: the commit goes on, and zeros read
-#                  back, with no error
+#                  until the unmount the refusal keeps the names it could not
+#                  write in memory (@refused_names), so on the read-only
+#                  mount every block reads back as 'B', device 1's column
+#                  rebuilt from the parity the others flushed; after the
+#                  crash the file was never committed, and nothing reads
+#                  back wrong
+#   refuse-unnamedctl the same with raid56_wf_refusal_leaves_unnamed=1: the
+#                  commit fails as in refuse, but nothing keeps the names,
+#                  and on the read-only mount the blocks of device 1's
+#                  column read back as zeros, with no error -- data whose
+#                  O_DIRECT write returned, though no commit made it durable
+#   refuse-control the same with raid56_wf_full_stripe_unnamed=1: the commit
+#                  goes on, and zeros read back, with no error
 #   inflight       384 KiB (three full stripes) in one go, each write held once
 #                  its bios have completed (raid56_write_hold_ms); device 1 then
 #                  fails the barrier of an fsync's commit (notreelog) while they
@@ -38,7 +47,7 @@
 #                  column read back as zeros, with no error
 #
 # The second argument picks the arms: all (the default), base (the first
-# four) or inflight (the last two).
+# five) or inflight (the last two).
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: fullstripe_flush.sh <kernel> [all|base|inflight]}
@@ -73,10 +82,11 @@ arm() {	# name control MiB [KiB held in flight]
 }
 ARMS=
 if [ $WHICH != inflight ]; then
-	ARMS="named named-control refuse refuse-control"
+	ARMS="named named-control refuse refuse-unnamedctl refuse-control"
 	arm named 0 16
 	arm named-control 1 16
 	arm refuse 0 360
+	arm refuse-unnamedctl 3 360
 	arm refuse-control 1 360
 fi
 if [ $WHICH != base ]; then
@@ -98,7 +108,9 @@ for a in $ARMS; do
 			echo "RESULT: INCONCLUSIVE -- the $a arm did not report ($f)"; exit 2; }
 	done
 done
-grep -lq KERNEL_SPLAT $T/umltest/ff-*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+for a in $ARMS; do
+	grep -lq KERNEL_SPLAT $T/umltest/ff-$a/log.* && { echo "RESULT: FAIL -- kernel splat ($a)"; exit 1; }
+done
 for a in $ARMS; do
 	grep -lq "CONTROL_KNOB_FAIL\|HOLD_KNOB_FAIL" $T/umltest/ff-$a/log.* &&
 		{ echo "RESULT: INCONCLUSIVE -- a knob of the $a arm is not there (not a CONFIG_BTRFS_DEBUG kernel?)"
@@ -179,9 +191,37 @@ if [ "$(v ffv refuse old)" != 0 ] || [ "$(v ffv refuse other)" != 0 ]; then
 	echo "RESULT: FAIL -- refuse arm: after the crash $(v ffv refuse old) block(s) read back as zeros, $(v ffv refuse other) as something else"
 	exit 1
 fi
+# Before the crash, on the read-only mount: the file's O_DIRECT writes
+# returned, and the kernel still serves it.  Keeping no names for the reads
+# (refuse-unnamedctl), device 1's column reads back as the zeros on its
+# platter; kept (@refused_names), every block is rebuilt from the parity
+# the others flushed -- a refusal (EIO) would be for nothing.
+u=refuse-unnamedctl
+if [ "$(v ffp $u writable_after)" = 0 ] || [ "$(v ffp $u sync_rc)" = 0 ] ||
+   [ "$(v ffp $u unnamed)" = 0 ] || [ "$(v ffp $u unnamed)" = '?' ] ||
+   [ "$(v ffp $u old)" = 0 ] || [ "$(v ffp $u old)" = '?' ]; then
+	echo "RESULT: INCONCLUSIVE -- the $u arm did not refuse the commit and read zeros back on the read-only"
+	echo "        mount (writable $(v ffp $u writable_after), sync rc $(v ffp $u sync_rc), full_stripe_flush_unnamed"
+	echo "        $(v ffp $u unnamed), zeros $(v ffp $u old)), so the refuse arm's reads there prove nothing"
+	exit 2
+fi
+nblk=$(( $(v ffp refuse acked) / 65536 ))
+echo "  on the read-only mount before the crash, new/zeros/eio/other of $nblk: refuse" \
+     "$(v ffp refuse new)/$(v ffp refuse old)/$(v ffp refuse eio)/$(v ffp refuse other)," \
+     "$u $(v ffp $u new)/$(v ffp $u old)/$(v ffp $u eio)/$(v ffp $u other)"
+for k in old other eio; do
+	[ "$(v ffp refuse $k)" = 0 ] || {
+		echo "RESULT: FAIL -- refuse arm: on the read-only mount $(v ffp refuse $k) block(s) read back $k"
+		exit 1; }
+done
+[ "$nblk" -gt 0 ] && [ "$(v ffp refuse new)" = "$nblk" ] || {
+	echo "RESULT: FAIL -- refuse arm: on the read-only mount $(v ffp refuse new) of $nblk blocks read back as written"
+	exit 1; }
 echo "RESULT: PASS -- named, every block read back as written before and after the crash ($(v ffv named new));"
 echo "        with more to name than the log holds the commit failed, read-only (full_stripe_flush_unnamed"
-echo "        $(v ffp refuse unnamed), sync rc $(v ffp refuse sync_rc)) and after the crash nothing read wrong (file $(v ffv refuse size));"
+echo "        $(v ffp refuse unnamed), sync rc $(v ffp refuse sync_rc)); until the unmount every block read back"
+echo "        as written ($(v ffp refuse new) of $nblk), and after the crash nothing read wrong (file $(v ffv refuse size));"
+echo "        keeping no names for those reads, $(v ffp $u old) read back as zeros, silently ($u);"
 echo "        without the names $(v ffv named-control old) and $(v ffv refuse-control old) blocks read back as zeros, silently"
 [ $WHICH = all ] &&
 	echo "        named in flight, the names outlived the writes' completion; cleared by it, $(v ffv inflight-control old) read back as zeros"

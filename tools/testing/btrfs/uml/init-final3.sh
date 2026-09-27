@@ -5171,9 +5171,15 @@ fullstripe_flush_prep)
 	# regions, more than a block that names anything describes): the commit
 	# fails, the filesystem goes read-only with the full_stripe_flush_unnamed
 	# alert, and after the crash nothing reads back wrong -- the file was
-	# never committed.  CONTROL=1 sets raid56_wf_full_stripe_unnamed=1:
-	# nothing is named, the commit goes on, and the blocks of FAIL's column
-	# read back as the zeros on its platter, with no error.
+	# never committed.  Before the crash, on the read-only mount, the names
+	# the refusal could not write stay in memory for the reads
+	# (@refused_names): every block reads back as 'B', FAIL's column rebuilt
+	# from the parity the others flushed.  CONTROL=1 sets
+	# raid56_wf_full_stripe_unnamed=1: nothing is named, the commit goes on,
+	# and the blocks of FAIL's column read back as the zeros on its platter,
+	# with no error.  CONTROL=3 sets raid56_wf_refusal_leaves_unnamed=1: the
+	# commit fails as without it, but nothing keeps the names, and until the
+	# unmount FAIL's column reads back as zeros, with no error.
 	#
 	# FF_INFLIGHT=1: the file is FF_KB KiB (three full stripes), written in
 	# one go, and every write held FF_HOLD_MS once its bios have completed
@@ -5208,6 +5214,11 @@ fullstripe_flush_prep)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_full_stripe_clears_hold 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
 		log "control: a full stripe's completion clears the names a failed flush put on while it was in flight"
+	fi
+	if [ "${CONTROL:-0}" = 3 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_refusal_leaves_unnamed 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a refused naming of full stripes keeps no names for the reads"
 	fi
 	touch $MNT/marker0
 	sync
