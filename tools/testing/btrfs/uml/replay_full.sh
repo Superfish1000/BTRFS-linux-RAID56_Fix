@@ -92,6 +92,12 @@ if [ "$f_ref$c_ref" != 11 ] || [ "$f_commit$c_commit" != 00 ] ||
 	echo "RESULT: INCONCLUSIVE -- the log never filled, a commit ran, or no tree log was left"
 	exit 2
 fi
+# The reads below count the acknowledged overwrites: none, and they would
+# pass having read nothing.
+case "$f_acked:$c_acked" in ''|*[!0-9:]*|0:*|*:0)
+	echo "RESULT: INCONCLUSIVE -- no overwrite was acknowledged (fixed $f_acked, control $c_acked)"
+	exit 2;;
+esac
 if [ "$f_first$c_first" != failfail ] || [ "${f_said:-0}" = 0 ] || [ "${c_said:-0}" = 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- the replay did not meet the full log (first mount fixed" \
 	     "$f_first, control $c_first)"

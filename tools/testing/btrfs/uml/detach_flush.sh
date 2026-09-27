@@ -81,6 +81,20 @@ for a in $ARMS; do
 		echo "RESULT: INCONCLUSIVE -- no overwrite acknowledged ($a)"; exit 2
 	fi
 done
+# Counts, all of them: a file that was not there reads "absent", which the
+# arithmetic below would take for 0 -- a clean arm that read nothing.
+for a in $ARMS; do
+	for k in b_new b_old b_eio b_other c_new c_old c_eio c_other; do
+		case "$(v $a $k)" in ''|*[!0-9]*)
+			if [ $a = fixed ]; then
+				echo "RESULT: FAIL -- a file the committed sync covered was not there once the"
+				echo "        device was back ($k $(v $a $k))"
+				exit 1
+			fi
+			echo "RESULT: INCONCLUSIVE -- the $a arm read nothing back ($k $(v $a $k))"; exit 2;;
+		esac
+	done
+done
 echo "  after the commit: stale_marks fixed $(v fixed stale_marks), control $(v control stale_marks);" \
      "sync fixed $(v fixed sync_ok), control $(v control sync_ok)"
 for a in $ARMS; do
@@ -109,6 +123,13 @@ fi
 eio=$(( $(v fixed b_eio) + $(v fixed c_eio) ))
 if [ "$eio" != 0 ]; then
 	echo "RESULT: FAIL -- $eio block(s) the names prove failed to read (EIO)"; exit 1
+fi
+c_all=$(( $(v fixed c_new) + $(v fixed c_old) + $(v fixed c_eio) + $(v fixed c_other) ))
+if [ "$(v fixed b_new)" != "$(v fixed acked)" ] || [ "$c_all" = 0 ] ||
+   [ "$(v fixed c_new)" != "$c_all" ]; then
+	echo "RESULT: FAIL -- $(v fixed b_new) of $(v fixed acked) overwrites and $(v fixed c_new) of $c_all"
+	echo "        chunks of the new file read back as written"
+	exit 1
 fi
 # The inflight arm refuses (the names are there, the listing says torn): it
 # must never read anything wrong, and it must refuse something, or the fixed

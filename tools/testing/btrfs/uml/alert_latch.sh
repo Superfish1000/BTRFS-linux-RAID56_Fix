@@ -293,8 +293,8 @@ echo "    control $c_u0 / $c_u1 / $c_u2 / $c_u3 / $c_u4 (state $c_st)"
 case "$f_w1$c_w1$f_u1$c_u1$f_u4$c_u4" in
 *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;;
 esac
-grep -lq KERNEL_SPLAT $T/umltest/al-*/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
-grep -lq WATCHDOG $T/umltest/al-*/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+grep -lq KERNEL_SPLAT $T/umltest/al-{fixed,control}/log.* && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+grep -lq WATCHDOG $T/umltest/al-{fixed,control}/log.* && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
 grep -lq CONTROL_KNOB_FAIL $T/umltest/al-control/log.* &&
 	{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
 has() { case ",$1," in *,log_write_failed,*) return 0;; esac; return 1; }

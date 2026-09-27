@@ -120,6 +120,12 @@ if [ $PLAN = column ]; then
 	if [ "${f_rbad:-0}" != 0 ]; then
 		echo "RESULT: FAIL -- $f_rbad acknowledged block(s) read back wrong"; exit 1
 	fi
+	# Every acknowledged block was read: none left out of the count.
+	if [ $(( ${f_rok:-0} + ${f_reio:-0} + ${f_rbad:-0} )) != "$f_acked" ]; then
+		echo "RESULT: FAIL -- $f_rok ok, $f_reio EIO and $f_rbad wrong of $f_acked acknowledged blocks:"
+		echo "        not every one was read back"
+		exit 1
+	fi
 	grep -aq "replace that devid with a NEW disk the same way, and do not reconnect the old one" \
 		$T/umltest/dlf-$PLAN-fixed/log ||
 		{ echo "RESULT: FAIL -- the log_full explanation does not say to replace the missing devid"; exit 1; }
@@ -144,6 +150,11 @@ if [ "${f_drop:-0}" != 0 ] || [ "${f_sev:-0}" != 0 ] || [ "${f_rbad:-0}" != 0 ];
 fi
 if [ "$f_eio" = 0 ] || [ "${f_full:-0}" -lt 1 ]; then
 	echo "RESULT: FAIL -- the full log did not refuse (eio=$f_eio log_full=$f_full)"; exit 1
+fi
+if [ "${f_rok:-0}" != "$f_acked" ]; then
+	echo "RESULT: FAIL -- $f_rok of $f_acked blocks device 1 failed read back as written"
+	echo "        ($f_reio EIO): a device that is not missing holds their parity"
+	exit 1
 fi
 if [ "$f_fresh" != ok ]; then
 	echo "RESULT: FAIL -- after the scrub the alert asks for, a write into a new region still failed"; exit 1

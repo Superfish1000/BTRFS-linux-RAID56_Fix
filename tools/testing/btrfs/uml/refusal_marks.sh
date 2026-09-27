@@ -86,9 +86,13 @@ for a in default markfirst control trust; do
 	[ "${f:-0}" -gt 0 ] ||
 		{ echo "RESULT: INCONCLUSIVE -- no repair was refused in the $a arm"; exit 2; }
 done
-if [ "$c_b" = 4096 ] || [ "$t_b" = 4096 ]; then
-	echo "RESULT: INCONCLUSIVE -- a control read 'B' back: the refused repair cleared nothing,"
-	echo "        so the fixed arms' clean reads prove nothing"
+# Each control must show the defect itself, not just fail to read 'B': the
+# cleared marks make the read fail the cross-check (control), and trusted,
+# return the old 'A' with no error (trust).
+if [ "$c_b" = 4096 ] || [ "$c_rc" = 0 ] || [ "$t_a" != 4096 ] || [ "$t_rc" != 0 ]; then
+	echo "RESULT: INCONCLUSIVE -- the controls did not reproduce the cleared marks (control read"
+	echo "        $c_b bytes of 'B', rc $c_rc; trust read $t_a bytes of 'A', rc $t_rc), so the"
+	echo "        fixed arms' clean reads prove nothing"
 	exit 2
 fi
 if [ "$d_b" != 4096 ] || [ "$d_rc" != 0 ]; then
