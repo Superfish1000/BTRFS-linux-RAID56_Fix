@@ -2233,8 +2233,9 @@ static const bool name_unwritten;
  * the log -- the set is more than a block describes, or too few devices took
  * the block -- keeps the previous block on the devices and goes on, as before
  * wib_commit_failed(): the records only the set holds are acknowledged with
- * nothing on disk.  The negative control for the r2 arm of
- * uml/commit_full.sh.
+ * nothing on disk.  So does the commit that writes the last block of a log
+ * being disabled.  The negative control for the r2 arm of uml/commit_full.sh,
+ * and for its logio and disable plans.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -6585,15 +6586,25 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 			mutex_lock(&wib->commit_mutex);
 			ret = wib_write_final_locked(wib, flushed);
 			mutex_unlock(&wib->commit_mutex);
+			if (READ_ONCE(wib->readd_refused))
+				return wib_commit_refused(fs_info);
+			if (READ_ONCE(wib->unlogged_refused))
+				return wib_unlogged_refused(fs_info);
+			/*
+			 * The devices keep the previous block, which lists what
+			 * may be in flight but not the records the set gained
+			 * since -- the names failed writes put on members above
+			 * all -- and the next mount reads it whatever the
+			 * feature flag says: fail the commit as any other that
+			 * cannot write the log (wib_commit_failed()).
+			 */
+			if (ret < 0 && !READ_ONCE(commit_keeps_previous))
+				return wib_commit_failed(fs_info, ret);
 			if (ret < 0)
 				btrfs_warn(fs_info,
 	"raid56 write-intent log: could not write the final log block, the next mount will scrub the stripes the previous one listed");
 			if (!btrfs_is_testing(fs_info))
 				btrfs_info(fs_info, "raid56 write-intent log disabled");
-			if (READ_ONCE(wib->readd_refused))
-				return wib_commit_refused(fs_info);
-			if (READ_ONCE(wib->unlogged_refused))
-				return wib_unlogged_refused(fs_info);
 			return 0;
 		}
 		wib->disable_armed = !flag_written;

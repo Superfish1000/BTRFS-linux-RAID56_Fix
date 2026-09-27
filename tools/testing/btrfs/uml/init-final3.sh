@@ -2924,6 +2924,11 @@ commit_full)
 		# commit that drops the finished record succeed, and only its log
 		# block does not reach enough devices.  CONTROL=2: it goes on, as
 		# the lazy commit it was taken for.
+		# DISABLE=1: the log is being disabled.  The disable takes two
+		# commits: the first, before the write, writes the superblock
+		# without the flag, and the one that meets the failing slots is
+		# the one that writes the log's last block.  CONTROL=2: "could not
+		# write the final log block", and it goes on.
 		dm_setup
 		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
 		dm_scan
@@ -2932,6 +2937,16 @@ commit_full)
 		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
 		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
 		sync
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		if [ "${DISABLE:-0}" = 1 ]; then
+			echo 0 > /sys/fs/btrfs/*-*-*/features/raid56_write_intent || log "DISABLE_FAIL"
+			touch $MNT/marker0
+			sync
+			# Still enabled: only the superblock without the flag is written.
+			[ "$(awk '$1 == "enabled" {print $2}' $W)" = 1 ] || log "CF_DISABLED_EARLY"
+			log "disable requested, log enabled until the next commit:" \
+			    "$(awk '$1 == "enabled" {print $2}' $W)"
+		fi
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.cf
 		dd if=/tmp/cblock.cf of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
 		   conv=notrunc status=none 2>/dev/null && w=ok || w=eio
@@ -2942,11 +2957,15 @@ commit_full)
 		btrfs filesystem sync $MNT >/dev/null 2>&1 || c=fail
 		ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
-		kmsg "failing the transaction commit|commit FAILED|lazy commit failed" 4
-		log "CF logio: write $w commit $c ro=$ro" \
+		kmsg "failing the transaction commit|commit FAILED|lazy commit failed|final log block" 4
+		kmsg "log disabled" 1
+		# That commit wrote the disable's last block: the log is off.
+		dis=-
+		[ "${DISABLE:-0}" = 1 ] && dis=$(awk '$1 == "enabled" {print ($2 == 0)}' $W)
+		log "CF logio: write $w commit $c ro=$ro disabled=$dis" \
 		    "log_write_failed=$(sed -n 's/^log_write_failed //p' $H)" \
 		    "log_commit_failed=$(sed -n 's/^log_commit_failed //p' $H)"
-		echo "$w $c $ro $(sed -n 's/^log_commit_failed //p' $H)" > $T/umltest/cf-logio.$TAG
+		echo "$w $c $ro $(sed -n 's/^log_commit_failed //p' $H) $dis" > $T/umltest/cf-logio.$TAG
 		for i in 0 1 2; do dm_heal $i; done
 		umount $MNT || log "UMOUNT_FAIL"
 		dmsetup remove_all 2>/dev/null

@@ -36,11 +36,21 @@
 #   fixed    it fails, read-only, with log_commit_failed
 #   control  raid56_wf_commit_keeps_previous=1: taken for a failed lazy
 #            commit, it goes on
+#
+# disable: logio, with the log being disabled (echo 0 > features/
+# raid56_write_intent) before the write: its first commit writes the superblock
+# without the flag, and the commit that meets the failing log slots is the one
+# that writes the log's last block (wib_write_final_locked())
+#   fixed    it fails, read-only, with log_commit_failed, as any commit that
+#            cannot write the log: the next mount reads the previous block,
+#            flag or not, and the names the set gained since are only in memory
+#   control  raid56_wf_commit_keeps_previous=1: "could not write the final log
+#            block", and it goes on
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: commit_full.sh <kernel> [full|logio]}
+KERNEL=${1:?usage: commit_full.sh <kernel> [full|logio|disable]}
 PLAN=${2:-full}
-case $PLAN in full|logio) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in full|logio|disable) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OMIT=2
 NDEV=4
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -80,9 +90,10 @@ arm() {	# name control
 	boot final none rw
 	rm -f $D/disk*.img
 }
-if [ $PLAN = logio ]; then
+if [ $PLAN = logio ] || [ $PLAN = disable ]; then
+	DIS=0; [ $PLAN = disable ] && DIS=1
 	for a in fixed:0 control:2; do
-		tag=cf-logio-${a%%:*}; D=$T/umltest/$tag
+		tag=cf-$PLAN-${a%%:*}; D=$T/umltest/$tag
 		rm -rf $D; mkdir -p $D; rm -f $T/umltest/cf-logio.$tag $T/umltest/results.$tag
 		ubds=""
 		for i in $(seq 0 $((NDEV-1))); do
@@ -91,25 +102,39 @@ if [ $PLAN = logio ]; then
 		timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
 			init=$T/umltest/init-cf.sh $ubds quiet con=null con0=fd:0,fd:1 \
 			BTRFS_TEST_DIR=$T MODE=commit_full OPTS=rw,commit=600 PROFILE=raid5:raid1c3 \
-			TAG=$tag NDEV=$NDEV CONTROL=${a##*:} PHASE=logio < /dev/null > $D/log 2>&1
+			TAG=$tag NDEV=$NDEV CONTROL=${a##*:} PHASE=logio DISABLE=$DIS \
+			< /dev/null > $D/log 2>&1
 		rm -f $D/disk*.img
-		grep -ahE "control:|CF |KERNEL_SPLAT|WATCHDOG|MOUNT_FAIL|MKFS_FAIL|KNOB_FAIL|DM_RELOAD" \
+		grep -ahE "control:|CF |disable|KERNEL_SPLAT|WATCHDOG|MOUNT_FAIL|MKFS_FAIL|KNOB_FAIL|DM_RELOAD" \
 			$D/log | cut -c1-300 | sed "s/^/  [${a%%:*}] /"
 	done
-	read -r fw fc fro flcf <<<"$(cat $T/umltest/cf-logio.cf-logio-fixed 2>/dev/null || echo '? ? ? ?')"
-	read -r cw cc cro clcf <<<"$(cat $T/umltest/cf-logio.cf-logio-control 2>/dev/null || echo '? ? ? ?')"
+	res() { cat $T/umltest/cf-logio.cf-$PLAN-$1 2>/dev/null || echo '? ? ? ? ?'; }
+	read -r fw fc fro flcf fdis <<<"$(res fixed)"
+	read -r cw cc cro clcf cdis <<<"$(res control)"
 	echo "  write: fixed $fw, control $cw; commit: fixed $fc (read-only $fro, log_commit_failed $flcf)," \
 	     "control $cc (read-only $cro, log_commit_failed $clcf)"
 	case "$fw$cw$fc$cc" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
-	grep -lq KERNEL_SPLAT $T/umltest/cf-logio-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
-	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-logio-*/log &&
+	grep -lq KERNEL_SPLAT $T/umltest/cf-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/cf-$PLAN-*/log &&
 		{ echo "RESULT: INCONCLUSIVE -- the control knob is not there"; exit 2; }
 	if [ "$fw" != ok ] || [ "$cw" != ok ]; then
 		echo "RESULT: INCONCLUSIVE -- the write before the fault failed (fixed $fw, control $cw)"
 		exit 2
 	fi
+	# The disable: the log was still enabled at the write, and the commit
+	# that met the failing slots was the one writing its last block.
+	lazy="lazy commit failed"
+	if [ $PLAN = disable ]; then
+		lazy="could not write the final log block"
+		if grep -lq "CF_DISABLED_EARLY\|DISABLE_FAIL" $T/umltest/cf-$PLAN-*/log ||
+		   [ "$fdis" != 1 ] || [ "$cdis" != 1 ]; then
+			echo "RESULT: INCONCLUSIVE -- the commit that met the failing log slots did not write"
+			echo "        the last block of the log being disabled (fixed $fdis, control $cdis)"
+			exit 2
+		fi
+	fi
 	if [ "$cc" != ok ] || [ "$cro" != 0 ] ||
-	   ! grep -aq "lazy commit failed" $T/umltest/cf-logio-control/log; then
+	   ! grep -aq "$lazy" $T/umltest/cf-$PLAN-control/log; then
 		echo "RESULT: INCONCLUSIVE -- the control's commit did not meet the failing log slots"
 		echo "        and go on (commit $cc, read-only $cro)"
 		exit 2
@@ -120,8 +145,13 @@ if [ $PLAN = logio ]; then
 		exit 1
 	fi
 	grep -aq "a transaction commit FAILED and the filesystem is now read-only" \
-		$T/umltest/cf-logio-fixed/log ||
+		$T/umltest/cf-$PLAN-fixed/log ||
 		{ echo "RESULT: FAIL -- no log_commit_failed explanation"; exit 1; }
+	if [ $PLAN = disable ]; then
+		echo "RESULT: PASS -- the commit whose last log block of a disable reached too few devices"
+		echo "        failed, read-only, with log_commit_failed; control: it went on"
+		exit 0
+	fi
 	echo "RESULT: PASS -- the commit whose log block reached too few devices failed, read-only,"
 	echo "        with log_commit_failed; control: it went on"
 	exit 0
