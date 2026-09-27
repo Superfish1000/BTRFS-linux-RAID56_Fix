@@ -2395,7 +2395,14 @@ static const bool name_unwritten;
  * the writes in flight that hold the readd's room wait for the commit's
  * mutex, and would have gone within milliseconds, and the filesystem goes
  * read-only for a readd that would have landed.  The negative control for
- * test_commit_settles_readd() in the self tests.
+ * readd_names_settle() in the self tests.
+ *
+ * raid56_wf_refusal_leaves_unnamed=1: a readd or a naming of full stripe
+ * writes that refuses the commits leaves out of the record what it could not
+ * name, as before @refused_names: until the unmount, a read of such a member
+ * returns what the device holds, which it may have lost from its cache, with
+ * no error.  The negative control for the unnamedctl arm of
+ * uml/flush_wedge.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool disable_forgets_writes;
@@ -2450,6 +2457,10 @@ static bool commit_refuses_owed;
 module_param_named(raid56_wf_commit_refuses_owed, commit_refuses_owed, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_commit_refuses_owed,
 		 "Let a transaction commit that finds a failed flush's readd owed refuse at once, without waiting for the writes in flight that hold its room in the write-intent log (testing only: restores a known defect)");
+static bool refusal_leaves_unnamed;
+module_param_named(raid56_wf_refusal_leaves_unnamed, refusal_leaves_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_refusal_leaves_unnamed,
+		 "Let a failed flush's readd that refuses the commits leave what it could not name out of the write-intent log's in-memory record too, so reads of it until the unmount return what the device holds (testing only: restores a known defect)");
 #else
 static const bool disable_forgets_writes;
 static const bool snapshot_misses_marks;
@@ -2464,6 +2475,7 @@ static const bool readd_acks_unnamed;
 static const bool commit_keeps_previous;
 static const bool untimed_takes_back;
 static const bool commit_refuses_owed;
+static const bool refusal_leaves_unnamed;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -2536,6 +2548,17 @@ bool btrfs_wib_untimed_takes_back(void)
 bool btrfs_wib_commit_refuses_owed(void)
 {
 	return READ_ONCE(commit_refuses_owed);
+}
+
+bool btrfs_wib_refusal_leaves_unnamed(void)
+{
+	return READ_ONCE(refusal_leaves_unnamed);
+}
+
+/* No repair runs in the self tests: waiting for one is time for nothing. */
+unsigned int btrfs_wib_set_log_full_repair_wait_ms(unsigned int ms)
+{
+	return xchg(&log_full_repair_wait_ms, ms);
 }
 #endif
 
@@ -3298,6 +3321,91 @@ static void wib_readd_names(struct btrfs_wib *wib, u32 i, u64 bytenr, bool preci
 }
 
 /*
+ * Keep the name of members @stale and @stale_par of region @bytenr that a
+ * refusal could not put on the record (@refused_names in struct btrfs_wib).
+ * Caller holds wib->lock.
+ */
+static void wib_refused_name_locked(struct btrfs_wib *wib, u64 bytenr, u64 stale,
+				    u64 stale_par)
+{
+	lockdep_assert_held(&wib->lock);
+
+	if (!(stale | stale_par) || READ_ONCE(refusal_leaves_unnamed))
+		return;
+	for (u32 i = 0; i < wib->nr_refused_names; i++) {
+		struct btrfs_wib_refused_name *r = &wib->refused_names[i];
+
+		if (r->bytenr == bytenr) {
+			r->stale |= stale;
+			r->stale_par |= stale_par;
+			return;
+		}
+	}
+	if (wib->nr_refused_names == BTRFS_WIB_REFUSED_SLOTS) {
+		wib->refused_names_overflow = true;
+		return;
+	}
+	wib->refused_names[wib->nr_refused_names++] = (struct btrfs_wib_refused_name) {
+		.bytenr = bytenr, .stale = stale, .stale_par = stale_par,
+	};
+}
+
+/*
+ * Does a refusal stand with names it kept only here?  Lock-free: a stale
+ * answer is the one given before the refusal, as for wib->nr_stale.
+ */
+static bool wib_refused_any(const struct btrfs_wib *wib)
+{
+	return READ_ONCE(wib->nr_refused_names) &&
+	       (READ_ONCE(wib->readd_refused) || READ_ONCE(wib->unlogged_refused));
+}
+
+/* The names a refusal kept of region @bytenr, or NULL.  Caller holds wib->lock. */
+static const struct btrfs_wib_refused_name *
+wib_refused_stale_locked(const struct btrfs_wib *wib, u64 bytenr)
+{
+	lockdep_assert_held(&wib->lock);
+
+	if (!wib_refused_any(wib))
+		return NULL;
+	for (u32 i = 0; i < wib->nr_refused_names; i++)
+		if (wib->refused_names[i].bytenr == bytenr)
+			return &wib->refused_names[i];
+	return NULL;
+}
+
+/*
+ * A transaction commit refused a readd that is still owed: nothing of the
+ * last block was taken back, nor named.  Keep the names the readd planned
+ * (wib->readd_names[], worked out against @last by the plan the commit met),
+ * where a write went to the member.  commit_mutex held.
+ */
+static void wib_readd_refused_names(struct btrfs_wib *wib)
+{
+	const struct btrfs_wib_disk_header *oh = wib->last;
+	const bool precise = !READ_ONCE(name_unwritten);
+	unsigned long flags;
+	u32 onr;
+
+	lockdep_assert_held(&wib->commit_mutex);
+
+	if (le64_to_cpu(oh->magic) != BTRFS_WIB_MAGIC)
+		return;
+	onr = min(le32_to_cpu(oh->nr_entries), wib_block_max_entries(wib->last));
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u32 i = 0; i < onr; i++) {
+		struct btrfs_wib_entry old;
+		u64 stale, stale_par;
+
+		btrfs_wib_read_entry(wib->last, i, &old);
+		wib_readd_names(wib, i, old.bytenr, precise, &stale, &stale_par);
+		wib_refused_name_locked(wib, old.bytenr, stale & wib_entry_bits(&old),
+					stale_par & wib_entry_bits(&old));
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
  * Ask for a repair of the full stripe of each block @bits of region @bytenr,
  * once for a run of blocks of the same stripe (@prev), and say in @first the
  * first one asked for.  Outside wib->lock, under memalloc_nofs_save(); @mapp
@@ -3673,6 +3781,17 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 				e = wib_find_or_alloc_entry(wib, old.bytenr, false);
 			if (!e) {
 				nr_lost += hweight64(back);
+				/*
+				 * Lost, which refuses every commit from here:
+				 * keep at least the names, for the reads until
+				 * the unmount.
+				 */
+				if (!READ_ONCE(readd_acks_unnamed)) {
+					wib_readd_names(wib, i, old.bytenr, precise, &nstale,
+							&npar);
+					wib_refused_name_locked(wib, old.bytenr, nstale & back,
+								npar & back);
+				}
 				continue;
 			}
 			live++;
@@ -3732,8 +3851,18 @@ static bool wib_readd_dropped(struct btrfs_wib *wib,
 			 * Say at least that, so that a mount after a crash
 			 * treats it as the write in flight it was, not as a
 			 * failed write whose damage the record names.
+			 *
+			 * Unless that refuses every commit from here (a name
+			 * left off is one, @readd_refused): then no block is
+			 * written again, and the mark would only refuse this
+			 * mount's rebuilds of the member.  Keep the name
+			 * instead, for its reads until the unmount
+			 * (@refused_names).
 			 */
-			if (!READ_ONCE(all_records_torn))
+			if ((nstale | npar) && !READ_ONCE(readd_acks_unnamed) &&
+			    !READ_ONCE(refusal_leaves_unnamed))
+				wib_refused_name_locked(wib, old.bytenr, nstale, npar);
+			else if (!READ_ONCE(all_records_torn))
 				e->torn |= ((nstale & ~e->stale) | (npar & ~e->stale_par)) &
 					   e->sticky;
 		}
@@ -3998,8 +4127,18 @@ static void wib_unlogged_name(struct btrfs_wib *wib,
 		names->repair = (nstale | npar) & ~names->absent;
 		nr_named += hweight64(nstale) + hweight64(npar);
 	}
-	if (refuse)
+	if (refuse) {
 		WRITE_ONCE(wib->unlogged_refused, true);
+		/* Keep the names for the reads until the unmount: @refused_names. */
+		for (u32 i = 0; i < nr; i++) {
+			const struct btrfs_wib_unlogged *u = wib_unlogged_find(wib, un[i].bytenr);
+
+			if (u)
+				wib_refused_name_locked(wib, un[i].bytenr,
+							u->cols & un[i].names.stale,
+							u->par & un[i].names.stale_par);
+		}
+	}
 	spin_unlock_irqrestore(&wib->lock, flags);
 
 	if (nr_named) {
@@ -4727,7 +4866,8 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 /* Is anything at all recorded stale?  Lock-free; see wib->nr_stale. */
 bool btrfs_wib_any_stale(const struct btrfs_fs_info *fs_info)
 {
-	return fs_info->wib && atomic_read(&fs_info->wib->nr_stale) != 0;
+	return fs_info->wib && (atomic_read(&fs_info->wib->nr_stale) != 0 ||
+				wib_refused_any(fs_info->wib));
 }
 
 /*
@@ -5544,7 +5684,7 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 	 */
 	if (nr_data > 64 || nr_parity > 2)
 		return false;
-	if (likely(!atomic_read(&wib->nr_stale))) {
+	if (likely(!atomic_read(&wib->nr_stale)) && likely(!wib_refused_any(wib))) {
 		atomic64_inc(&wib->stat_stale_fast);
 		return false;
 	}
@@ -5558,8 +5698,13 @@ bool btrfs_wib_stripe_state(struct btrfs_fs_info *fs_info, u64 full_stripe_start
 		const u64 mask = btrfs_wib_range_mask(cur, logical, BTRFS_WIB_BLOCK_SIZE);
 		const struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
 		const struct btrfs_wib_entry *pe = wib_find_pending(wib, cur, mask);
+		const struct btrfs_wib_refused_name *rn = wib_refused_stale_locked(wib, cur);
 		u64 stale = 0, stale_par = 0, any = 0, gen = 0;
 
+		if (rn) {
+			stale |= rn->stale;
+			stale_par |= rn->stale_par;
+		}
 		if (e) {
 			/*
 			 * Not what a running replace marked for its target
@@ -5631,6 +5776,7 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	unsigned long flags;
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 cur = wib_entry_bytenr(logical);
+	const struct btrfs_wib_refused_name *rn;
 	struct btrfs_wib_entry *e;
 	const struct btrfs_wib_entry *pe;
 	bool stale = false;
@@ -5644,7 +5790,7 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	 * being added can only return the answer this function gave before
 	 * the record existed at all, which is the behaviour without it.
 	 */
-	if (likely(!atomic_read(&wib->nr_stale))) {
+	if (likely(!atomic_read(&wib->nr_stale)) && likely(!wib_refused_any(wib))) {
 		atomic64_inc(&wib->stat_stale_fast);
 		return false;
 	}
@@ -5665,6 +5811,9 @@ bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical)
 	pe = wib_find_pending(wib, cur, mask);
 	if (pe)
 		stale |= pe->stale & mask;
+	rn = wib_refused_stale_locked(wib, cur);
+	if (rn)
+		stale |= rn->stale & mask;
 	spin_unlock_irqrestore(&wib->lock, flags);
 	return stale;
 }
@@ -6960,6 +7109,7 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 	 */
 	if (wib->readd_owed && !wib->readd_refused && !READ_ONCE(readd_acks_unnamed)) {
 		WRITE_ONCE(wib->readd_refused, true);
+		wib_readd_refused_names(wib);
 		btrfs_raid56_alert(fs_info, BTRFS_RAID56_EV_LOG_UNFLUSHED, 0, NULL, 0);
 	}
 	owed = wib->readd_owed;
@@ -8070,9 +8220,11 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 	wib->unlogged = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged), GFP_KERNEL);
 	wib->unlogged_names = kcalloc(BTRFS_WIB_UNLOGGED_SLOTS, sizeof(*wib->unlogged_names),
 				      GFP_KERNEL);
+	wib->refused_names = kcalloc(BTRFS_WIB_REFUSED_SLOTS, sizeof(*wib->refused_names),
+				     GFP_KERNEL);
 	if (!wib->block || !wib->last || !wib->prepared || !wib->flushsnap ||
 	    !wib->readd_base || !wib->written || !wib->snapbits || !wib->readd_last ||
-	    !wib->unlogged || !wib->unlogged_names) {
+	    !wib->unlogged || !wib->unlogged_names || !wib->refused_names) {
 		free_page((unsigned long)wib->block);
 		free_page((unsigned long)wib->last);
 		free_page((unsigned long)wib->prepared);
@@ -8083,6 +8235,7 @@ int btrfs_wib_alloc(struct btrfs_fs_info *fs_info)
 		kfree(wib->readd_last);
 		kfree(wib->unlogged);
 		kfree(wib->unlogged_names);
+		kfree(wib->refused_names);
 		kfree(wib);
 		return -ENOMEM;
 	}
@@ -8133,6 +8286,7 @@ void btrfs_wib_free(struct btrfs_fs_info *fs_info)
 	kfree(wib->readd_last);
 	kfree(wib->unlogged);
 	kfree(wib->unlogged_names);
+	kfree(wib->refused_names);
 	kvfree(wib->pending);
 	kvfree(wib->pending_taken);
 	kfree(wib);

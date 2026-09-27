@@ -5307,10 +5307,15 @@ flush_wedge)
 	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
-	#              nothing acknowledges the overwrites
+	#              nothing acknowledges the overwrites -- and the names the
+	#              readd could not write stay in memory for the reads until
+	#              the unmount (@refused_names): every overwrite reads back
 	#     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 	#              overwrites FAIL dropped read back as the block was before,
 	#              with no error
+	#     CONTROL=2 raid56_wf_refusal_leaves_unnamed=1: the commit fails as in
+	#              fixed, but nothing keeps the names: until the unmount, the
+	#              overwrites FAIL dropped read back as the block was before
 	watchdog ${WATCH:-900}
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -5329,6 +5334,13 @@ flush_wedge)
 		echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null || log "CONTROL_KNOB_FAIL"
 		log "control: $k=1"
 	done
+	# PLAN=unnamed, CONTROL=2: the refused readd leaves what it could not
+	# name out of the in-memory record too, as before @refused_names.
+	[ "${CONTROL:-0}" = 2 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_refusal_leaves_unnamed \
+			2>/dev/null || log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_refusal_leaves_unnamed=1"
+	}
 	# torn and busy check what a log full of records that only say a write
 	# may have been torn does: both arms let the readd that cannot name the
 	# device leave them, which unnamed shows the default refuses.  And busy

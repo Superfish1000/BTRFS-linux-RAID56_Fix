@@ -43,10 +43,16 @@
 #   unnamed (CUR-4)  165 regions, as torn: too many to name device 1 in
 #     fixed    the commit whose barrier failed fails instead (read-only), with
 #              the log_flush_unnamed alert: the overwrites are never
-#              acknowledged, and each block reads back as written or as it was
+#              acknowledged -- and until the unmount the refused readd keeps
+#              in memory the names it could not write (@refused_names), so
+#              every block reads back as written: device 1's dropped column
+#              is rebuilt from the parity the others flushed
 #     control  raid56_wf_readd_acks_unnamed=1: the commit goes on, and the
 #              overwrites device 1 dropped read back as the block was before
 #              the acknowledged write, with no error
+#     unnamedctl raid56_wf_refusal_leaves_unnamed=1: the commit fails as in
+#              fixed, but nothing keeps the names, and until the unmount the
+#              overwrites device 1 dropped read back as before, with no error
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
 KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|unnamed]}
@@ -84,7 +90,9 @@ arm() {	# name control
 }
 arm fixed 0
 arm control 1
-for a in fixed control; do
+ARMS="fixed control"
+[ $PLAN = unnamed ] && { arm unnamedctl 2; ARMS="$ARMS unnamedctl"; }
+for a in $ARMS; do
 	grep -ah "control:\|FW \|FW_\|drops every\|fails writes\|healed\|in-place overwrites\|suspended\|resumed\|KERNEL_SPLAT\|WATCHDOG\|MOUNT_FAIL\|MKFS_FAIL\|LAYOUT_FAIL\|FALLOCATE_FAIL\|DM_RELOAD\|DM_SUSPEND\|DM_RESUME\|KNOB_FAIL" \
 		$T/umltest/fw-$PLAN-$a/log | grep -v FW_READ_BAD | sed "s/^/  [$a] /"
 	echo "  [$a] FW_READ_BAD lines: $(grep -ac FW_READ_BAD $T/umltest/fw-$PLAN-$a/log)"
@@ -97,7 +105,7 @@ read -r c_acked c_fl c_named c_torn c_queued c_rok c_ok c_eio c_rdok c_rdeio c_r
 case "$f_acked$c_acked" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
 grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
 grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
-grep -lq CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-control/log &&
+grep -lqs CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-control/log $T/umltest/fw-$PLAN-unnamedctl/log &&
 	{ echo "RESULT: INCONCLUSIVE -- the control knob is not there (not a CONFIG_BTRFS_DEBUG kernel?)"; exit 2; }
 if [ "$f_commit" != 0 ] || [ "$c_commit" != 0 ]; then
 	echo "RESULT: INCONCLUSIVE -- a transaction commit ran while the device dropped writes"; exit 2
@@ -167,9 +175,25 @@ if [ $PLAN = unnamed ]; then
 	grep -aq "every transaction commit from here FAILS and the filesystem goes read-only" \
 		$T/umltest/fw-$PLAN-fixed/log ||
 		{ echo "RESULT: FAIL -- the log_flush_unnamed explanation does not say the commit failed"; exit 1; }
-	echo "RESULT: PASS -- the commit that could not name device 1 failed, read-only, with the alert:"
-	echo "        nothing acknowledged the overwrites ($f_rold read back as before, $f_rdok as written);"
-	echo "        control: the commit went on and $c_rold acknowledged block(s) read back old, no error"
+	# The names the refused readd could not write, kept for the reads.
+	read -r u_acked _ _ _ _ _ _ _ u_rdok u_rdeio u_rdbad _ _ _ _ _ _ u_fsync u_ro u_rold u_unn \
+		<<<"$(res unnamedctl)"
+	echo "  unnamedctl: went on $u_fsync, read-only $u_ro, log_flush_unnamed $u_unn;" \
+	     "read back ok/eio/bad $u_rdok/$u_rdeio/$u_rdbad of $u_acked (old $u_rold)"
+	if [ "${u_fsync:-1}" != 0 ] || [ "${u_rold:-0}" = 0 ]; then
+		echo "RESULT: INCONCLUSIVE -- with raid56_wf_refusal_leaves_unnamed=1 the commit went on or"
+		echo "        nothing read back old, so the fixed arm's reads show nothing"
+		exit 2
+	fi
+	if [ "${f_rold:-0}" != 0 ] || [ "${f_rdeio:-0}" != 0 ]; then
+		echo "RESULT: FAIL -- after the refusal $f_rold block(s) read back as before the write and"
+		echo "        $f_rdeio failed, although the refused readd could have kept their names"
+		exit 1
+	fi
+	echo "RESULT: PASS -- the commit that could not name device 1 failed, read-only, with the alert,"
+	echo "        and every overwrite read back as written until the unmount ($f_rdok);"
+	echo "        keeping no names, $u_rold read back as before (unnamedctl); control: the commit went"
+	echo "        on and $c_rold acknowledged block(s) read back old, no error"
 	exit 0
 fi
 if [ $PLAN = named ]; then

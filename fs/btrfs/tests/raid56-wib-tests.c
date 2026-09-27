@@ -1880,6 +1880,7 @@ static int test_untimed_commit(struct btrfs_fs_info *fs_info)
 	ret = 0;
 out:
 	WRITE_ONCE(wib->readd_refused, false);
+	wib->nr_refused_names = 0;
 	btrfs_wib_done(fs_info, busy, blk, false);
 	for (int pass = 0; pass < 2; pass++) {
 		btrfs_wib_clear_sticky(fs_info, rec, blk);
@@ -2502,6 +2503,8 @@ static int readd_refused(struct btrfs_wib *wib, int ret, const char *what)
 		return -EINVAL;
 	}
 	WRITE_ONCE(wib->readd_refused, false);
+	/* What it kept for the reads is the refused mount's, not the next test's. */
+	wib->nr_refused_names = 0;
 	return 0;
 }
 
@@ -3673,8 +3676,17 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 	struct btrfs_wib *wib = fs_info->wib;
 	const u64 unnamed0 = atomic64_read(&wib->stat_alert[BTRFS_RAID56_EV_LOG_UNFLUSHED]);
 	const bool marks_off = btrfs_wib_all_records_torn();
+	/*
+	 * The readd refuses the commits: what it could not name it keeps for
+	 * the reads until the unmount (@refused_names) instead of marking it
+	 * possibly torn, as it did before, and still does under the knobs that
+	 * restore that.
+	 */
+	const bool keeps_names = !legacy && !btrfs_wib_readd_acks_unnamed() &&
+				 !btrfs_wib_refusal_leaves_unnamed();
 	const u64 first = 10;
 	const u64 nr = 100;
+	unsigned int wait_ms;
 	bool refused;
 	void *saved;
 	int ret;
@@ -3688,6 +3700,20 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 	memcpy(saved, wib->last, BTRFS_WIB_SLOT_SIZE);
 
 	ret = readd_commit_failed(rig);
+	/* While the refusal stands, the reads see the names it could not write. */
+	for (u64 k = first; k < first + nr && keeps_names && ret == -EIO; k++) {
+		struct btrfs_wib_stripe_state st;
+		u64 stale, stale_par;
+
+		readd_expect(k, &stale, &stale_par);
+		btrfs_wib_stripe_state(fs_info, readd_region(k), READD_NR_DATA, 1, &st);
+		if (st.stale_cols != stale || st.bad_parity != stale_par) {
+			test_err("region %llu: the refused readd keeps 0x%llx/0x%x for the reads, expected 0x%llx/0x%llx",
+				 k, st.stale_cols, st.bad_parity, stale, stale_par);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
 	if (!legacy)
 		ret = readd_refused(wib, ret, "the commit that could not name the device");
 	if (ret)
@@ -3727,7 +3753,7 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 		u64 stale, stale_par, torn;
 
 		readd_expect(k, &stale, &stale_par);
-		torn = legacy || marks_off ? 0 : stale | stale_par;
+		torn = legacy || marks_off || keeps_names ? 0 : stale | stale_par;
 		if (!e || e->torn != torn) {
 			test_err("region %llu: marked possibly torn 0x%llx, expected 0x%llx",
 				 k, e ? e->torn : 0, torn);
@@ -3744,10 +3770,12 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 	 * may not be spent are more than a wide block holds (wib_admit_max()) --
 	 * a repair's persist, a commit.
 	 */
-	refused = !btrfs_wib_admits_narrow() && !legacy && !marks_off &&
+	refused = !btrfs_wib_admits_narrow() && !legacy && !marks_off && !keeps_names &&
 		  !btrfs_wib_evicts_naming() &&
 		  (btrfs_wib_torn_unevictable() || !btrfs_wib_evicts_stage0());
+	wait_ms = btrfs_wib_set_log_full_repair_wait_ms(10);
 	ret = btrfs_wib_mark(fs_info, readd_region(first + nr), READD_STRIPE_LEN);
+	btrfs_wib_set_log_full_repair_wait_ms(wait_ms);
 	if (ret != (refused ? -EIO : 0)) {
 		test_err("a new write after the failed flush returned %d, expected %d", ret,
 			 refused ? -EIO : 0);
@@ -3777,7 +3805,7 @@ static int readd_names_no_room(struct readd_rig *rig, bool legacy)
 		u64 stale, stale_par, torn;
 
 		readd_expect(k, &stale, &stale_par);
-		torn = legacy || marks_off || btrfs_wib_torn_no_persist() ? 0 :
+		torn = legacy || marks_off || keeps_names || btrfs_wib_torn_no_persist() ? 0 :
 		       stale | stale_par;
 		if (block_bitmap(wib->last, readd_region(k)) != torn) {
 			test_err("region %llu: the block lists 0x%llx in flight, expected the marks 0x%llx",
@@ -4007,6 +4035,7 @@ static int readd_names_settle(struct readd_rig *rig, bool legacy)
 	ret = 0;
 out:
 	WRITE_ONCE(wib->readd_refused, false);
+	wib->nr_refused_names = 0;
 	btrfs_wib_clear_sticky(fs_info, readd_region(k_stale), READD_STRIPE_LEN);
 	/*
 	 * The readd owed under a knob lands here, before the records go, and
@@ -4473,6 +4502,7 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 	}
 	readd_full_done(rig, 20 + BTRFS_WIB_UNLOGGED_SLOTS, n_last);
 	WRITE_ONCE(wib->unlogged_refused, false);
+	wib->nr_refused_names = 0;
 	ret = readd_commit(rig);
 	if (ret)
 		return ret;
@@ -4504,6 +4534,7 @@ static int readd_names_full_stripe(struct readd_rig *rig)
 		return -EINVAL;
 	}
 	WRITE_ONCE(wib->unlogged_refused, false);
+	wib->nr_refused_names = 0;
 	btrfs_raid56_health_ack(fs_info, false, 0);
 	ret = readd_commit(rig);
 	if (ret)

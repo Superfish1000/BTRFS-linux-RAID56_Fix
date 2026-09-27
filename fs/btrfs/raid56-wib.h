@@ -553,6 +553,21 @@ struct btrfs_wib_unlogged_names {
 	struct btrfs_wib_names names;
 };
 
+/*
+ * In memory only.  A name a refused readd or naming of full stripe writes
+ * could not put on the record (@refused_names in struct btrfs_wib): the
+ * members of region @bytenr, addressed as the record addresses them, that a
+ * write went to on a device that did not confirm a flush.
+ */
+struct btrfs_wib_refused_name {
+	u64 bytenr;
+	u64 stale;
+	u64 stale_par;
+};
+
+/* Every region of the last block, and every region of unlogged records. */
+#define BTRFS_WIB_REFUSED_SLOTS	(BTRFS_WIB_NR_ENTRIES + BTRFS_WIB_UNLOGGED_SLOTS)
+
 /* A region's in-flight bits in a snapshot block, see wib_load_snapbits(). */
 struct btrfs_wib_bits {
 	u64 bytenr;
@@ -822,6 +837,20 @@ struct btrfs_wib {
 	 */
 	bool unlogged_refused;
 	/*
+	 * Under @lock.  The names a readd (@readd_refused) or the naming of
+	 * full stripe writes (@unlogged_refused) refused over could not put on
+	 * the record: no block could describe them, and none is written again.
+	 * A read of such a member would get what the device holds, which it
+	 * may have lost from its cache, with no error.  While a refusal stands
+	 * the staleness queries answer from these too
+	 * (wib_refused_stale_locked()), and the read rebuilds the member from
+	 * the parity the other devices flushed; @refused_names_overflow if
+	 * there were more than BTRFS_WIB_REFUSED_SLOTS regions.
+	 */
+	struct btrfs_wib_refused_name *refused_names;
+	u32 nr_refused_names;
+	bool refused_names_overflow;
+	/*
 	 * Under @commit_mutex: the in-flight bits of the snapshot a flush was
 	 * issued after, sorted by region (wib_load_snapbits()), and how many.
 	 * BTRFS_WIB_NR_ENTRIES of them, allocated with the log.
@@ -1014,6 +1043,8 @@ bool btrfs_wib_readd_acks_unnamed(void);
 bool btrfs_wib_commit_keeps_previous(void);
 bool btrfs_wib_untimed_takes_back(void);
 bool btrfs_wib_commit_refuses_owed(void);
+bool btrfs_wib_refusal_leaves_unnamed(void);
+unsigned int btrfs_wib_set_log_full_repair_wait_ms(unsigned int ms);
 bool btrfs_wib_replace_trusts_target(void);
 bool btrfs_wib_torn_unevictable(void);
 bool btrfs_wib_torn_spent_eagerly(void);
