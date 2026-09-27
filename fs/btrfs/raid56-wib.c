@@ -7421,14 +7421,18 @@ static const bool torn_remedy_legacy;
  * log is to be replayed; a device left out (-o degraded) without saying that
  * such a mount fails with recovery_log_full if the log lists more stripes
  * than it can keep; nothing of the case where no mount can make the
- * filesystem writable again, nor of how to get the data off then.  The
- * negative control for the replay plan of uml/commit_full.sh.
+ * filesystem writable again, nor of how to get the data off then.  And, for
+ * a log_full that fails a tree-log replay, to fix the device and mount again
+ * (whose recovery keeps every record until after the replay, and fails the
+ * same way), or to mount with '-o ro,nologreplay' (no such mount option), or
+ * to zero the log and replace the device (which the full log refuses too).
+ * The negative control for uml/commit_full.sh replay and uml/replay_full.sh.
  */
 #ifdef CONFIG_BTRFS_DEBUG
 static bool advice_legacy;
 module_param_named(raid56_wf_advice_legacy, advice_legacy, bool, 0644);
 MODULE_PARM_DESC(raid56_wf_advice_legacy,
-		 "Give the old advice with recovery_log_full, log_full, log_flush_unnamed, full_stripe_flush_unnamed and log_commit_failed, each in one printk record that cuts it off at 1024 bytes, which sends a mount that has a tree log to replay into the same failure and does not say when no mount can make the filesystem writable again (testing only: restores the old behaviour)");
+		 "Give the old advice with recovery_log_full, log_full, log_flush_unnamed, full_stripe_flush_unnamed and log_commit_failed, each in one printk record that cuts it off at 1024 bytes, which sends a mount that has a tree log to replay into the same failure, and a replay the full log failed into another mount that fails it again, and does not say when no mount can make the filesystem writable again (testing only: restores the old behaviour)");
 #else
 static const bool advice_legacy;
 #endif
@@ -7604,13 +7608,23 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 				  logical, fsid);
 			break;
 		}
-		if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
+		if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags) &&
+		    READ_ONCE(advice_legacy)) {
 			btrfs_err(fs_info,
 "raid56: the tree-log replay of this mount FAILED to write near %llu, and the mount fails, because the write-intent log is full of records it will not drop: each says which copy of a stripe is stale on a device that failed writes or is missing, or that a write into it may have been torn, and dropping one could let old data read back with no error. The same records are there at every mount until they retire. If a device fails writes, make it work again (cabling, power) and mount again: the mount's recovery repairs what the records name first. Otherwise mount without the replay to copy the data off ('mount -o ro,nologreplay', with -o degraded if a device is missing): the changes fsync'd since the last transaction commit are not visible that way. Or give those changes up for good ('btrfs rescue zero-log <device>'), mount read-write and replace the failing or missing device with a new disk ('btrfs replace start <devid> <new device> <mountpoint>', then 'btrfs scrub start <mountpoint>'); do not reconnect a disk that went missing, its copy is stale.",
 				  logical);
 			break;
 		}
 		missing = READ_ONCE(fs_info->fs_devices->missing_devices);
+		if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
+			raid56_explain_err(fs_info,
+"raid56: the tree-log replay of this mount FAILED to write near %llu, and the mount fails, because the write-intent log is full of records it will not drop: each says which copy of a stripe is stale on a device that failed writes or is missing, or that a write into it may have been torn, and dropping one could let old data read back with no error. While a tree log is to be replayed, the mount's recovery repairs none of the records of failed writes -- it keeps them until after the replay -- so mounting again fails the same way, even with the device fixed. To read the data, mount read-only without the replay: 'mount -o %s <device> <mountpoint>'; the changes fsync'd since the last transaction commit are not visible that way, and nothing but this replay can bring them back. To make the filesystem writable, those changes must be given up: with every device there and taking writes (a device that failed writes made to work again -- cabling, power -- and one missing only at this mount brought back, but not a disk the array went on without: its copy is stale), copy off what you need, clear the tree log ('btrfs rescue zero-log <device>', with a btrfs-progs that knows the raid56_write_intent feature: an older one refuses to write this filesystem, 'unsupported option features') and mount again: without a replay, its recovery repairs what the records name. If a device cannot be made to work or brought back, clearing the tree log does not help -- the records naming it stay, and so does the full log -- and no mount can make this filesystem writable again without dropping them: copy the data off the read-only mount and recreate the filesystem; the same if the mount after clearing the tree log still fails writes with log_full. State: /sys/fs/btrfs/%pU/raid56_health",
+					   logical,
+					   missing ? "ro,degraded,rescue=nologreplay" :
+						     "ro,rescue=nologreplay",
+					   fsid);
+			break;
+		}
 		if (READ_ONCE(advice_legacy)) {
 			btrfs_err(fs_info,
 "raid56: a write near %llu FAILED (EIO to the application; a refused metadata write makes the filesystem read-only) because the write-intent log is full of records it will not drop: each says which copy of a stripe is stale -- left by writes a device failed or could not take because it is missing, or by a cache flush it did not confirm -- or that a write into it may have been torn, and dropping one could let old data, or a rebuild nothing checked, read back with no error. If a device keeps failing writes, replace it ('btrfs replace start <devid> <new device> <mountpoint>'). If a device is missing, replace that devid with a NEW disk the same way, and do not reconnect the old one: its copy is stale wherever the array was written without it. Then run 'btrfs scrub start <mountpoint>': it repairs every stripe it can, and retires the records that only say a write may have been torn. If the filesystem went read-only because its metadata is on RAID5/6 too, the replace cannot run either: mount it read-only (-o ro, with -o degraded if a device is missing) and copy the data off. State: /sys/fs/btrfs/%pU/raid56_health",

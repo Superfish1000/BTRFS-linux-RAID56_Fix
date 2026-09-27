@@ -3300,6 +3300,217 @@ commit_full)
 		;;
 	esac
 	;;
+replay_full)
+	# A tree-log replay that meets a write-intent log full of records naming
+	# a device: does the log_full alert give advice that works?
+	#
+	# PHASE=prep: RAID5 data AND metadata (the replay's writes are metadata
+	# and must go through the log), four devices.  A nodatacow file
+	# preallocated over RPF_REGIONS + RPF_EXTRA regions (4 MiB), and in each
+	# the first row whose parity device FAIL holds.  A few bytes written and
+	# fsync'd into a new file: a tree log to replay, its barrier before the
+	# records below, which it would otherwise drop.  Then FAIL fails writes,
+	# no repair is queued on the fault (raid56_no_repair_on_fault: the
+	# records stay until the crash), and one block per region is overwritten
+	# in place, until a write is refused: each acknowledged, its record
+	# naming the parity on FAIL stale, until they fill the log (82, a wide
+	# block).  The refused write's log_full explanation says how to mount
+	# read-only.  The machine stops without syncing.
+	# PHASE=mount: every device, FAIL working again.  The read-write mount's
+	# recovery keeps every record until after the replay, whose first write
+	# into a new region finds the log full: the mount fails with log_full.
+	# Then what its explanation advises, as it gives it:
+	#   - the read-only mount (both messages' options): does it mount, and
+	#     do the overwritten blocks read back as written?
+	#   - with the device working again: the old advice mounts again, which
+	#     fails the same way (CONTROL=1, raid56_wf_advice_legacy=1, both
+	#     boots); the new one clears the tree log ('btrfs rescue zero-log';
+	#     zero_log.py where the rig's btrfs-progs, which predate the
+	#     raid56_write_intent feature, refuse the filesystem) and mounts: its
+	#     recovery repairs the parity, the filesystem is writable, and every
+	#     overwritten block reads back as written.
+	watchdog ${WATCH:-1500}
+	RPF_REGIONS=${RPF_REGIONS:-82}; RPF_EXTRA=${RPF_EXTRA:-8}
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_advice_legacy 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_advice_legacy=1"
+	}
+	rpf_blk() {	# file-block -> A | B | eio | other
+		if dd if=$MNT/nocow of=/tmp/blk.rpf bs=4096 count=1 skip=$1 iflag=direct \
+		      status=none 2>/dev/null; then
+			for c in A B; do
+				[ "$(tr -cd $c < /tmp/blk.rpf | wc -c)" = 4096 ] &&
+					{ echo $c; return; }
+			done
+			echo other
+		else
+			echo eio
+		fi
+	}
+	rpf_read() {	# -> "<B> <eio> <other>" over the acknowledged overwrites
+		local b=0 e=0 o=0 v
+		for blk in $(cat $T/umltest/rpf.acked.$TAG); do
+			v=$(rpf_blk $blk)
+			case $v in B) b=$((b + 1));; eio) e=$((e + 1));; *) o=$((o + 1));; esac
+		done
+		echo "$b $e $o"
+	}
+	# The last explanation matching a pattern, with its continuations: one
+	# longer than a printk record is said in parts (raid56_explain_err()).
+	rpf_msg() {	# message-pattern
+		dmesg | awk -v p="$1" 'index($0, p) { m = $0; on = 1; next }
+			on && index($0, "raid56 (continued): ") { m = m " " $0; next }
+			{ on = 0 } END { print m }'
+	}
+	# The read-only mount options an explanation gives: the new texts quote
+	# the command, the old say '(-o ro, with -o degraded ...)'.
+	rpf_ro_opts() {	# message-pattern
+		local m o
+		m=$(rpf_msg "$1")
+		o=$(echo "$m" | sed -n "s/.*'mount -o \([^ ']*\).*/\1/p")
+		[ -z "$o" ] && echo "$m" | grep -q "(-o ro, with -o degraded" && o=ro
+		echo ${o:-none}
+	}
+	case "$PHASE" in
+	prep)
+		dm_setup
+		mkfs.btrfs -K -q -f -d raid5 -m raid5 $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		nrows=$(( (RPF_REGIONS + RPF_EXTRA + 4) * 22 ))
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		fallocate -l $(( nrows * NOCOW_FS_BLOCKS * 4096 )) $MNT/nocow ||
+			{ log "FALLOCATE_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=$(( nrows * NOCOW_FS_BLOCKS * 4096 / 1048576 )) \
+		   status=none | tr '\000' 'A' | dd of=$MNT/nocow conv=notrunc status=none
+		sync
+		R=$T/umltest/rpf.rows.$TAG
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 $NOCOW_FS_BLOCKS \
+			$nrows region > $R 2>&1
+		# One block per region, in the first row of it whose parity FAIL
+		# holds, its full stripe wholly in the region: the write rewrites
+		# a data column elsewhere and the parity on FAIL, whose failure the
+		# record names -- decidable, whatever the crash tore.  And a block
+		# of another full stripe of the same region, for the last write.
+		awk -v f=$FAIL '$3 >= 0 { split($5, r, ":"); if (r[2] != 0) next
+			if ($4 == f && !(r[1] in t)) { t[r[1]] = $2; o[++n] = r[1] }
+			else if (!(r[1] in sp)) sp[r[1]] = $2 }
+			END { for (i = 1; i <= n; i++) if (o[i] in sp) print t[o[i]], sp[o[i]] }' \
+			$R > $T/umltest/rpf.targets.$TAG
+		n=$(wc -l < $T/umltest/rpf.targets.$TAG)
+		[ "$n" -ge $((RPF_REGIONS + RPF_EXTRA)) ] || {
+			log "LAYOUT_FAIL $n of $((RPF_REGIONS + RPF_EXTRA)) regions: $(head -2 $R | tr '\n' ' ')"
+			finish
+		}
+		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		# Inline, no data space: no chunk allocated, which would make the
+		# fsync a full transaction commit.
+		printf 'fsynced\n' | dd of=$MNT/fsynced conv=fsync status=none || log "FSYNC_FAIL"
+		lroot=$(btrfs inspect-internal dump-super /dev/mapper/d0 2>/dev/null |
+			awk '$1 == "log_root" {print $2}')
+		echo 1 > /sys/module/btrfs/parameters/raid56_no_repair_on_fault 2>/dev/null ||
+			log "NOREPAIR_KNOB_FAIL"
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.rpf
+		dm_error_writes $FAIL; log "device $FAIL fails writes"
+		acked=0; refused=0; : > $T/umltest/rpf.acked.$TAG
+		while read -r b sp; do
+			if dd if=/tmp/bblock.rpf of=$MNT/nocow bs=4096 seek=$b count=1 oflag=direct \
+			      conv=notrunc status=none 2>/dev/null; then
+				acked=$((acked + 1)); echo $b >> $T/umltest/rpf.acked.$TAG
+			else
+				refused=1; break
+			fi
+		done < $T/umltest/rpf.targets.$TAG
+		# The last write's record names FAIL in memory until the log is
+		# written again: a write into another full stripe of the first
+		# region, recorded already, writes it with every name.
+		read -r b sp < $T/umltest/rpf.targets.$TAG
+		dd if=/tmp/bblock.rpf of=$MNT/nocow bs=4096 seek=$sp count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && echo $sp >> $T/umltest/rpf.acked.$TAG ||
+			log "RPF the write into a recorded region failed"
+		acked=$(wc -l < $T/umltest/rpf.acked.$TAG)
+		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		stats "after the overwrites"
+		rtopts=$(rpf_ro_opts "because the write-intent log is full of records it will not drop")
+		kmsg "write-intent log is full|still full" 2
+		log "RPF_PREP overwrites acknowledged=$acked refused=$refused" \
+		    "commits $commits0 -> $commits1 log_root ${lroot:-?}; log_full's read-only mount: -o $rtopts"
+		echo "$acked $refused $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) ${lroot:-0} $rtopts" \
+			> $T/umltest/rpf-prep.$TAG
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		sync -f $RES $T/umltest/rpf-prep.$TAG $T/umltest/rpf.acked.$TAG
+		echo o > /proc/sysrq-trigger
+		sleep 60
+		;;
+	mount)
+		RPAT="the tree-log replay of this mount FAILED"
+		mount -o rw $MNTDEV $MNT 2>/dev/null && first=ok || first=fail
+		kmsg "valid blocks found|recovery done|tree-log replay" 4
+		[ $first = ok ] && stats "after the first mount"
+		grep " $MNT " /proc/mounts >/dev/null && umount $MNT
+		said=$(dmesg | grep -ac "$RPAT")
+		kmsg "$RPAT|still full|failed to recover log|open_ctree failed" 3
+		# The read-only mounts the two explanations give: this one's, and
+		# that of the write the full log refused before the crash.
+		ro=""
+		for o in $(rpf_ro_opts "$RPAT") $(sed -n 's/.* //p' $T/umltest/rpf-prep.$TAG); do
+			if [ "$o" != none ] && mount -o $o $MNTDEV $MNT 2>/dev/null; then
+				r=$(rpf_read | tr ' ' /); [ -e $MNT/fsynced ] && f=1 || f=0
+				umount $MNT || log "UMOUNT_FAIL"
+				log "RPF read-only mount -o $o: mounted, overwrites B/eio/other $r, fsynced $f"
+				ro="$ro $o 1 $r"
+			else
+				kmsg "nknown parameter|nologreplay|$RPAT" 2
+				log "RPF read-only mount -o $o: FAILED"
+				ro="$ro $o 0 -"
+			fi
+		done
+		# With the device working again, what the explanation advises.
+		msg=$(rpf_msg "$RPAT")
+		plan=none
+		echo "$msg" | grep -q "make it work again (cabling, power) and mount again" && plan=remount
+		echo "$msg" | grep -q "clear the tree log ('btrfs rescue zero-log <device>'" && plan=zerolog
+		# The rig's btrfs-progs predate the raid56_write_intent feature and
+		# write no filesystem that has it; zero_log.py does what one that
+		# knows it does.
+		if [ $plan = zerolog ]; then
+			if btrfs rescue zero-log $MNTDEV > /tmp/zl.rpf 2>&1; then
+				log "RPF btrfs rescue zero-log cleared the tree log"
+			else
+				log "RPF btrfs rescue zero-log: $(tr '\n' ' ' < /tmp/zl.rpf | cut -c1-160)"
+				python3 $T/umltest/zero_log.py $DEVS > /tmp/zl.rpf 2>&1 ||
+					log "ZERO_LOG_FAIL $(tr '\n' ' ' < /tmp/zl.rpf | cut -c1-200)"
+				log "RPF zero_log.py: $(grep -c cleared /tmp/zl.rpf) superblocks cleared"
+			fi
+		fi
+		before=$(dmesg | grep -ac "$RPAT")
+		rw=0; wr=0; r=-; again=0
+		if [ $plan != none ] && mount -o rw $MNTDEV $MNT 2>/dev/null; then
+			rw=1
+			allow_nodatacow
+			echo 3 > /proc/sys/vm/drop_caches
+			r=$(rpf_read | tr ' ' /)
+			dd if=/dev/urandom of=$MNT/after bs=64K count=16 conv=fsync status=none 2>/dev/null &&
+				sync && wr=1
+			grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && wr=0
+			stats "after the advised mount"
+			umount $MNT || log "UMOUNT_FAIL"
+		else
+			again=$(( $(dmesg | grep -ac "$RPAT") - before ))
+			kmsg "$RPAT|failed to recover log|open_ctree failed" 2
+		fi
+		log "RPF mount: first=$first replay_log_full=$said; advice with the device working:" \
+		    "$plan -> rw=$rw write=$wr overwrites B/eio/other $r (replay failed again: $again);" \
+		    "read-only:$ro"
+		echo "$first $said $plan $rw $wr $r $again$ro" > $T/umltest/rpf-mount.$TAG
+		finish
+		;;
+	esac
+	;;
 degraded_log_full)
 	# A full write-intent log with a device missing: does it refuse rather
 	# than spend the records that name stale data?
