@@ -2430,11 +2430,50 @@ alert_latch)
 	# after the ack and the crash that follows it.  CONTROL=1 sets
 	# raid56_wf_latch_volatile=1: the log does not keep it, and the mount
 	# after the crash reads none.
-	[ "${CONTROL:-0}" = 1 ] && {
+	#
+	# PLAN=narrow (PHASE=nraise, then check): the alert raised as above,
+	# a sync, then AL_REGIONS overwrites of one block each, in regions of
+	# their own, finished one after the other and not committed: the log's
+	# block lists every one of them (the union with the last block), 165
+	# being what the narrow layout holds.  Then the crash.  Fixed, no block
+	# lists more than 164 and every one carries the alert.  CONTROL=1 sets
+	# raid56_wf_latch_full_narrow=1: the newest block lists 165 regions and
+	# no alert, and the mount after the crash reads none.
+	#
+	# PLAN=unmount (PHASE=uraise, one boot): a write goes through, then the
+	# log slots of three devices of four fail every IO and the filesystem is
+	# unmounted: the unmount's commit cannot write the log and fails,
+	# log_commit_failed, read-only; the alert reaches the fourth device.
+	# Healed and mounted read-only, it stands; it is acknowledged, and after
+	# an unmount and a read-write mount it stands again, until acknowledged
+	# there.  Fixed, the read-only ack says it lasts that mount only;
+	# CONTROL=1 (raid56_wf_latch_unmount_drops=1): it says nothing.
+	#
+	# PLAN=disabled (PHASE=draise, then dcheck): the alert raised as above,
+	# then the feature cleared (the log disabled: its last block carries the
+	# alert), an unmount, and a mount with -o noraid56_write_intent: the
+	# alert is back; it is acknowledged, and the machine stops.  Mounted so
+	# again, fixed, nothing stands; CONTROL=1 (raid56_wf_latch_needs_log=1):
+	# the ack never reached the log, and the alert is back again.
+	case "${PLAN:-}:${CONTROL:-0}" in
+	narrow:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_full_narrow 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_full_narrow=1";;
+	disabled:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_needs_log 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_needs_log=1";;
+	unmount:1)
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_unmount_drops 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_latch_unmount_drops=1";;
+	narrow:*|disabled:*|unmount:*) ;;
+	*:1)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_volatile 2>/dev/null ||
 			log "CONTROL_KNOB_FAIL"
-		log "control: raid56_wf_latch_volatile=1"
-	}
+		log "control: raid56_wf_latch_volatile=1";;
+	esac
 	unack() {
 		local h=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
 		sed -n 's/^unacknowledged //p' $h | tr ' ' ,
@@ -2445,6 +2484,142 @@ alert_latch)
 		sleep 60
 	}
 	case "$PHASE" in
+	uraise)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_bad_sectors $i $((512 * 1024)) $((516 * 1024)); done
+		touch $MNT/marker
+		umount $MNT && um=ok || um=fail
+		kmsg "commit FAILED|failing the transaction commit|commit super" 3
+		for i in 0 1 2; do dm_heal $i; done
+		do_mount ro /dev/mapper/d0
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		u1=$(unack)
+		m0=$(dmesg | grep -c "acknowledged for this mount only")
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 2
+		msg=$(( $(dmesg | grep -c "acknowledged for this mount only") - m0 ))
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw /dev/mapper/d0
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		u2=$(unack)
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 2
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw /dev/mapper/d0
+		u3=$(unack)
+		log "AL uraise: write $w1, unmount $um; read-only mount: $u1, its ack said this" \
+		    "mount only: $msg; read-write mount after it: $u2; after an ack there: $u3"
+		echo "$w1 ${u1:-none} $msg ${u2:-none} ${u3:-none}" > $T/umltest/al.$TAG.uraise
+		umount $MNT || log "UMOUNT_FAIL"
+		dmsetup remove_all 2>/dev/null
+		finish
+		;;
+	draise)
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=2 status=none | tr '\000' 'A' > $MNT/nocow
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		for i in 0 1 2; do dm_error_writes_range $i $((512 * 1024)) 8192; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_heal $i; done
+		sync
+		F=$(ls -d /sys/fs/btrfs/*-*-*/features 2>/dev/null | head -1)
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		echo 0 > $F/raid56_write_intent || log "DISABLE_FAIL"
+		# The disable completes at the commit after the one whose
+		# superblock lacks the flag: see btrfs_wib_commit().
+		for i in 1 2 3; do touch $MNT/m$i; sync; done
+		en0=$(awk '$1 == "enabled" {print $2}' $W)
+		u0=$(unack)
+		umount $MNT || log "UMOUNT_FAIL"
+		do_mount rw,noraid56_write_intent /dev/mapper/d0
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		en1=$(awk '$1 == "enabled" {print $2}' $W)
+		u1=$(unack)
+		echo ack > $H 2>/dev/null || log "ACK_FAIL"
+		sleep 3
+		u2=$(unack)
+		kmsg "alerts an earlier mount|acknowledged|write-intent log disabled" 3
+		log "AL draise: first write $w1; disabled (enabled $en0), unacknowledged $u0;" \
+		    "mounted again (enabled $en1): $u1; after the ack $u2"
+		echo "$w1 $en0 ${u0:-none} $en1 ${u1:-none} ${u2:-none}" > $T/umltest/al.$TAG.draise
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		crash
+		;;
+	dcheck)
+		do_mount rw,noraid56_write_intent $MNTDEV
+		W=$(ls /sys/fs/btrfs/*-*-*/raid56_write_intent 2>/dev/null | head -1)
+		en=$(awk '$1 == "enabled" {print $2}' $W)
+		u3=$(unack)
+		kmsg "alerts an earlier mount" 1
+		log "AL dcheck: after the ack and a crash (enabled $en): $u3"
+		echo "$en ${u3:-none}" > $T/umltest/al.$TAG.dcheck
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
+	nraise)
+		# 4.3 MiB apart: each block in a 4 MiB region of its own.
+		AL_REGIONS=${AL_REGIONS:-165}
+		AL_STRIDE=$(( 23 * NOCOW_FS_BLOCKS ))
+		dm_setup
+		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		fallocate -l $(( (AL_REGIONS + 41) * AL_STRIDE * 4096 )) $MNT/nocow ||
+			{ log "FALLOCATE_FAIL"; finish; }
+		sync
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'C' > /tmp/cblock.al
+		for i in 0 1 2; do dm_error_writes_range $i $((512 * 1024)) 8192; done
+		dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=5 count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && w1=ok || w1=eio
+		for i in 0 1 2; do dm_heal $i; done
+		sync
+		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		# A block per row whose full stripe lies in one 4 MiB region, one
+		# row per region: each overwrite is recorded in an entry of its own.
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 $AL_STRIDE \
+			$((AL_REGIONS + 40)) region > /tmp/rows.al 2>&1
+		awk '$3 >= 0 && $5 ~ /:0$/ { r = $5; sub(/:.*/, "", r)
+			if (!(r in seen)) { seen[r] = 1; print $2 } }' /tmp/rows.al |
+			head -n $AL_REGIONS > /tmp/targets.al
+		regs=$(wc -l < /tmp/targets.al)
+		ok=0
+		while read -r b; do
+			dd if=/tmp/cblock.al of=$MNT/nocow bs=4096 seek=$b count=1 \
+			   oflag=direct conv=notrunc status=none 2>/dev/null && ok=$((ok + 1))
+		done < /tmp/targets.al
+		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		u=$(unack)
+		stats "after the overwrites"
+		log "AL nraise: first write $w1, $ok of $AL_REGIONS overwrites in $regs regions," \
+		    "commits $commits0 -> $commits1, unacknowledged $u"
+		echo "$w1 $ok $regs $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) $u" \
+			> $T/umltest/al.$TAG.nraise
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		crash
+		;;
 	raise)
 		dm_setup
 		mkfs.btrfs -K -q -f -d $DPROF -m $MPROF $DMDEVS || { log "MKFS_FAIL"; finish; }
@@ -2884,6 +3059,24 @@ commit_full)
 	#     log_commit_failed, and the fsync reports it.  2: the commit keeps
 	#     the previous block and goes on: 'C' is acknowledged, its name only
 	#     in memory.
+	#   Where the read-write mount is refused, the filesystem is mounted
+	#   read-only, degraded, as the alert says, and raid56_health read; then a
+	#   remount read-write, refused again, and raid56_health read again.
+	#   CONTROL=0: recovery_log_full stands unacknowledged on the read-only
+	#   mount (the failed recovery wrote it to the log), and the action is to
+	#   bring the missing device back, else to copy the data off.  CONTROL=3
+	#   (raid56_wf_recovery_full_legacy=1, and raid56_wf_latch_needs_log=1:
+	#   the latch work of the failed mount would write it too): nothing
+	#   unacknowledged, and the action a read-write mount, the refused one.
+	# PLAN=replay: prep as above, with a small file written and fsync'd before
+	# the overwrites, which leaves a tree log to replay; degraded as above,
+	# then the read-only mount recovery_log_full recommends, as its message
+	# gives the options.
+	#   CONTROL=0: 'ro,degraded,rescue=nologreplay', which mounts, and the
+	#   message says that without the device no mount makes the filesystem
+	#   writable again, and to copy the data off.  CONTROL=4
+	#   (raid56_wf_advice_legacy=1): '-o ro, with -o degraded', which replays
+	#   the tree log, runs the recovery again and fails the same way.
 	# PHASE=final: every device, rw.  The recovery rebuilds what the log on
 	# disk lists in flight from the data as it is on disk: the target block
 	# must read what was acknowledged ('C' where it was, else 'A' or 'C').
@@ -2892,10 +3085,25 @@ commit_full)
 	CF_REGIONS=${CF_REGIONS:-100}
 	CF_STRIDE=$(( 23 * NOCOW_FS_BLOCKS ))
 	cf_knobs() {
-		[ "${CONTROL:-0}" -ge 1 ] && {
+		case "${CONTROL:-0}" in 1|2)
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_admit_narrow 2>/dev/null ||
 				log "CONTROL_KNOB_FAIL"
-			log "control: raid56_wf_admit_narrow=1"
+			log "control: raid56_wf_admit_narrow=1";;
+		esac
+		# The latch work of a mount whose log is not enabled yet writes
+		# the alert too (wib_stamp_latch_locked()), since the log disabled
+		# keeps acknowledgments: without it as well, as before both.
+		[ "${CONTROL:-0}" = 3 ] && {
+			for k in raid56_wf_recovery_full_legacy raid56_wf_latch_needs_log; do
+				echo 1 > /sys/module/btrfs/parameters/$k 2>/dev/null ||
+					log "CONTROL_KNOB_FAIL"
+			done
+			log "control: raid56_wf_recovery_full_legacy=1 raid56_wf_latch_needs_log=1"
+		}
+		[ "${CONTROL:-0}" = 4 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_advice_legacy \
+				2>/dev/null || log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_advice_legacy=1"
 		}
 		[ "${CONTROL:-0}" = 2 ] && {
 			echo 1 > /sys/module/btrfs/parameters/raid56_wf_commit_keeps_previous \
@@ -2998,6 +3206,17 @@ commit_full)
 		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.cf
 		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
 		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		lroot=0
+		if [ "${PLAN:-full}" = replay ]; then
+			# Before the overwrites: the tree log's sync issues a
+			# barrier, which would drop their records.  A few bytes,
+			# inline: no data space, so no chunk allocated, which would
+			# make the fsync a full transaction commit.
+			printf 'fsynced\n' | dd of=$MNT/fsynced conv=fsync status=none ||
+				log "FSYNC_FAIL"
+			lroot=$(btrfs inspect-internal dump-super /dev/mapper/d0 2>/dev/null |
+				awk '$1 == "log_root" {print $2}')
+		fi
 		acked=0
 		for i in $(seq 0 $((CF_REGIONS - 1))); do
 			dd if=/tmp/bblock.cf of=$MNT/nocow bs=4096 seek=$((i * CF_STRIDE)) count=1 \
@@ -3006,8 +3225,8 @@ commit_full)
 		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
 		stats "after the overwrites"
 		log "CF_PREP overwrites=$acked of $CF_REGIONS target=$tgt" \
-		    "commits $commits0 -> $commits1"
-		echo "$acked $([ "$commits0" = "$commits1" ] && echo 0 || echo 1)" \
+		    "commits $commits0 -> $commits1 log_root ${lroot:-?}"
+		echo "$acked $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) ${lroot:-0}" \
 			> $T/umltest/cf-prep.$TAG
 		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)" &&
 			log "KERNEL_SPLAT"
@@ -3021,11 +3240,45 @@ commit_full)
 	degraded)
 		tgt=$(cat $T/umltest/cf.target.$TAG)
 		refused=0; acked=-; ro=0
+		ro_un=-; ro_act=-; rm_act=-
+		if [ "${PLAN:-full}" = replay ]; then
+			mount -o $OPTS,degraded $MNTDEV $MNT && refused=0 || refused=1
+			grep " $MNT " /proc/mounts >/dev/null && umount $MNT
+			kmsg "could not keep the record" 1
+			# The read-only mount the alert gives.
+			opts=$(dmesg | sed -n "s/.*'mount -o \([^ ']*\) <device> <mountpoint>'.*/\1/p" |
+			       tail -1)
+			[ -z "$opts" ] && dmesg | grep -q "Mount it read-only (-o ro, with -o degraded" &&
+				opts=ro,degraded
+			deadend=$(dmesg | grep -c "If it cannot come back, no mount can make this filesystem writable again")
+			if [ -n "$opts" ] && mount -o $opts $MNTDEV $MNT; then
+				advised=1
+				allow_nodatacow
+				got=$(cf_blk $tgt)
+				umount $MNT || log "UMOUNT_FAIL"
+			else
+				advised=0; got=-
+				kmsg "could not keep the record|failed to replay|open_ctree" 3
+			fi
+			log "CF replay: rw refused=$refused, advised read-only mount -o ${opts:-?}:" \
+			    "mounted=$advised target=$got dead_end_said=$deadend"
+			echo "$refused ${opts:-none} $advised $got $deadend" > $T/umltest/cf-deg.$TAG
+			finish
+		fi
 		if ! mount -o $OPTS,degraded $MNTDEV $MNT; then
 			refused=1
 			log "CF_RW_REFUSED: the read-write mount failed"
 			kmsg "could not keep the record|recovery stopped" 2
 			do_mount ro,degraded $MNTDEV
+			H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+			ro_un=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+			ro_act=$(sed -n 's/^action //p' $H | tr ' ' _)
+			mount -o remount,rw $MNT 2>/dev/null && rm_ok=1 || rm_ok=0
+			rm_act=$(sed -n 's/^action //p' $H | tr ' ' _)
+			log "CF health on the read-only mount: unacknowledged $ro_un, action $ro_act;" \
+			    "remount,rw ok=$rm_ok, then action $rm_act"
+			grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" ||
+				mount -o remount,ro $MNT
 		fi
 		regs=$(dmesg | sed -n 's/.*valid blocks found, \([0-9]*\) regions.*/\1/p' | tail -1)
 		allow_nodatacow
@@ -3046,7 +3299,8 @@ commit_full)
 		    "recovery_log_full=$(sed -n 's/^recovery_log_full //p' $H)" \
 		    "unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
 		echo "${regs:-?} $refused $acked $ro $(sed -n 's/^log_commit_failed //p' $H)" \
-		     "$(sed -n 's/^recovery_log_full //p' $H)" > $T/umltest/cf-deg.$TAG
+		     "$(sed -n 's/^recovery_log_full //p' $H) ${ro_un:-none} $ro_act $rm_act" \
+			> $T/umltest/cf-deg.$TAG
 		umount $MNT || log "UMOUNT_FAIL"
 		finish
 		;;
@@ -3067,6 +3321,217 @@ commit_full)
 		echo "$got $(echo $fills | wc -w) $(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)" \
 		     > $T/umltest/cf-final.$TAG
 		umount $MNT || log "UMOUNT_FAIL"
+		finish
+		;;
+	esac
+	;;
+replay_full)
+	# A tree-log replay that meets a write-intent log full of records naming
+	# a device: does the log_full alert give advice that works?
+	#
+	# PHASE=prep: RAID5 data AND metadata (the replay's writes are metadata
+	# and must go through the log), four devices.  A nodatacow file
+	# preallocated over RPF_REGIONS + RPF_EXTRA regions (4 MiB), and in each
+	# the first row whose parity device FAIL holds.  A few bytes written and
+	# fsync'd into a new file: a tree log to replay, its barrier before the
+	# records below, which it would otherwise drop.  Then FAIL fails writes,
+	# no repair is queued on the fault (raid56_no_repair_on_fault: the
+	# records stay until the crash), and one block per region is overwritten
+	# in place, until a write is refused: each acknowledged, its record
+	# naming the parity on FAIL stale, until they fill the log (82, a wide
+	# block).  The refused write's log_full explanation says how to mount
+	# read-only.  The machine stops without syncing.
+	# PHASE=mount: every device, FAIL working again.  The read-write mount's
+	# recovery keeps every record until after the replay, whose first write
+	# into a new region finds the log full: the mount fails with log_full.
+	# Then what its explanation advises, as it gives it:
+	#   - the read-only mount (both messages' options): does it mount, and
+	#     do the overwritten blocks read back as written?
+	#   - with the device working again: the old advice mounts again, which
+	#     fails the same way (CONTROL=1, raid56_wf_advice_legacy=1, both
+	#     boots); the new one clears the tree log ('btrfs rescue zero-log';
+	#     zero_log.py where the rig's btrfs-progs, which predate the
+	#     raid56_write_intent feature, refuse the filesystem) and mounts: its
+	#     recovery repairs the parity, the filesystem is writable, and every
+	#     overwritten block reads back as written.
+	watchdog ${WATCH:-1500}
+	RPF_REGIONS=${RPF_REGIONS:-82}; RPF_EXTRA=${RPF_EXTRA:-8}
+	[ "${CONTROL:-0}" = 1 ] && {
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_advice_legacy 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: raid56_wf_advice_legacy=1"
+	}
+	rpf_blk() {	# file-block -> A | B | eio | other
+		if dd if=$MNT/nocow of=/tmp/blk.rpf bs=4096 count=1 skip=$1 iflag=direct \
+		      status=none 2>/dev/null; then
+			for c in A B; do
+				[ "$(tr -cd $c < /tmp/blk.rpf | wc -c)" = 4096 ] &&
+					{ echo $c; return; }
+			done
+			echo other
+		else
+			echo eio
+		fi
+	}
+	rpf_read() {	# -> "<B> <eio> <other>" over the acknowledged overwrites
+		local b=0 e=0 o=0 v
+		for blk in $(cat $T/umltest/rpf.acked.$TAG); do
+			v=$(rpf_blk $blk)
+			case $v in B) b=$((b + 1));; eio) e=$((e + 1));; *) o=$((o + 1));; esac
+		done
+		echo "$b $e $o"
+	}
+	# The last explanation matching a pattern, with its continuations: one
+	# longer than a printk record is said in parts (raid56_explain_err()).
+	rpf_msg() {	# message-pattern
+		dmesg | awk -v p="$1" 'index($0, p) { m = $0; on = 1; next }
+			on && index($0, "raid56 (continued): ") { m = m " " $0; next }
+			{ on = 0 } END { print m }'
+	}
+	# The read-only mount options an explanation gives: the new texts quote
+	# the command, the old say '(-o ro, with -o degraded ...)'.
+	rpf_ro_opts() {	# message-pattern
+		local m o
+		m=$(rpf_msg "$1")
+		o=$(echo "$m" | sed -n "s/.*'mount -o \([^ ']*\).*/\1/p")
+		[ -z "$o" ] && echo "$m" | grep -q "(-o ro, with -o degraded" && o=ro
+		echo ${o:-none}
+	}
+	case "$PHASE" in
+	prep)
+		dm_setup
+		mkfs.btrfs -K -q -f -d raid5 -m raid5 $DMDEVS || { log "MKFS_FAIL"; finish; }
+		dm_scan
+		do_mount $OPTS /dev/mapper/d0
+		allow_nodatacow
+		nrows=$(( (RPF_REGIONS + RPF_EXTRA + 4) * 22 ))
+		touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+		fallocate -l $(( nrows * NOCOW_FS_BLOCKS * 4096 )) $MNT/nocow ||
+			{ log "FALLOCATE_FAIL"; finish; }
+		dd if=/dev/zero bs=1M count=$(( nrows * NOCOW_FS_BLOCKS * 4096 / 1048576 )) \
+		   status=none | tr '\000' 'A' | dd of=$MNT/nocow conv=notrunc status=none
+		sync
+		R=$T/umltest/rpf.rows.$TAG
+		python3 $T/umltest/raid56_rows.py $MNT/nocow /dev/mapper/d0 $NOCOW_FS_BLOCKS \
+			$nrows region > $R 2>&1
+		# One block per region, in the first row of it whose parity FAIL
+		# holds, its full stripe wholly in the region: the write rewrites
+		# a data column elsewhere and the parity on FAIL, whose failure the
+		# record names -- decidable, whatever the crash tore.  And a block
+		# of another full stripe of the same region, for the last write.
+		awk -v f=$FAIL '$3 >= 0 { split($5, r, ":"); if (r[2] != 0) next
+			if ($4 == f && !(r[1] in t)) { t[r[1]] = $2; o[++n] = r[1] }
+			else if (!(r[1] in sp)) sp[r[1]] = $2 }
+			END { for (i = 1; i <= n; i++) if (o[i] in sp) print t[o[i]], sp[o[i]] }' \
+			$R > $T/umltest/rpf.targets.$TAG
+		n=$(wc -l < $T/umltest/rpf.targets.$TAG)
+		[ "$n" -ge $((RPF_REGIONS + RPF_EXTRA)) ] || {
+			log "LAYOUT_FAIL $n of $((RPF_REGIONS + RPF_EXTRA)) regions: $(head -2 $R | tr '\n' ' ')"
+			finish
+		}
+		CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+		commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		# Inline, no data space: no chunk allocated, which would make the
+		# fsync a full transaction commit.
+		printf 'fsynced\n' | dd of=$MNT/fsynced conv=fsync status=none || log "FSYNC_FAIL"
+		lroot=$(btrfs inspect-internal dump-super /dev/mapper/d0 2>/dev/null |
+			awk '$1 == "log_root" {print $2}')
+		echo 1 > /sys/module/btrfs/parameters/raid56_no_repair_on_fault 2>/dev/null ||
+			log "NOREPAIR_KNOB_FAIL"
+		dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.rpf
+		dm_error_writes $FAIL; log "device $FAIL fails writes"
+		acked=0; refused=0; : > $T/umltest/rpf.acked.$TAG
+		while read -r b sp; do
+			if dd if=/tmp/bblock.rpf of=$MNT/nocow bs=4096 seek=$b count=1 oflag=direct \
+			      conv=notrunc status=none 2>/dev/null; then
+				acked=$((acked + 1)); echo $b >> $T/umltest/rpf.acked.$TAG
+			else
+				refused=1; break
+			fi
+		done < $T/umltest/rpf.targets.$TAG
+		# The last write's record names FAIL in memory until the log is
+		# written again: a write into another full stripe of the first
+		# region, recorded already, writes it with every name.
+		read -r b sp < $T/umltest/rpf.targets.$TAG
+		dd if=/tmp/bblock.rpf of=$MNT/nocow bs=4096 seek=$sp count=1 oflag=direct \
+		   conv=notrunc status=none 2>/dev/null && echo $sp >> $T/umltest/rpf.acked.$TAG ||
+			log "RPF the write into a recorded region failed"
+		acked=$(wc -l < $T/umltest/rpf.acked.$TAG)
+		commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+		stats "after the overwrites"
+		rtopts=$(rpf_ro_opts "because the write-intent log is full of records it will not drop")
+		kmsg "write-intent log is full|still full" 2
+		log "RPF_PREP overwrites acknowledged=$acked refused=$refused" \
+		    "commits $commits0 -> $commits1 log_root ${lroot:-?}; log_full's read-only mount: -o $rtopts"
+		echo "$acked $refused $([ "$commits0" = "$commits1" ] && echo 0 || echo 1) ${lroot:-0} $rtopts" \
+			> $T/umltest/rpf-prep.$TAG
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		sync -f $RES $T/umltest/rpf-prep.$TAG $T/umltest/rpf.acked.$TAG
+		echo o > /proc/sysrq-trigger
+		sleep 60
+		;;
+	mount)
+		RPAT="the tree-log replay of this mount FAILED"
+		mount -o rw $MNTDEV $MNT 2>/dev/null && first=ok || first=fail
+		kmsg "valid blocks found|recovery done|tree-log replay" 4
+		[ $first = ok ] && stats "after the first mount"
+		grep " $MNT " /proc/mounts >/dev/null && umount $MNT
+		said=$(dmesg | grep -ac "$RPAT")
+		kmsg "$RPAT|still full|failed to recover log|open_ctree failed" 3
+		# The read-only mounts the two explanations give: this one's, and
+		# that of the write the full log refused before the crash.
+		ro=""
+		for o in $(rpf_ro_opts "$RPAT") $(sed -n 's/.* //p' $T/umltest/rpf-prep.$TAG); do
+			if [ "$o" != none ] && mount -o $o $MNTDEV $MNT 2>/dev/null; then
+				r=$(rpf_read | tr ' ' /); [ -e $MNT/fsynced ] && f=1 || f=0
+				umount $MNT || log "UMOUNT_FAIL"
+				log "RPF read-only mount -o $o: mounted, overwrites B/eio/other $r, fsynced $f"
+				ro="$ro $o 1 $r"
+			else
+				kmsg "nknown parameter|nologreplay|$RPAT" 2
+				log "RPF read-only mount -o $o: FAILED"
+				ro="$ro $o 0 -"
+			fi
+		done
+		# With the device working again, what the explanation advises.
+		msg=$(rpf_msg "$RPAT")
+		plan=none
+		echo "$msg" | grep -q "make it work again (cabling, power) and mount again" && plan=remount
+		echo "$msg" | grep -q "clear the tree log ('btrfs rescue zero-log <device>'" && plan=zerolog
+		# The rig's btrfs-progs predate the raid56_write_intent feature and
+		# write no filesystem that has it; zero_log.py does what one that
+		# knows it does.
+		if [ $plan = zerolog ]; then
+			if btrfs rescue zero-log $MNTDEV > /tmp/zl.rpf 2>&1; then
+				log "RPF btrfs rescue zero-log cleared the tree log"
+			else
+				log "RPF btrfs rescue zero-log: $(tr '\n' ' ' < /tmp/zl.rpf | cut -c1-160)"
+				python3 $T/umltest/zero_log.py $DEVS > /tmp/zl.rpf 2>&1 ||
+					log "ZERO_LOG_FAIL $(tr '\n' ' ' < /tmp/zl.rpf | cut -c1-200)"
+				log "RPF zero_log.py: $(grep -c cleared /tmp/zl.rpf) superblocks cleared"
+			fi
+		fi
+		before=$(dmesg | grep -ac "$RPAT")
+		rw=0; wr=0; r=-; again=0
+		if [ $plan != none ] && mount -o rw $MNTDEV $MNT 2>/dev/null; then
+			rw=1
+			allow_nodatacow
+			echo 3 > /proc/sys/vm/drop_caches
+			r=$(rpf_read | tr ' ' /)
+			dd if=/dev/urandom of=$MNT/after bs=64K count=16 conv=fsync status=none 2>/dev/null &&
+				sync && wr=1
+			grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && wr=0
+			stats "after the advised mount"
+			umount $MNT || log "UMOUNT_FAIL"
+		else
+			again=$(( $(dmesg | grep -ac "$RPAT") - before ))
+			kmsg "$RPAT|failed to recover log|open_ctree failed" 2
+		fi
+		log "RPF mount: first=$first replay_log_full=$said; advice with the device working:" \
+		    "$plan -> rw=$rw write=$wr overwrites B/eio/other $r (replay failed again: $again);" \
+		    "read-only:$ro"
+		echo "$first $said $plan $rw $wr $r $again$ro" > $T/umltest/rpf-mount.$TAG
 		finish
 		;;
 	esac
@@ -5412,14 +5877,15 @@ flush_wedge)
 	#              records, and the writes into new regions succeed
 	#     control  raid56_wf_readd_no_repair=1: nothing retires them, and
 	#              the writes fail at once (log_full)
-	#   PLAN=torn (FW_REGIONS 165: a narrow block holds 165)
+	#   PLAN=torn (FW_REGIONS 164: a narrow block this kernel writes holds
+	#            164, BTRFS_WIB_NARROW_WRITE_MAX)
 	#     fixed    a full log keeps the possibly torn records: the writes
 	#              fail at once (log_full), and its alert says a scrub
 	#              retires them -- after one, a write into a new region
 	#              succeeds
 	#     control  raid56_wf_evict_stage0=1: it spends them, last and with
 	#              the alert (record_dropped), and the writes succeed
-	#   PLAN=busy (FW_REGIONS 164: one slot is left) and, instead of the
+	#   PLAN=busy (FW_REGIONS 163: one slot is left) and, instead of the
 	#            writes one at a time, FW_BUSY at once into rows of new
 	#            regions whose parity FAIL holds, started while FAIL is
 	#            suspended for FW_HOLD_SECS: they queue behind it and are
@@ -5436,7 +5902,7 @@ flush_wedge)
 	#   the default leaves no such log, as unnamed shows.  busy runs with
 	#   raid56_wf_admit_narrow=1 in both arms as well: the default admits no
 	#   write into a log holding more such records than a wide block does.
-	#   PLAN=hot (FW_REGIONS 165, as torn): instead of the writes one at a
+	#   PLAN=hot (FW_REGIONS 164, as torn): instead of the writes one at a
 	#            time, a write into one of the recorded regions, held in
 	#            flight FW_HOLD_MS once its bios have completed
 	#            (raid56_write_hold_ms), then one write into a new region
@@ -5445,7 +5911,7 @@ flush_wedge)
 	#              nothing
 	#     control  raid56_wf_room_any_write=1: it waits for the write in
 	#              flight to finish before it fails the same way
-	#   PLAN=unnamed (FW_REGIONS 165, as torn): the readd cannot name FAIL
+	#   PLAN=unnamed (FW_REGIONS 164, as torn): the readd cannot name FAIL
 	#     fixed    the commit whose barrier failed fails instead, with the
 	#              log_flush_unnamed alert, and the filesystem goes read-only:
 	#              nothing acknowledges the overwrites -- and the names the
@@ -5457,7 +5923,38 @@ flush_wedge)
 	#     CONTROL=2 raid56_wf_refusal_leaves_unnamed=1: the commit fails as in
 	#              fixed, but nothing keeps the names: until the unmount, the
 	#              overwrites FAIL dropped read back as the block was before
+	#   PLAN=health: unnamed's refused commit, then raid56_health is read on
+	#            the read-only filesystem, and the machine stops
+	#     fixed    the alert names FAIL: the devices line lists it, and the
+	#              action is to unmount and mount again first, then to
+	#              replace it
+	#     control  raid56_wf_refusal_health_legacy=1: no device, and the
+	#              action a scrub, which cannot run on it
+	#   PHASE=reboot, after that stop: mounted again (every device, no
+	#            device-mapper), raid56_health read.  The alert is back from
+	#            the log, and devid 2 with it (BTRFS_WIB_LATCH_DEVS_OFFSET);
+	#            CONTROL=2 (raid56_wf_latch_no_devs=1, both boots): no device.
 	watchdog ${WATCH:-900}
+	if [ "${PHASE:-}" = reboot ]; then
+		# PLAN=health, after the crash: what the log kept.
+		[ "${CONTROL:-0}" = 2 ] && {
+			echo 1 > /sys/module/btrfs/parameters/raid56_wf_latch_no_devs 2>/dev/null ||
+				log "CONTROL_KNOB_FAIL"
+			log "control: raid56_wf_latch_no_devs=1"
+		}
+		rw=rw
+		mount -o rw /dev/ubda $MNT || { rw=ro; do_mount ro /dev/ubda; }
+		sleep 3
+		H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+		devs=$(sed -n 's/^devices *//p' $H | tr ' ' ,)
+		act=$(sed -n 's/^action //p' $H | tr ' ' _)
+		unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+		kmsg "alerts an earlier mount" 2
+		log "FW reboot: mounted $rw, unacknowledged=$unack devices=${devs:-none} action=$act"
+		echo "$rw ${unack:-none} ${devs:-none} $act" > $T/umltest/fw.reboot.$TAG
+		umount $MNT || log "UMOUNT_FAIL"
+		finish
+	fi
 	dm_setup
 	mkfs.btrfs -K -q -f -d raid5 -m raid1 $DMDEVS || { log "MKFS_FAIL"; finish; }
 	dm_scan
@@ -5465,11 +5962,13 @@ flush_wedge)
 	allow_nodatacow
 	case "$PLAN" in
 	named) knob=raid56_wf_readd_no_repair; FW_REGIONS=${FW_REGIONS:-82};;
-	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-165};;
-	hot) knob=raid56_wf_room_any_write; FW_REGIONS=${FW_REGIONS:-165};;
+	torn) knob=raid56_wf_evict_stage0; FW_REGIONS=${FW_REGIONS:-164};;
+	hot) knob=raid56_wf_room_any_write; FW_REGIONS=${FW_REGIONS:-164};;
 	busy) knob="raid56_wf_evict_stage0 raid56_wf_torn_spent_eagerly"
-	      FW_REGIONS=${FW_REGIONS:-164};;
-	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-165};;
+	      FW_REGIONS=${FW_REGIONS:-163};;
+	unnamed) knob=raid56_wf_readd_acks_unnamed; FW_REGIONS=${FW_REGIONS:-164};;
+	health) knob=raid56_wf_refusal_health_legacy; FW_REGIONS=${FW_REGIONS:-164}
+		[ "${CONTROL:-0}" = 2 ] && { knob=raid56_wf_latch_no_devs; CONTROL=1; };;
 	*) log "PLAN_UNKNOWN $PLAN"; finish;;
 	esac
 	[ "${CONTROL:-0}" = 1 ] && for k in $knob; do
@@ -5487,7 +5986,7 @@ flush_wedge)
 	# may have been torn does: both arms let the readd that cannot name the
 	# device leave them, which unnamed shows the default refuses.  And busy
 	# checks the wait for the one slot a write in flight frees in a log that
-	# holds 164 of them: both arms admit writes against the narrow layout,
+	# holds 163 of them: both arms admit writes against the narrow layout,
 	# which the default does not (commit_full) -- it refuses them all.
 	case "$PLAN" in torn|busy|hot)
 		echo 1 > /sys/module/btrfs/parameters/raid56_wf_readd_acks_unnamed 2>/dev/null ||
@@ -5551,6 +6050,23 @@ flush_wedge)
 	btrfs filesystem sync $MNT >/dev/null 2>&1 && fsync_ok=1 || fsync_ok=0
 	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
 	fl=$(btrfs device stats $MNT 2>/dev/null | awk '/flush_io_errs/ {s += $2} END {print s + 0}')
+	if [ "$PLAN" = health ]; then
+		sleep 2
+		devs=$(sed -n 's/^devices *//p' $H | tr ' ' ,)
+		act=$(sed -n 's/^action //p' $H | tr ' ' _)
+		unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)
+		kmsg "did not confirm|write-intent log|raid56:" 6
+		log "FW health after the refused commit: commit_ok=$fsync_ok read_only=$ro" \
+		    "flush_io_errs=$fl state=$(hv state) unacknowledged=$unack devices=${devs:-none}" \
+		    "action=$act"
+		echo "$fsync_ok $ro $fl $(hv state) ${unack:-none} ${devs:-none} $act" \
+			> $T/umltest/fw.health.$TAG
+		dmesg | grep -E "^\[ *[0-9.]+\] (BUG:|WARNING:|KASAN|INFO: task|Oops)|possible circular" &&
+			log "KERNEL_SPLAT"
+		sync -f $RES $T/umltest/fw.health.$TAG
+		echo o > /proc/sysrq-trigger
+		sleep 60
+	fi
 	named=$(hv stale_marks); torn=$(wv torn_blocks); queued=$(wv repair_queued)
 	stale1=$(hv device_write_failed)
 	kmsg "did not confirm|write-intent log|raid56:" 6
@@ -6230,7 +6746,8 @@ torn_present_read)
 	#                 them), then fails a commit's barrier: the readd takes
 	#                 them back possibly torn, too many to name, and with the
 	#                 recovery's record the log is full of records that say
-	#                 no more than that (n = 164: a narrow block holds 165).
+	#                 no more than that (n = 163: a narrow block this
+	#                 kernel writes holds 164, BTRFS_WIB_NARROW_WRITE_MAX).
 	#                 FILLDEV is healed and one write goes into a new
 	#                 region, with nothing in flight: it spends one of them.
 	#   SCRUB=1       once the mount is done, a scrub runs to its end first.

@@ -35,6 +35,21 @@ FLAGS_SUPPORTED = FLAG_STALE                  # BTRFS_WIB_FLAGS_SUPPORTED
 # the kernel reads every error record of the block as possibly torn.
 TRAILER_OFFSET = SLOT_SIZE - 8
 TORN_MARKING = 0x4b52414d4e524f54             # "TORNMARK"
+# The 8 bytes before the trailer (BTRFS_WIB_LATCH_OFFSET): the alerts nobody
+# has acknowledged, bit N for event N in the low half, "LTCH" in the high
+# half -- only where the entries leave them free.
+LATCH_OFFSET = TRAILER_OFFSET - 8
+LATCH_MAGIC = 0x4843544c
+# The 16 bytes before it (BTRFS_WIB_LATCH_DEVS_OFFSET): the devids of up to
+# two devices those alerts named, 0 for none.
+LATCH_DEVS_OFFSET = LATCH_OFFSET - 16
+EVENTS = ["device_write_failed", "write_refused", "write_refused_not_durable",
+          "stripe_undecidable", "write_failed", "repair_gave_up", "log_full",
+          "record_dropped", "read_unverifiable", "log_write_failed", "repair_dropped",
+          "read_parities_disagree", "log_flush_unnamed", "replace_uncopyable",
+          "replace_record_dropped", "replace_aborted", "read_unrecovered",
+          "torn_undecidable", "recovery_log_full", "log_commit_failed",
+          "scrub_uncommitted", "full_stripe_flush_unnamed"]
 SUPER_OFFSET = 64 * 1024
 SUPER_MAGIC = b"_BHRfS_M"
 CSUM_NAMES = {0: "crc32c", 1: "xxhash64", 2: "sha256", 3: "blake2b"}
@@ -81,6 +96,23 @@ def read_csum_type(f):
     return struct.unpack_from("<H", sb, 0xc4)[0]
 
 
+def latch(blk, nr, ent):
+    """The alerts the block carries, as btrfs_wib_block_latched() reads them."""
+    if HEADER.size + nr * ent.size > LATCH_OFFSET:
+        return "no room (the entries cover the latch word)"
+    word = struct.unpack_from("<Q", blk, LATCH_OFFSET)[0]
+    if word >> 32 != LATCH_MAGIC:
+        return "none"
+    bits = word & 0xffffffff
+    names = [EVENTS[i] if i < len(EVENTS) else f"event{i}" for i in range(32) if bits & (1 << i)]
+    if not names:
+        return "none"
+    devs = []
+    if HEADER.size + nr * ent.size <= LATCH_DEVS_OFFSET:
+        devs = [d for d in struct.unpack_from("<QQ", blk, LATCH_DEVS_OFFSET) if d]
+    return " ".join(names) + (" (devid " + ", ".join(map(str, devs)) + ")" if devs else "")
+
+
 def dump(path):
     with open(path, "rb") as f:
         csum_type = read_csum_type(f)
@@ -106,6 +138,7 @@ def dump(path):
                   f"flags 0x{flags:x} {'wide' if wide else 'narrow'} "
                   f"fsid {fsid.hex()} csum {state} "
                   f"{'marks-torn' if marks else 'unmarked (error records read as possibly torn)'}")
+            print(f"    unacknowledged: {latch(blk, nr, ent)}")
             # Refuse rather than guess, which is what the kernel does with a
             # flag it does not know (BTRFS_WIB_FLAGS_SUPPORTED).  A bit we have
             # never seen may well move the fields we are about to read, and a

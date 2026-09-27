@@ -3,7 +3,7 @@
 # Do the records a failed flush leaves wedge the write-intent log once it is
 # full of them, with every device there?
 #
-#   flush_wedge.sh <kernel> [named|torn|busy|unnamed]
+#   flush_wedge.sh <kernel> [named|torn|busy|hot|unnamed|health]
 #
 # See flush_wedge in init-final3.sh.  RAID5 data, RAID1 metadata, four
 # devices.  While device 1 drops writes, one block per region is overwritten
@@ -18,14 +18,14 @@
 #     control  raid56_wf_readd_no_repair=1: nothing retires them, and the
 #              new writes fail at once (log_full)
 #   The named control's log_full explanation must name scrub as the remedy.
-#   torn   165 regions: too many to name, the readd marks them possibly torn,
+#   torn   164 regions: too many to name, the readd marks them possibly torn,
 #          which fills a narrow block
 #     fixed    a full log keeps them: the new writes fail at once (log_full),
 #              its explanation says a scrub retires them, and after one a
 #              write into a new region succeeds; nothing is dropped
 #     control  raid56_wf_evict_stage0=1: it spends them, last and with the
 #              alert (record_dropped), and every new write succeeds
-#   busy   164 regions, one slot left, and instead of FW_FRESH writes one at a
+#   busy   163 regions, one slot left, and instead of FW_FRESH writes one at a
 #          time, FW_BUSY (8) at once into new regions whose parity device 1
 #          holds, started while device 1 is suspended: they queue behind it
 #          and go together once it is back, the first to be recorded takes the
@@ -48,7 +48,7 @@
 #   sets raid56_wf_admit_narrow=1 in both arms too: the default admits no
 #   write into a log holding more of those records than a wide block
 #   describes, and refuses all eight (commit_full.sh).
-#   unnamed (CUR-4)  165 regions, as torn: too many to name device 1 in
+#   unnamed (CUR-4)  164 regions, as torn: too many to name device 1 in
 #     fixed    the commit whose barrier failed fails instead (read-only), with
 #              the log_flush_unnamed alert: the overwrites are never
 #              acknowledged -- and until the unmount the refused readd keeps
@@ -61,11 +61,25 @@
 #     unnamedctl raid56_wf_refusal_leaves_unnamed=1: the commit fails as in
 #              fixed, but nothing keeps the names, and until the unmount the
 #              overwrites device 1 dropped read back as before, with no error
+#   health  unnamed's refused commit, then raid56_health on the read-only
+#           filesystem
+#     fixed    the log_flush_unnamed alert names device 1 (devid 2): the
+#              devices line lists it, and the action is to unmount and mount
+#              again first, then to replace it, scrub and acknowledge
+#     control  raid56_wf_refusal_health_legacy=1: no device listed, and the
+#              action a scrub, which a read-only filesystem refuses (EROFS)
+#   Then the machine stops, and the filesystem is mounted again: the alert
+#   comes back from the log (BTRFS_WIB_LATCH_OFFSET)
+#     fixed    and so does devid 2 (BTRFS_WIB_LATCH_DEVS_OFFSET): the devices
+#              line lists it, the action says to replace it
+#     nodevs   raid56_wf_latch_no_devs=1: the alert without the device, which
+#              nothing names any more -- the flush errors the device stats
+#              counted never reached a disk
 set -u
 T=${BTRFS_TEST_DIR:?set BTRFS_TEST_DIR to a scratch directory}
-KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|hot|unnamed]}
+KERNEL=${1:?usage: flush_wedge.sh <kernel> [named|torn|busy|hot|unnamed|health]}
 PLAN=${2:-named}
-case $PLAN in named|torn|busy|hot|unnamed) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
+case $PLAN in named|torn|busy|hot|unnamed|health) ;; *) echo "unknown plan $PLAN"; exit 2;; esac
 OPTS=rw,commit=600
 # More RMW workers than the three one CPU gets, or no more than three writes
 # are ever recorded at once (rmw_workers).
@@ -94,12 +108,84 @@ arm() {	# name control
 		BTRFS_TEST_DIR=$T MODE=flush_wedge OPTS=$OPTS PROFILE=raid5:raid1 \
 		TAG=$tag NDEV=$NDEV FAIL=$FAIL PLAN=$PLAN CONTROL=$2 < /dev/null > $D/log 2>&1
 	echo "boot rc=$?" >> $D/log
+	# health: the machine stopped after the refused commit; mount it again.
+	[ $PLAN = health ] &&
+		timeout 900 $KERNEL mem=1G rootfstype=hostfs rootflags=/ rw \
+			init=$T/umltest/init-fw.sh $ubds quiet con=null con0=fd:0,fd:1 \
+			BTRFS_TEST_DIR=$T MODE=flush_wedge OPTS=rw PROFILE=raid5:raid1 \
+			TAG=$tag NDEV=$NDEV FAIL=$FAIL PLAN=$PLAN CONTROL=$2 PHASE=reboot \
+			< /dev/null > $D/log.reboot 2>&1
 	rm -f $D/disk*.img
 }
 arm fixed 0
 arm control 1
 ARMS="fixed control"
 [ $PLAN = unnamed ] && { arm unnamedctl 2; ARMS="$ARMS unnamedctl"; }
+[ $PLAN = health ] && arm nodevs 2
+if [ $PLAN = health ]; then
+	grep -ah "control:\|FW \|alerts an earlier\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
+		$T/umltest/fw-$PLAN-nodevs/log* | sed "s/^/  [nodevs] /"
+	for a in fixed control; do
+		grep -ah "control:\|FW \|healed\|in-place overwrites\|alerts an earlier\|KERNEL_SPLAT\|WATCHDOG\|_FAIL" \
+			$T/umltest/fw-$PLAN-$a/log* | sed "s/^/  [$a] /"
+	done
+	hres() { cat $T/umltest/fw.health.fw-$PLAN-$1 2>/dev/null || echo "?"; }
+	read -r f_ok f_ro f_fl f_st f_un f_devs f_act <<<"$(hres fixed)"
+	read -r c_ok c_ro c_fl c_st c_un c_devs c_act <<<"$(hres control)"
+	read -r n_ok n_ro n_fl n_st n_un n_devs n_act <<<"$(hres nodevs)"
+	rres() { cat $T/umltest/fw.reboot.fw-$PLAN-$1 2>/dev/null || echo "?"; }
+	read -r f_rw f_run f_rdevs f_ract <<<"$(rres fixed)"
+	read -r n_rw n_run n_rdevs n_ract <<<"$(rres nodevs)"
+	echo "  after the refused commit: read-only fixed $f_ro control $c_ro; unacknowledged" \
+	     "fixed $f_un control $c_un"
+	echo "  devices: fixed $f_devs, control $c_devs"
+	echo "  action: fixed $f_act, control $c_act"
+	echo "  after the crash (mounted $f_rw/$n_rw): unacknowledged fixed $f_run, nodevs $n_run;" \
+	     "devices fixed $f_rdevs, nodevs $n_rdevs; action fixed $f_ract, nodevs $n_ract"
+	case "$f_ok$c_ok$n_ok$f_rw$n_rw" in *'?'*) echo "RESULT: INCONCLUSIVE -- a boot did not report"; exit 2;; esac
+	grep -lq KERNEL_SPLAT $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- kernel splat"; exit 1; }
+	grep -lq WATCHDOG $T/umltest/fw-$PLAN-*/log && { echo "RESULT: FAIL -- a guest hung"; exit 1; }
+	grep -lq CONTROL_KNOB_FAIL $T/umltest/fw-$PLAN-{control,nodevs}/log* &&
+		{ echo "RESULT: INCONCLUSIVE -- a control knob is not there"; exit 2; }
+	for v in "$f_ok:$f_ro:$f_un" "$c_ok:$c_ro:$c_un" "$n_ok:$n_ro:$n_un"; do
+		case "$v" in 0:1:*log_flush_unnamed*) ;; *)
+			echo "RESULT: INCONCLUSIVE -- a commit was not refused read-only with" \
+			     "log_flush_unnamed ($v)"; exit 2;;
+		esac
+	done
+	case "$c_devs:$c_act" in none:scrub_then_ack) ;; *)
+		echo "RESULT: INCONCLUSIVE -- the control did not reproduce the old advice" \
+		     "(devices $c_devs, action $c_act)"; exit 2;;
+	esac
+	case ",$f_devs," in *,2:*) ;; *)
+		echo "RESULT: FAIL -- the refusal's alert does not name devid 2 (devices $f_devs)"; exit 1;;
+	esac
+	case "$f_act" in unmount_then_mount-rw_then_replace-devid-2*_then_ack) ;; *)
+		echo "RESULT: FAIL -- the action on the read-only filesystem is $f_act"; exit 1;;
+	esac
+	# After the crash: the alert is back from the log, and with it the device.
+	for v in "$f_run" "$n_run"; do
+		case ",$v," in *,log_flush_unnamed,*) ;; *)
+			echo "RESULT: INCONCLUSIVE -- the alert was not back after the crash ($v)"; exit 2;;
+		esac
+	done
+	case "$n_rdevs" in none) ;; *)
+		echo "RESULT: INCONCLUSIVE -- raid56_wf_latch_no_devs: devices $n_rdevs after the crash"
+		exit 2;;
+	esac
+	case ",$f_rdevs," in *,2:*) ;; *)
+		echo "RESULT: FAIL -- after the crash raid56_health lists devices $f_rdevs, not devid 2"
+		exit 1;;
+	esac
+	case "$f_ract" in *replace-devid-2*) ;; *)
+		echo "RESULT: FAIL -- after the crash the action is $f_ract"; exit 1;;
+	esac
+	echo "RESULT: PASS -- after the refused commit raid56_health lists devid 2 and says to"
+	echo "        unmount and mount again first, then replace it, and after the crash the"
+	echo "        log still names devid 2 with the alert; controls: no device and a scrub"
+	echo "        the read-only filesystem cannot run, no device after the crash"
+	exit 0
+fi
 for a in $ARMS; do
 	grep -ah "control:\|FW \|FW_\|drops every\|fails writes\|healed\|in-place overwrites\|suspended\|resumed\|KERNEL_SPLAT\|WATCHDOG\|MOUNT_FAIL\|MKFS_FAIL\|LAYOUT_FAIL\|FALLOCATE_FAIL\|DM_RELOAD\|DM_SUSPEND\|DM_RESUME\|KNOB_FAIL" \
 		$T/umltest/fw-$PLAN-$a/log | grep -v FW_READ_BAD | sed "s/^/  [$a] /"

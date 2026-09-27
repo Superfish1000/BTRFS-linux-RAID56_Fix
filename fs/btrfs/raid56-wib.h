@@ -261,17 +261,40 @@ struct btrfs_wib_disk_header {
  * raid56_health goes on showing them after an unmount, a crash, or a commit
  * that failed, until someone acknowledges them.
  *
- * Only where the entries leave them free: in every wide block (82 entries
- * end 16 bytes short of them), in a narrow one while it lists fewer than
- * BTRFS_WIB_MAX_ENTRIES_V1 regions (the last entry's @error lies there).  Not
- * a header field, for the reason the trailer is not: a kernel that does not
- * know them reads @nr_entries entries and never looks here, and
- * btrfs_wib_block_valid() checks nothing past them but the checksum, which
- * covers them all the same.  The event numbers only ever grow at the end.
+ * Only where the entries leave them free, which is in every block this kernel
+ * writes: 82 wide entries end 16 bytes short of them, and so do the
+ * BTRFS_WIB_NARROW_WRITE_MAX narrow ones a block it builds lists at most.  A
+ * narrow block of BTRFS_WIB_MAX_ENTRIES_V1 regions, which a kernel before that
+ * cap wrote, has no room (the last entry's @error lies there): a mount then
+ * takes them from the device's other slot.  Not a header field, for the
+ * reason the trailer is not: a kernel that does not know them reads
+ * @nr_entries entries and never looks here, and btrfs_wib_block_valid()
+ * checks nothing past them but the checksum, which covers them all the same.
+ * The event numbers only ever grow at the end.
  */
 #define BTRFS_WIB_LATCH_OFFSET		(BTRFS_WIB_TRAILER_OFFSET - sizeof(__le64))
 /* "LTCH" in little endian. */
 #define BTRFS_WIB_LATCH_MAGIC		0x4843544cU
+/*
+ * The 16 bytes before the latch word: the devids (__le64, 0 for none) of up
+ * to two devices the latched alerts named -- the one that failed a flush the
+ * log could not name it in, say -- for raid56_health to name them again after
+ * a crash, when the kernel log that named them is gone and the flush errors
+ * the device stats counted never reached a disk.  Only in a block whose
+ * entries leave them free, which is every block this kernel writes, and only
+ * while the latch word carries BTRFS_WIB_LATCH_MAGIC and an alert; zero
+ * otherwise, as every kernel before them left them.
+ */
+#define BTRFS_WIB_LATCH_DEVS		2
+#define BTRFS_WIB_LATCH_DEVS_OFFSET	(BTRFS_WIB_LATCH_OFFSET -			\
+					 BTRFS_WIB_LATCH_DEVS * sizeof(__le64))
+/*
+ * The most regions a narrow block this kernel builds lists: one short of what
+ * the layout holds, so that its entries leave the latched alerts room, and
+ * the 16 bytes before them as a wide block does.  Every kernel with the log
+ * reads a block of up to BTRFS_WIB_MAX_ENTRIES_V1 of them.
+ */
+#define BTRFS_WIB_NARROW_WRITE_MAX	(BTRFS_WIB_MAX_ENTRIES_V1 - 1)
 
 /* In-memory entry, mirrors the on-disk one. */
 struct btrfs_wib_entry {
@@ -1021,6 +1044,12 @@ struct btrfs_wib {
 	unsigned long last_jiffies;
 	char last_name[BTRFS_RAID56_ALERT_NAME];
 	struct btrfs_raid56_alert_dev alert_devs[BTRFS_RAID56_ALERT_DEVS];
+	/*
+	 * The devices the latched alerts named, for the log to keep with them
+	 * (BTRFS_WIB_LATCH_DEVS_OFFSET) and @alert_devs to list until they
+	 * are acknowledged.
+	 */
+	struct btrfs_raid56_alert_dev latch_devs[BTRFS_WIB_LATCH_DEVS];
 	struct delayed_work alert_work;
 	/* Writes @alert_latched to the log when it changes: wib_latch_work(). */
 	struct work_struct latch_work;
@@ -1075,7 +1104,11 @@ bool btrfs_wib_torn_spent_eagerly(void);
 bool btrfs_wib_kept_torn_in_order(void);
 bool btrfs_wib_admits_narrow(void);
 bool btrfs_wib_latch_volatile(void);
+u32 btrfs_wib_narrow_max(void);
 u32 btrfs_wib_block_latched(const void *block);
+void btrfs_wib_block_latched_devs(const void *block, u64 *devs);
+bool btrfs_wib_latch_no_devs(void);
+bool btrfs_wib_recovery_full_legacy(void);
 bool btrfs_wib_failed_leaves_flight(void);
 bool btrfs_wib_admits_recorded_free(void);
 bool btrfs_wib_flush_drop_asserts(void);
@@ -1117,6 +1150,7 @@ void btrfs_wib_parity_unwritten(struct btrfs_fs_info *fs_info, u64 start, u64 le
 #endif
 void btrfs_wib_unmount(struct btrfs_fs_info *fs_info);
 void btrfs_wib_device_lost(struct btrfs_fs_info *fs_info, u64 devid);
+void btrfs_wib_close_latch(struct btrfs_fs_info *fs_info);
 void btrfs_wib_remount_ro(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);
