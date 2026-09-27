@@ -1932,6 +1932,73 @@ static void wib_barrier_failed(struct btrfs_fs_info *fs_info,
 }
 
 /*
+ * Testing only.  raid56_wf_detach_unnamed=1: a device detached while mounted
+ * drops out of every later flush without counting as one that did not
+ * confirm it, as before btrfs_wib_device_lost(): the next commit drops what
+ * its cache may have lost, and the device, reconnected, is read as it is.
+ * The negative control for uml/detach_flush.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool detach_unnamed;
+module_param_named(raid56_wf_detach_unnamed, detach_unnamed, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_detach_unnamed,
+		 "Let a device detached while mounted drop out of the flushes without the write-intent log naming what its cache may have lost (testing only: restores a known defect)");
+#else
+static const bool detach_unnamed;
+#endif
+
+/*
+ * Device @devid has been detached while the filesystem is mounted
+ * (btrfs_remove_bdev()), about to be marked missing: whatever its cache held
+ * is gone, and no flush will fail on it to say so -- a barrier, and the log's
+ * own flushes, leave a missing device out.  The writes it acknowledged since
+ * it last confirmed a flush are the ones a failed flush loses, and read back
+ * as the old content, with no error, once it is back: count it among the
+ * devices that did not confirm the next flush (wib_take_lost()), whose readd
+ * names them.  Before the device is marked missing: a flush that already
+ * leaves it out finds it here.  Only while the log is enabled: nothing names
+ * anything otherwise.  Under device_list_mutex; takes wib->lock.
+ */
+void btrfs_wib_device_lost(struct btrfs_fs_info *fs_info, u64 devid)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	unsigned long flags;
+	bool enabled;
+
+	if (!wib || READ_ONCE(detach_unnamed))
+		return;
+	spin_lock_irqsave(&wib->lock, flags);
+	enabled = wib->enabled;
+	if (enabled)
+		wib_flush_failed_add(&wib->lost, devid);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (enabled)
+		btrfs_warn(fs_info,
+	"raid56 write-intent log: devid %llu was detached; what its cache held is gone, and the log names what was written to it since its last flush, so that its copy of that is rebuilt from the parity if it comes back",
+			   devid);
+}
+
+/*
+ * Merge the devices detached since the last flush that took them into
+ * @failed, for the flush just issued: true if there were any.  That flush
+ * then counts as failed on them.
+ */
+static bool wib_take_lost(struct btrfs_wib *wib, struct btrfs_wib_flush_failed *failed)
+{
+	unsigned long flags;
+	bool any;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	any = wib_flush_failed_any(&wib->lost);
+	if (any) {
+		wib_flush_failed_merge(failed, &wib->lost);
+		memset(&wib->lost, 0, sizeof(wib->lost));
+	}
+	spin_unlock_irqrestore(&wib->lock, flags);
+	return any;
+}
+
+/*
  * After a commit: advance the slot of every device that got the block, and
  * account the failed writes.  After a flush (!@with_data): add every device
  * that did not confirm it to @failed, which is what wib_readd_dropped() names
@@ -2052,6 +2119,7 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 				 struct btrfs_wib_flush_failed *failed)
 {
 	int nr;
+	int ret;
 
 	memset(failed, 0, sizeof(*failed));
 	if (btrfs_test_opt(wib->fs_info, NOBARRIER))
@@ -2061,8 +2129,12 @@ static int wib_flush_all_devices(struct btrfs_wib *wib,
 	 * A flush that could not even be submitted (-ENOMEM) names nobody: no
 	 * device reported losing anything, the stripes only stay recorded.
 	 */
-	return wib_submit_all_devices(wib, REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC, false,
-				      &nr, failed);
+	ret = wib_submit_all_devices(wib, REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC, false,
+				     &nr, failed);
+	/* A device detached meanwhile did not confirm it either. */
+	if (wib_take_lost(wib, failed) && ret == 0)
+		ret = 1;
+	return ret;
 }
 
 /*
@@ -6463,8 +6535,14 @@ static int wib_write_final_locked(struct btrfs_wib *wib, bool flushed)
 		wib_written_reset_locked(wib);
 		spin_unlock_irqrestore(&wib->lock, flags);
 	} else {
-		if (!flushed) {
+		if (!flushed)
 			wib_barrier_failed(wib->fs_info, &wib->flush_failed);
+		else
+			memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
+		/* A device detached since the last flush: see wib_take_lost(). */
+		if (wib_take_lost(wib, &wib->flush_failed))
+			flushed = false;
+		if (!flushed) {
 			wib_readd_dropped(wib, &wib->flush_failed,
 					  wib->prepared_valid ? wib->prepared : NULL);
 			wib_unlogged_name(wib, &wib->flush_failed,
@@ -6715,6 +6793,14 @@ int btrfs_wib_commit(struct btrfs_fs_info *fs_info, bool flushed)
 		wib_barrier_failed(fs_info, &wib->flush_failed);
 	else
 		memset(&wib->flush_failed, 0, sizeof(wib->flush_failed));
+	/*
+	 * And who was detached since the last flush: the barrier left it out,
+	 * and its cache is gone all the same (wib_take_lost()).
+	 */
+	if (wib_take_lost(wib, &wib->flush_failed)) {
+		flushed = false;
+		barrier_failed = true;
+	}
 	timed = wib->prepared_valid;
 	wib->prepared_valid = false;
 	if (!timed && flushed && !wib->readd_owed && !READ_ONCE(untimed_takes_back)) {
@@ -7286,12 +7372,12 @@ static void raid56_alert_explain(struct btrfs_fs_info *fs_info,
 			break;
 		}
 		btrfs_err(fs_info,
-"raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log cannot keep a record naming that device in every stripe the flush covered -- more of them than a log block holds, or writes in flight still holding the room. Rather than acknowledge those writes with nothing on disk saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only; the log on the devices still lists every one of those stripes, and data written since the last commit may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs) and fix it, unmount and mount again (-o degraded if you pulled it): the mount's recovery checks every stripe the log lists. Replace the device if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+"raid56: a device did not confirm a cache flush, so writes it acknowledged may never have reached its disk, and the write-intent log cannot keep a record naming that device in every stripe the flush covered -- more of them than a log block holds, or writes in flight still holding the room. Rather than acknowledge those writes with nothing on disk saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only; the log on the devices still lists every one of those stripes, and data written since the last commit may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs; or the one that went missing, whose cache went with it) and fix it, unmount and mount again (-o degraded if you pulled it): the mount's recovery checks every stripe the log lists. Replace the device if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), run 'btrfs scrub start <mountpoint>', then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_FLUSH_UNLOGGED:
 		btrfs_err(fs_info,
-"raid56: a device did not confirm a cache flush after full stripes were written copy-on-write, so data it acknowledged may never have reached its disk, and the write-intent log, which does not record such writes, cannot name that device in them: it lost track of some of them, or has no room for the names. Rather than commit a transaction that references data the device may have lost with nothing saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only: what was written since the last commit is not kept, and until the unmount data without checksums written since then may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs), unmount, fix it or pull it and mount again (-o degraded if you pulled it); replace it if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
+"raid56: a device did not confirm a cache flush after full stripes were written copy-on-write, so data it acknowledged may never have reached its disk, and the write-intent log, which does not record such writes, cannot name that device in them: it lost track of some of them, or has no room for the names. Rather than commit a transaction that references data the device may have lost with nothing saying which copy is stale, every transaction commit from here FAILS and the filesystem goes read-only: what was written since the last commit is not kept, and until the unmount data without checksums written since then may read back as it was before. Find the device (btrfs device stats <mountpoint>: flush_io_errs; or the one that went missing, whose cache went with it), unmount, fix it or pull it and mount again (-o degraded if you pulled it); replace it if it keeps failing ('btrfs replace start <devid> <new device> <mountpoint>'), then acknowledge with 'echo ack > /sys/fs/btrfs/%pU/raid56_health'.",
 			  fsid);
 		break;
 	case BTRFS_RAID56_EV_READ_UNRECOVERED:
@@ -8038,6 +8124,22 @@ MODULE_PARM_DESC(raid56_load_unions_stale,
 #endif
 
 /*
+ * Testing only: take a device's older block's writes in flight at their word
+ * where the newest block records them finished, with their damage named, as
+ * before wib_load_block()'s @superseding: the recovery takes the stripe for
+ * possibly torn.  The negative control for the inflight arm of
+ * uml/detach_flush.sh.
+ */
+#ifdef CONFIG_BTRFS_DEBUG
+static bool load_stale_inflight;
+module_param_named(raid56_wf_load_stale_inflight, load_stale_inflight, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_load_stale_inflight,
+		 "At mount, take the writes an older log block lists in flight at their word where the newest block records them finished with their damage named, so their stripes read as possibly torn (testing only: restores a known defect)");
+#else
+static const bool load_stale_inflight;
+#endif
+
+/*
  * Add the entries of @block, the newest valid block of one device, to the
  * pending set.  @newest: it is the newest block of all, whose stale marks
  * count (see btrfs_wib_load()).
@@ -8052,8 +8154,38 @@ MODULE_PARM_DESC(raid56_load_unions_stale,
  * (wib_keep_torn()), so the blocks this kernel writes from then on say so.
  * @nr_torn receives how many blocks were loaded that way.
  */
-int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
-			 unsigned int *nr_torn)
+/*
+ * The blocks of region @bytenr that @newest lists as the record of a failed
+ * write and not in flight.
+ */
+static u64 wib_superseded(const void *newest, u64 bytenr)
+{
+	const struct btrfs_wib_disk_header *hdr = newest;
+	const u32 nr = min(le32_to_cpu(hdr->nr_entries), wib_block_max_entries(newest));
+
+	for (u32 i = 0; i < nr; i++) {
+		struct btrfs_wib_entry ne;
+
+		btrfs_wib_read_entry(newest, i, &ne);
+		if (ne.bytenr == bytenr)
+			return ne.sticky & ~ne.bitmap;
+	}
+	return 0;
+}
+
+/*
+ * @superseding: the newest block of the log, another device's, when @block is
+ * older (!@newest).  Its device missed the blocks written after it -- it was
+ * missing or detached, or failed their writes -- and a write @block lists in
+ * flight that @superseding lists as a record, no longer in flight, had
+ * finished when that was written: with the damage the record says, which is
+ * how a failed flush's readd writes what it took back (wib_readd_base()).
+ * Taken at @block's word, the stripe reads to the recovery as possibly torn,
+ * and a column the record names that only its parity rebuilds is refused for
+ * good.  So that listing is left out.
+ */
+static int wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
+			  const void *superseding, unsigned int *nr_torn)
 {
 	const struct btrfs_wib_disk_header *hdr = block;
 	const bool marks = btrfs_wib_block_marks_torn(block) ||
@@ -8069,6 +8201,8 @@ int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
 		if (!newest) {
 			e.stale = 0;
 			e.stale_par = 0;
+			if (superseding && !READ_ONCE(load_stale_inflight))
+				e.bitmap &= ~wib_superseded(superseding, e.bytenr);
 		}
 		if (!marks) {
 			e.torn = e.sticky;
@@ -8079,6 +8213,12 @@ int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
 			return ret;
 	}
 	return 0;
+}
+
+int btrfs_wib_load_block(struct btrfs_wib *wib, const void *block, bool newest,
+			 unsigned int *nr_torn)
+{
+	return wib_load_block(wib, block, newest, NULL, nr_torn);
 }
 
 /*
@@ -8116,6 +8256,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 	unsigned int nr_unmarked = 0;
 	unsigned int nofs_flag;
 	u32 latched = 0;
+	void *newest_buf;
 	void *buf;
 	int ret = 0;
 
@@ -8126,8 +8267,12 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 		return 0;
 
 	buf = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!buf)
+	newest_buf = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!buf || !newest_buf) {
+		free_page((unsigned long)buf);
+		free_page((unsigned long)newest_buf);
 		return -ENOMEM;
+	}
 
 	/* Allocations under device_list_mutex must not enter reclaim. */
 	nofs_flag = memalloc_nofs_save();
@@ -8144,6 +8289,9 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			if (wib_read_slot(device, slot, buf) < 0 ||
 			    !btrfs_wib_block_valid(fs_info, buf))
 				continue;
+			/* The newest block of all, see wib_load_block(). */
+			if (le64_to_cpu(hdr->seq) > max_seq)
+				memcpy(newest_buf, buf, BTRFS_WIB_SLOT_SIZE);
 			max_seq = max(max_seq, le64_to_cpu(hdr->seq));
 		}
 	}
@@ -8197,7 +8345,7 @@ int btrfs_wib_load(struct btrfs_fs_info *fs_info)
 			ret = 0;
 			continue;
 		}
-		ret = btrfs_wib_load_block(wib, buf, newest, &nr);
+		ret = wib_load_block(wib, buf, newest, max_seq ? newest_buf : NULL, &nr);
 		if (ret < 0)
 			goto out;
 		nr_unmarked += nr;
@@ -8209,6 +8357,7 @@ out:
 	mutex_unlock(&fs_devices->device_list_mutex);
 	memalloc_nofs_restore(nofs_flag);
 	free_page((unsigned long)buf);
+	free_page((unsigned long)newest_buf);
 	if (ret < 0)
 		return ret;
 

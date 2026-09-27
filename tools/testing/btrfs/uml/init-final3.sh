@@ -4451,6 +4451,143 @@ scrub_uncommitted)
 	dmsetup remove_all 2>/dev/null
 	finish
 	;;
+detach_flush)
+	# A device detached while the filesystem is mounted -- a surprise
+	# removal, an enclosure that drops off the bus -- takes its volatile
+	# cache with it.  btrfs marks it missing (btrfs_remove_bdev()) and goes
+	# on degraded, and neither a barrier nor the log's own flushes go to a
+	# missing device: none fails on it to say what it lost.
+	#
+	# RAID5 over NDEV null_blk devices (memory-backed, with a write cache of
+	# DF_CACHE MiB that a flush empties and a power-off throws away -- for
+	# sectors never written before: null_blk writes into a page its media
+	# already holds in place), RAID1 metadata, nodatasum, commit=600 so that
+	# nothing commits on its own.  A nodatacow file is preallocated and
+	# committed; then, with no flush, one 4 KiB block per full stripe of it
+	# is written in place with 'B' (O_DIRECT, a read-modify-write, which the
+	# log records) and a new file of 'C' is written with O_DIRECT in full
+	# stripes (copy-on-write, which it does not).  Device DF_DEV is powered
+	# off: detached, its cache lost.  A sync commits.  Unmounted, the device
+	# powered on again with what reached its media, the filesystem mounted
+	# with every device (the log's recovery runs), and both files are read
+	# back cold:
+	#   fixed      the commit counts the detached device as one that did not
+	#              confirm its flush, and the log names what was written to
+	#              it: every block reads back as written
+	#   CONTROL=1  raid56_wf_detach_unnamed=1: nothing is named, and the
+	#              blocks of the detached device's column read back as they
+	#              were before the write (zeros), with no error
+	#   CONTROL=2  the fixed kernel with raid56_wf_load_stale_inflight=1 at
+	#              the last mount: the device's own last log block, older
+	#              than the others', still lists the overwrites in flight,
+	#              and taken at its word the recovery takes those stripes for
+	#              possibly torn and refuses the named column (EIO)
+	watchdog ${WATCH:-600}
+	mkdir -p /sys/kernel/config
+	mount -t configfs none /sys/kernel/config 2>/dev/null
+	NB=/sys/kernel/config/nullb
+	[ -d $NB ] || { log "NULLB_UNAVAILABLE"; finish; }
+	NDEV=${NDEV:-3}; DF_DEV=${DF_DEV:-1}; NBDEVS=""
+	for i in $(seq 0 $((NDEV - 1))); do
+		d=$NB/nulldf$i
+		mkdir $d || { log "NULLB_FAIL"; finish; }
+		echo 1 > $d/memory_backed; echo 4096 > $d/blocksize
+		echo ${DF_MB:-512} > $d/size; echo ${DF_CACHE:-128} > $d/cache_size
+		echo 1 > $d/power || { log "NULLB_FAIL power"; finish; }
+		NBDEVS="$NBDEVS /dev/nulldf$i"
+	done
+	sleep 1
+	for i in $(seq 0 $((NDEV - 1))); do
+		[ -b /dev/nulldf$i ] || { log "NULLB_FAIL no /dev/nulldf$i"; finish; }
+	done
+	mkfs.btrfs -K -q -f -d raid5 -m raid1 $NBDEVS || { log "MKFS_FAIL"; finish; }
+	btrfs device scan $NBDEVS >/dev/null 2>&1
+	do_mount rw,commit=600,nodatasum /dev/nulldf0
+	allow_nodatacow
+	if [ "${CONTROL:-0}" = 1 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_detach_unnamed 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: a detached device is left out of the flushes, nothing named"
+	fi
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	CS=$(ls /sys/fs/btrfs/*-*-*/commit_stats 2>/dev/null | head -1)
+	hv() { awk -v k=$1 '$1 == k {print $2}' $H 2>/dev/null; }
+	touch $MNT/nocow; chattr +C $MNT/nocow || { log "CHATTR_FAIL"; finish; }
+	fallocate -l ${DF_MB_FILE:-8}M $MNT/nocow || { log "FALLOCATE_FAIL"; finish; }
+	sync
+	commits0=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+	dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > /tmp/bblock.df
+	# One block per full stripe of two data columns (128 KiB).
+	nblk=$(( ${DF_MB_FILE:-8} * 8 ))
+	acked=0
+	for i in $(seq 0 $((nblk - 1))); do
+		dd if=/tmp/bblock.df of=$MNT/nocow bs=4096 seek=$((i * 32)) count=1 \
+		   oflag=direct conv=notrunc status=none 2>/dev/null && acked=$((acked + 1))
+	done
+	dd if=/dev/zero bs=1M count=${DF_MB_FILE:-8} status=none | tr '\000' 'C' |
+		dd of=$MNT/cow bs=1M iflag=fullblock oflag=direct status=none 2>/dev/null
+	cwrc=$?
+	commits1=$(awk '$1 == "commits" {print $2}' $CS 2>/dev/null)
+	log "overwrites: $acked of $nblk acknowledged, new file rc $cwrc," \
+	    "commits $commits0 -> $commits1"
+	echo 0 > $NB/nulldf$DF_DEV/power || log "NULLB_FAIL power off"
+	sleep 1
+	dmesg | grep -q "has gone missing" || log "DF_NOT_MISSING"
+	kmsg "gone missing|was detached" 3
+	sync
+	btrfs filesystem sync $MNT >/dev/null 2>&1 && sync_ok=1 || sync_ok=0
+	ro=0; grep " $MNT " /proc/mounts | awk '{print $4}' | grep -q "^ro" && ro=1
+	stale=$(hv stale_marks)
+	kmsg "did not confirm|write-intent log|raid56:" 6
+	log "DF after the commit: sync_ok=$sync_ok ro=$ro stale_marks=$stale" \
+	    "state=$(hv state) unack=$(sed -n 's/^unacknowledged //p' $H | tr ' ' ,)"
+	umount $MNT || log "UMOUNT_FAIL"
+	echo 1 > $NB/nulldf$DF_DEV/power || log "NULLB_FAIL power on"
+	sleep 1
+	[ -b /dev/nulldf$DF_DEV ] || log "NULLB_FAIL no /dev/nulldf$DF_DEV after power on"
+	if [ "${CONTROL:-0}" = 2 ]; then
+		echo 1 > /sys/module/btrfs/parameters/raid56_wf_load_stale_inflight 2>/dev/null ||
+			log "CONTROL_KNOB_FAIL"
+		log "control: an older log block's writes in flight are taken at their word"
+	fi
+	btrfs device scan --forget >/dev/null 2>&1
+	btrfs device scan $NBDEVS >/dev/null 2>&1
+	mount -o rw /dev/nulldf0 $MNT || { log "DF_MOUNT_FAIL"; kmsg "BTRFS" 6; finish; }
+	kmsg "write-intent|raid56:" 8
+	H=$(ls /sys/fs/btrfs/*-*-*/raid56_health 2>/dev/null | head -1)
+	echo 3 > /proc/sys/vm/drop_caches
+	# Every overwritten block and every 64 KiB of the new file: new, old
+	# (zeros: nothing had been written there before), eio, other.
+	res=$(python3 - $MNT/nocow $MNT/cow $nblk <<'PY'
+import os, sys
+def score(path, offs, size, new):
+    n = [0, 0, 0, 0]
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return "absent absent absent absent"
+    for off in offs:
+        try:
+            b = os.pread(fd, size, off)
+        except OSError:
+            n[2] += 1
+            continue
+        n[0 if b == new * size else 1 if b == bytes(size) else 3] += 1
+    return " ".join(map(str, n))
+nblk = int(sys.argv[3])
+print(score(sys.argv[1], [i * 32 * 4096 for i in range(nblk)], 4096, b"B"),
+      score(sys.argv[2], range(0, nblk * 128 * 1024 // 2, 65536), 65536, b"C"))
+PY
+)
+	read -r bn bo be bx cn co ce cx <<< "$res"
+	out="acked=$acked commits_while_cached=$((commits1 - commits0)) sync_ok=$sync_ok ro=$ro"
+	out="$out stale_marks=$stale b_new=$bn b_old=$bo b_eio=$be b_other=$bx"
+	out="$out c_new=$cn c_old=$co c_eio=$ce c_other=$cx"
+	log "DF $out health=$(tr '\n' ' ' < $H 2>/dev/null | cut -c1-200)"
+	echo "$out" > $T/umltest/df.$TAG
+	umount $MNT || log "UMOUNT_FAIL"
+	finish
+	;;
 fullstripe_flush_prep)
 	# Does a device that failed a flush after full stripes were written
 	# copy-on-write -- writes the write-intent log does not record -- get

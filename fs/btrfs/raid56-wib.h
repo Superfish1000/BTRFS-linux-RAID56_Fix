@@ -739,6 +739,15 @@ struct btrfs_wib {
 	/* Under @commit_mutex: who failed the flush just issued. */
 	struct btrfs_wib_flush_failed flush_failed;
 	/*
+	 * Under @lock: devices detached while the log was enabled
+	 * (btrfs_wib_device_lost()), since the flush that takes them
+	 * (wib_take_lost()).  Neither a barrier nor the log's own flushes go
+	 * to a missing device, so none can fail on it -- yet it went with
+	 * whatever its cache held.  The next flush counts it as one that did
+	 * not confirm, and the readd names what was written to it.
+	 */
+	struct btrfs_wib_flush_failed lost;
+	/*
 	 * Under @commit_mutex: wib_name_devices() for each entry of @last,
 	 * worked out before wib_readd_dropped() takes @lock -- the chunk map
 	 * is not walked with interrupts off -- and kept here so that a commit
@@ -1039,6 +1048,7 @@ void btrfs_wib_parity_unwritten(struct btrfs_fs_info *fs_info, u64 start, u64 le
 				unsigned int parities);
 #endif
 void btrfs_wib_unmount(struct btrfs_fs_info *fs_info);
+void btrfs_wib_device_lost(struct btrfs_fs_info *fs_info, u64 devid);
 void btrfs_wib_remount_ro(struct btrfs_fs_info *fs_info);
 
 int btrfs_wib_enable(struct btrfs_fs_info *fs_info);
