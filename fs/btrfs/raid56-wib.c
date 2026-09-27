@@ -708,6 +708,16 @@ module_param_named(raid56_wf_failed_leaves_flight, failed_leaves_flight, bool, 0
 MODULE_PARM_DESC(raid56_wf_failed_leaves_flight,
 		 "Let a failed write's record leave flight before the write names the member it did not reach, so that a full write-intent log can spend it in between (testing only: restores a known defect)");
 /*
+ * raid56_wf_repair_leaves_unpinned=1: a write that cleared what the record
+ * names after writing it back (rmw_repair_first()) leaves the record
+ * sticky-only and spendable until its own mark, as before (btrfs_wib_pin()).
+ * The negative control for test_pin_keeps_record().
+ */
+static bool repair_leaves_unpinned;
+module_param_named(raid56_wf_repair_leaves_unpinned, repair_leaves_unpinned, bool, 0644);
+MODULE_PARM_DESC(raid56_wf_repair_leaves_unpinned,
+		 "Let a full write-intent log spend the record a write cleared after writing back what it named, before the write's own mark (testing only: restores a known defect)");
+/*
  * raid56_wf_admit_recorded_free=1: a write into a region the log records only
  * as room to spend is admitted uncharged, as before (wib_count_entries_locked()),
  * and can leave more regions that may not be spent than a wide block
@@ -740,6 +750,7 @@ static const bool admit_narrow;
 static const bool failed_leaves_flight;
 static const bool admit_recorded_free;
 static const bool flush_drop_asserts;
+static const bool repair_leaves_unpinned;
 #endif
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
@@ -804,6 +815,12 @@ bool btrfs_wib_failed_leaves_flight(void)
 	return READ_ONCE(failed_leaves_flight);
 }
 #endif
+
+/* rmw_repair_first(): see @pin in struct btrfs_wib_entry. */
+bool btrfs_wib_repair_leaves_unpinned(void)
+{
+	return READ_ONCE(repair_leaves_unpinned);
+}
 
 /*
  * May a full log spend a record that names a stale member?  Not while that
@@ -910,8 +927,9 @@ static bool wib_entry_kept_torn(const struct btrfs_wib_entry *e)
 static bool wib_evictable(const struct btrfs_wib *wib, const struct btrfs_wib_entry *e,
 			  bool spend_torn)
 {
-	return !e->bitmap && (wib->may_evict_naming || !wib_entry_names_member(e) ||
-			      (spend_torn && wib_entry_torn_only(e)));
+	return !e->bitmap && !e->pin &&
+	       (wib->may_evict_naming || !wib_entry_names_member(e) ||
+		(spend_torn && wib_entry_torn_only(e)));
 }
 
 static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
@@ -966,7 +984,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			struct btrfs_wib_entry *e = &wib->entries[i];
 			bool lost;
 
-			if (e->bitmap || !e->sticky)
+			if (e->bitmap || e->pin || !e->sticky)
 				continue;
 			if (pass == 0 && wib_entry_names_member(e))
 				continue;
@@ -1032,6 +1050,7 @@ static struct btrfs_wib_entry *wib_evict_sticky(struct btrfs_wib *wib)
 			e->gen = 0;
 			e->hold = 0;
 			e->hold_par = 0;
+			e->pin = 0;
 			e->torn = 0;
 			e->kept_torn = 0;
 			return e;
@@ -1160,6 +1179,7 @@ static struct btrfs_wib_entry *wib_find_or_alloc_entry(struct btrfs_wib *wib,
 		free->gen = 0;
 		free->hold = 0;
 		free->hold_par = 0;
+		free->pin = 0;
 		free->torn = 0;
 		free->kept_torn = 0;
 	}
@@ -4638,6 +4658,44 @@ void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	/* The first stale bit halves the capacity; make the set fit it. */
 	wib_enforce_capacity_locked(wib);
 	spin_unlock_irqrestore(&wib->lock, flags);
+}
+
+/*
+ * Keep the records of [@logical, @logical + @len) from being spent (@pin), or
+ * let them be again: see @pin in struct btrfs_wib_entry.  Nothing new is
+ * recorded, and a region with no record is left alone.  Unpinned, a record
+ * may be spent again, and the set may be over what the layout of the moment
+ * describes -- a name while it was pinned -- so the capacity is enforced, and
+ * a write waiting for room is told.
+ *
+ * rmw_repair_first() under raid56_wf_repair_leaves_unpinned=1 pins nothing.
+ */
+void btrfs_wib_pin(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin)
+{
+	unsigned long flags;
+	struct btrfs_wib *wib = fs_info->wib;
+	const u64 end = logical + len;
+
+	if (!wib)
+		return;
+
+	spin_lock_irqsave(&wib->lock, flags);
+	for (u64 cur = wib_entry_bytenr(logical); cur < end; cur += BTRFS_WIB_ENTRY_SIZE) {
+		struct btrfs_wib_entry *e = wib_find_entry(wib, cur);
+		const u64 mask = btrfs_wib_range_mask(cur, logical, len);
+
+		if (!e)
+			continue;
+		if (pin)
+			e->pin |= mask;
+		else
+			e->pin &= ~mask;
+	}
+	if (!pin)
+		wib_enforce_capacity_locked(wib);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	if (!pin)
+		wake_up_all(&wib->wait);
 }
 
 /*

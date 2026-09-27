@@ -341,6 +341,17 @@ struct btrfs_wib_entry {
 	u64 hold;
 	u64 hold_par;
 	/*
+	 * In memory only.  Blocks whose record a caller keeps from being
+	 * spent for a moment without writing it in flight (btrfs_wib_pin()):
+	 * a write that has cleared what the record names, written back with
+	 * FUA, until its own mark makes it in flight -- or puts the names
+	 * back, if the log cannot say they are cleared; a mount's recovery
+	 * between naming the halves of a stripe that straddles two regions.
+	 * Sticky-only in between, the record was the first a full log spent,
+	 * and what came next found no entry to act on.
+	 */
+	u64 pin;
+	/*
 	 * In memory only.  The @stale (@replace_stale) and @stale_par
 	 * (@replace_stale_par) bits a running device replace set for the
 	 * zeros it put on its target where it could neither copy nor rebuild
@@ -1050,6 +1061,8 @@ void btrfs_wib_full_stripe_done(struct btrfs_fs_info *fs_info, u64 full_stripe_s
 void btrfs_wib_done(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool failed);
 void btrfs_wib_failed(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
 void btrfs_wib_mark_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len);
+void btrfs_wib_pin(struct btrfs_fs_info *fs_info, u64 logical, u64 len, bool pin);
+bool btrfs_wib_repair_leaves_unpinned(void);
 bool btrfs_wib_stale(struct btrfs_fs_info *fs_info, u64 logical);
 void btrfs_wib_clear_stale(struct btrfs_fs_info *fs_info, u64 logical, u64 len,
 			   bool durable);

@@ -1794,6 +1794,93 @@ out:
 }
 
 /*
+ * A write into a stripe whose record names a column writes that column back
+ * with FUA and clears the name (rmw_repair_first()), and only then marks the
+ * stripe in flight: in between the record says only that a write failed
+ * there, which is what a full log spends first.  Spent, and the log not
+ * written -- the put-back after a failed persist -- the name finds no entry:
+ * memory says the column is clean while the log on disk still names it.  So
+ * the record is pinned in between (btrfs_wib_pin()), and a write into a new
+ * region of the full log is refused instead.  Under
+ * raid56_wf_repair_leaves_unpinned=1 nothing is pinned, and the record is
+ * spent.
+ */
+static int test_pin_keeps_record(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_wib *wib = fs_info->wib;
+	const bool unpinned = btrfs_wib_repair_leaves_unpinned();
+	const u64 blk = BTRFS_WIB_BLOCK_SIZE;
+	const u64 base = 6500;
+	const u64 named = (base + BTRFS_WIB_MAX_ENTRIES - 1) * BTRFS_WIB_ENTRY_SIZE;
+	const u64 fresh = (base + BTRFS_WIB_MAX_ENTRIES) * BTRFS_WIB_ENTRY_SIZE;
+	const struct btrfs_wib_entry *e;
+	unsigned long flags;
+	int ret = -EINVAL;
+	int r;
+
+	if (btrfs_wib_evicts_naming()) {
+		test_msg("raid56_evict_naming is set, skipping the pinned-record test");
+		return 0;
+	}
+	/*
+	 * A wide log, full: writes in flight, one record naming a column of
+	 * another region, and the record the write is about to repair.
+	 */
+	for (u32 i = 0; i < BTRFS_WIB_MAX_ENTRIES; i++) {
+		struct btrfs_wib_entry *p = put_entry(wib, (base + i) * BTRFS_WIB_ENTRY_SIZE,
+						      i < BTRFS_WIB_MAX_ENTRIES - 2 ? 0x1 : 0,
+						      i < BTRFS_WIB_MAX_ENTRIES - 2 ? 0 : 0x1);
+
+		if (!p) {
+			test_err("no room for record %u", i);
+			goto out;
+		}
+		if (i >= BTRFS_WIB_MAX_ENTRIES - 2) {
+			spin_lock_irqsave(&wib->lock, flags);
+			p->stale = 0x1;
+			atomic_inc(&wib->nr_stale);
+			spin_unlock_irqrestore(&wib->lock, flags);
+		}
+	}
+	/* rmw_repair_first(): the column written back, its name cleared. */
+	if (!unpinned)
+		btrfs_wib_pin(fs_info, named, blk, true);
+	btrfs_wib_clear_stale(fs_info, named, blk, true);
+	/* A write into a new region of the full log meanwhile. */
+	spin_lock_irqsave(&wib->lock, flags);
+	r = btrfs_wib_try_mark(wib, fresh, blk);
+	spin_unlock_irqrestore(&wib->lock, flags);
+	/* The persist failed: the name goes back. */
+	btrfs_wib_mark_stale(fs_info, named, blk);
+	if (!unpinned)
+		btrfs_wib_pin(fs_info, named, blk, false);
+	e = find_live_entry(wib, named);
+	if (unpinned) {
+		if (r || e) {
+			test_err("raid56_wf_repair_leaves_unpinned is set, yet the record was kept: mark %d, entry %d",
+				 r, !!e);
+			goto out;
+		}
+		test_msg("raid56_wf_repair_leaves_unpinned is set: the record was spent and its name lost, as expected");
+	} else if (r != -ENOSPC || !e || e->stale != 0x1 || e->pin) {
+		test_err("the pinned record: mark %d, entry %d, stale 0x%llx, pin 0x%llx; expected -ENOSPC and the name back",
+			 r, !!e, e ? e->stale : 0, e ? e->pin : 0);
+		goto out;
+	}
+	ret = 0;
+out:
+	for (u32 i = 0; i <= BTRFS_WIB_MAX_ENTRIES; i++) {
+		btrfs_wib_done(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk, false);
+		btrfs_wib_clear_sticky(fs_info, (base + i) * BTRFS_WIB_ENTRY_SIZE, blk);
+	}
+	if (!ret && btrfs_wib_any_stale(fs_info)) {
+		test_err("stale marks left after the pinned-record test");
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
+/*
  * A transaction commit that cannot write the log fails, so that the
  * transaction aborts (wib_commit_failed()): here more regions name a member
  * than a wide block describes -- no write is admitted into that
@@ -5919,6 +6006,9 @@ int btrfs_test_raid56_wib(u32 sectorsize, u32 nodesize)
 	if (ret)
 		goto out;
 	ret = test_admit_recorded(fs_info);
+	if (ret)
+		goto out;
+	ret = test_pin_keeps_record(fs_info);
 	if (ret)
 		goto out;
 	ret = test_commit_fails_full(fs_info);

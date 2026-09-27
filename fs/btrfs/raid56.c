@@ -4721,7 +4721,7 @@ static u64 rmw_note_written(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 }
 
 static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
-			    int crash_point)
+			    int crash_point, bool *pinned)
 {
 	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
 	const int data_sectors = rbio->nr_data * rbio->stripe_nsectors;
@@ -4810,7 +4810,20 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 		      full_stripe_start);
 #endif
 
-	/* Each such column matches the parity again; say so, durably. */
+	/*
+	 * Each such column matches the parity again; say so, durably.  And
+	 * keep the record from being spent until this write's own mark makes
+	 * it in flight (rmw_rbio()), or the names are put back: what it says
+	 * then is sticky only, the first thing a full log spends, and spent
+	 * in between, the put-back below finds no entry -- the log on disk
+	 * still names the column, memory does not, and the next write skips
+	 * this phase.
+	 */
+	if (!btrfs_wib_repair_leaves_unpinned()) {
+		btrfs_wib_pin(fs_info, full_stripe_start,
+			      (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT, true);
+		*pinned = true;
+	}
 	for (int stripe = 0; stripe < rbio->nr_data; stripe++) {
 		const int first = stripe * rbio->stripe_nsectors;
 		bool all = true;
@@ -4854,6 +4867,11 @@ static int rmw_repair_first(struct btrfs_raid_bio *rbio, u64 full_stripe_start,
 						full_stripe_start + btrfs_stripe_nr_to_offset(stripe),
 						BTRFS_STRIPE_LEN);
 		}
+		if (*pinned) {
+			btrfs_wib_pin(fs_info, full_stripe_start,
+				      (u64)rbio->nr_data << BTRFS_STRIPE_LEN_SHIFT, false);
+			*pinned = false;
+		}
 		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
 			atomic64_inc(&fs_info->raid56_write_stats.rmw_refused);
 		if (!test_bit(RBIO_REPAIR_BIT, &rbio->flags))
@@ -4884,6 +4902,8 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	bool refused = false;
 	/* Refused in phase A, before the write was recorded in flight. */
 	bool repair_refused = false;
+	/* Its record kept from being spent until the mark (rmw_repair_first()). */
+	bool pinned = false;
 	/* The data and parity were submitted: the record can be updated. */
 	bool phase_b = false;
 	int crash_point = 0;
@@ -5054,7 +5074,7 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 #endif
 
 	if (!READ_ONCE(rmw_single_phase)) {
-		ret = rmw_repair_first(rbio, full_stripe_start, crash_point);
+		ret = rmw_repair_first(rbio, full_stripe_start, crash_point, &pinned);
 		if (ret < 0) {
 			refused = true;
 			repair_refused = !logged;
@@ -5068,9 +5088,17 @@ static void rmw_rbio(struct btrfs_raid_bio *rbio)
 	 */
 	if (record && !logged) {
 		ret = btrfs_wib_mark(fs_info, full_stripe_start, full_stripe_len);
+		if (pinned) {
+			btrfs_wib_pin(fs_info, full_stripe_start, full_stripe_len, false);
+			pinned = false;
+		}
 		if (ret < 0)
 			goto out;
 		logged = true;
+	}
+	if (pinned) {
+		btrfs_wib_pin(fs_info, full_stripe_start, full_stripe_len, false);
+		pinned = false;
 	}
 
 	index_rbio_pages(rbio);
